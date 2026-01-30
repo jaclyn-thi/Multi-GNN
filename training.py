@@ -63,7 +63,7 @@ def train_homo(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, mod
             wandb.log({"best_test_f1": te_f1}, step=epoch)
             if args.save_model:
                 save_model(model, optimizer, epoch, args, data_config)
-    
+
     return model
 
 def train_hetero(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, model, optimizer, loss_fn, args, config, device, val_data, te_data, data_config):
@@ -80,7 +80,7 @@ def train_hetero(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, m
             batch_edge_inds = inds[batch['node', 'to', 'node'].input_id.detach().cpu()]
             batch_edge_ids = tr_loader.data['node', 'to', 'node'].edge_attr.detach().cpu()[batch_edge_inds, 0]
             mask = torch.isin(batch['node', 'to', 'node'].edge_attr[:, 0].detach().cpu(), batch_edge_ids)
-            
+
             #remove the unique edge id from the edge features, as it's no longer needed
             batch['node', 'to', 'node'].edge_attr = batch['node', 'to', 'node'].edge_attr[:, 1:]
             batch['node', 'rev_to', 'node'].edge_attr = batch['node', 'rev_to', 'node'].edge_attr[:, 1:]
@@ -99,7 +99,7 @@ def train_hetero(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, m
 
             total_loss += float(loss) * pred.numel()
             total_examples += pred.numel()
-            
+
         pred = torch.cat(preds, dim=0).detach().cpu().numpy()
         ground_truth = torch.cat(ground_truths, dim=0).detach().cpu().numpy()
         f1 = f1_score(ground_truth, pred)
@@ -122,7 +122,7 @@ def train_hetero(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, m
             wandb.log({"best_test_f1": te_f1}, step=epoch)
             if args.save_model:
                 save_model(model, optimizer, epoch, args, data_config)
-        
+
     return model
 
 def get_model(sample_batch, config, args):
@@ -132,13 +132,13 @@ def get_model(sample_batch, config, args):
     if args.model == "gin":
         model = GINe(
                 num_features=n_feats, num_gnn_layers=config.n_gnn_layers, n_classes=2,
-                n_hidden=round(config.n_hidden), residual=False, edge_updates=args.emlps, edge_dim=e_dim, 
+                n_hidden=round(config.n_hidden), residual=False, edge_updates=args.emlps, edge_dim=e_dim,
                 dropout=config.dropout, final_dropout=config.final_dropout
                 )
     elif args.model == "gat":
         model = GATe(
                 num_features=n_feats, num_gnn_layers=config.n_gnn_layers, n_classes=2,
-                n_hidden=round(config.n_hidden), n_heads=round(config.n_heads), 
+                n_hidden=round(config.n_hidden), n_heads=round(config.n_heads),
                 edge_updates=args.emlps, edge_dim=e_dim,
                 dropout=config.dropout, final_dropout=config.final_dropout
                 )
@@ -160,7 +160,7 @@ def get_model(sample_batch, config, args):
             n_classes=2, n_hidden=round(config.n_hidden),
             edge_update=args.emlps, dropout=config.dropout, final_dropout=config.final_dropout, n_bases=None #(maybe)
         )
-    
+
     return model
 
 def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data_config):
@@ -170,7 +170,7 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
     #define a model config dictionary and wandb logging at the same time
     wandb.init(
         mode="disabled" if args.testing else "online",
-        project="your_proj_name", #replace this with your wandb project name if you want to use wandb logging
+        project="multi-gnn", #replace this with your wandb project name if you want to use wandb logging
 
         config={
             "epochs": args.n_epochs,
@@ -209,13 +209,13 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
 
     if args.reverse_mp:
         model = to_hetero(model, te_data.metadata(), aggr='mean')
-    
+
     if args.finetune:
         model, optimizer = load_model(model, device, args, config, data_config)
     else:
         model.to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
-    
+
     sample_batch.to(device)
     sample_x = sample_batch.x if not isinstance(sample_batch, HeteroData) else sample_batch.x_dict
     sample_edge_index = sample_batch.edge_index if not isinstance(sample_batch, HeteroData) else sample_batch.edge_index_dict
@@ -226,12 +226,12 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
         sample_batch.edge_attr = sample_batch.edge_attr[:, 1:]
     sample_edge_attr = sample_batch.edge_attr if not isinstance(sample_batch, HeteroData) else sample_batch.edge_attr_dict
     logging.info(summary(model, sample_x, sample_edge_index, sample_edge_attr))
-    
+
     loss_fn = torch.nn.CrossEntropyLoss(weight=torch.FloatTensor([config.w_ce1, config.w_ce2]).to(device))
 
     if args.reverse_mp:
         model = train_hetero(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, model, optimizer, loss_fn, args, config, device, val_data, te_data, data_config)
     else:
         model = train_homo(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, model, optimizer, loss_fn, args, config, device, val_data, te_data, data_config)
-    
+
     wandb.finish()

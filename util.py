@@ -12,7 +12,7 @@ def logger_setup():
     if not os.path.exists(log_directory):
         os.makedirs(log_directory)
     logging.basicConfig(
-        level=logging.INFO, 
+        level=logging.INFO,
         format="%(asctime)s [%(levelname)-5.5s] %(message)s",
         handlers=[
             logging.FileHandler(os.path.join(log_directory, "logs.log")),     ## log to local log file
@@ -42,7 +42,8 @@ def create_parser():
     parser.add_argument("--model", default=None, type=str, help="Select the model architecture. Needs to be one of [gin, gat, rgcn, pna]", required=True)
     parser.add_argument("--testing", action='store_true', help="Disable wandb logging while running the script in 'testing' mode.")
     parser.add_argument("--save_model", action='store_true', help="Save the best model.")
-    parser.add_argument("--unique_name", action='store_true', help="Unique name under which the model will be stored.")
+    # parser.add_argument("--unique_name", action='store_true', help="Unique name under which the model will be stored.")
+    parser.add_argument("--unique_name", type=str, default=None,help="Unique name under which the model will be stored.")
     parser.add_argument("--finetune", action='store_true', help="Fine-tune a model. Note that args.unique_name needs to point to the pre-trained model.")
     parser.add_argument("--inference", action='store_true', help="Load a trained model and only do AML inference with it. args.unique name needs to point to the trained model.")
 

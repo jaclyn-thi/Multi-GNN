@@ -18,7 +18,7 @@ def infer_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
     #define a model config dictionary and wandb logging at the same time
     wandb.init(
         mode="disabled" if args.testing else "online",
-        project="your_proj_name",
+        project="multi-gnn",
 
         config={
             "epochs": args.n_epochs,
@@ -57,7 +57,7 @@ def infer_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
 
     if args.reverse_mp:
         model = to_hetero(model, te_data.metadata(), aggr='mean')
-    
+
     if not (args.avg_tps or args.finetune):
         command = " ".join(sys.argv)
         name = ""

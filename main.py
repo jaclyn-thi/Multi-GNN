@@ -4,7 +4,10 @@ from util import create_parser, set_seed, logger_setup
 from data_loading import get_data
 from training import train_gnn
 from inference import infer_gnn
+from dotenv import load_dotenv
 import json
+
+load_dotenv()
 
 def main():
     parser = create_parser()
@@ -22,9 +25,9 @@ def main():
     #get data
     logging.info("Retrieving data")
     t1 = time.perf_counter()
-    
+
     tr_data, val_data, te_data, tr_inds, val_inds, te_inds = get_data(args, data_config)
-    
+
     t2 = time.perf_counter()
     logging.info(f"Retrieved data in {t2-t1:.2f}s")
 

@@ -5,8 +5,6 @@ from datatable import f,join,sort
 import sys
 import os
 
-# This is for the IBM AML-World dataset
-
 n = len(sys.argv)
 
 if n == 1:
@@ -40,13 +38,14 @@ firstTs = -1
 with open(outPath, 'w') as writer:
     writer.write(header)
     for i in range(raw.nrows):
-        datetime_object = datetime.strptime(raw[i,"Timestamp"], '%Y/%m/%d %H:%M')
+        datetime_object = datetime.strptime(raw[i,"Date"] + " " + raw[i,"Time"], '%Y-%m-%d %H:%M:%S')
         ts = datetime_object.timestamp()
         day = datetime_object.day
         month = datetime_object.month
         year = datetime_object.year
         hour = datetime_object.hour
-        minute = datetime_object.minute
+        minute = datetime_object.minute # not used yet
+        second = datetime_object.second # new for SAML-D, not used yet
 
         if firstTs == -1:
             startTime = datetime(year, month, day)
@@ -54,21 +53,22 @@ with open(outPath, 'w') as writer:
 
         ts = ts - firstTs
 
-        cur1 = get_dict_val(raw[i,"Receiving Currency"], currency)
-        cur2 = get_dict_val(raw[i,"Payment Currency"], currency)
+        cur1 = get_dict_val(raw[i,"Received_currency"], currency)
+        cur2 = get_dict_val(raw[i,"Payment_currency"], currency)
 
-        fmt = get_dict_val(raw[i,"Payment Format"], paymentFormat)
+        fmt = get_dict_val(raw[i,"Payment_type"], paymentFormat)
 
-        fromAccIdStr = raw[i,"From Bank"] + raw[i,2]
+        fromAccIdStr = raw[i,"Sender_bank_location"] + raw[i,"Sender_account"]
         fromId = get_dict_val(fromAccIdStr, account)
 
-        toAccIdStr = raw[i,"To Bank"] + raw[i,4]
+        toAccIdStr = raw[i,"Receiver_bank_location"] + raw[i,"Receiver_account"]
         toId = get_dict_val(toAccIdStr, account)
 
-        amountReceivedOrig = float(raw[i,"Amount Received"])
-        amountPaidOrig = float(raw[i,"Amount Paid"])
+        # SAML-D specific: only has Amount, so we set Amount Sent = Amount Paid = Amount for now
+        amountReceivedOrig = float(raw[i,"Amount"])
+        amountPaidOrig = float(raw[i,"Amount"])
 
-        isl = int(raw[i,"Is Laundering"])
+        isl = int(raw[i,"Is_laundering"])
 
         line = '%d,%d,%d,%d,%f,%d,%f,%d,%d,%d\n' % \
                     (i,fromId,toId,ts,amountPaidOrig,cur2, amountReceivedOrig,cur1,fmt,isl)
