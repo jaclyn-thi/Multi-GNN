@@ -1,7 +1,7 @@
 {
     "paths": {
       "aml_data": "aml-data",
-      "model_to_load": "/home/jthi/ondemand/data/sys/myjobs/projects/Multi-GNN/models.py",
+      "model_to_load": "/home/jthi/ondemand/data/sys/myjobs/projects/Multi-GNN/saved-models",
       "model_to_save": "/home/jthi/ondemand/data/sys/myjobs/projects/Multi-GNN/saved-models"
     }
   }

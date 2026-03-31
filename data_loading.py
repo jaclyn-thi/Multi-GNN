@@ -7,7 +7,7 @@ from data_util import GraphData, HeteroData, z_norm, create_hetero_obj
 
 def get_data(args, data_config):
     '''Loads the AML transaction data.
-    
+
     1. The data is loaded from the csv and the necessary features are chosen.
     2. The data is split into training, validation and test data.
     3. PyG Data objects are created with the respective data splits.
@@ -53,7 +53,7 @@ def get_data(args, data_config):
         weighted_daily_irs.append(y[day_inds].float().mean() * day_inds.shape[0] / n_samples)
         daily_inds.append(day_inds)
         daily_trans.append(day_inds.shape[0])
-    
+
     split_per = [0.6, 0.2, 0.2]
     daily_totals = np.array(daily_trans)
     d_ts = daily_totals
@@ -91,7 +91,7 @@ def get_data(args, data_config):
         f"{y[val_inds].float().mean() * 100:.2f}% || Val days: {split[1][:5]}")
     logging.info(f"Total test samples: {te_inds.shape[0] / y.shape[0] * 100 :.2f}% || IR: "
         f"{y[te_inds].float().mean() * 100:.2f}% || Test days: {split[2][:5]}")
-    
+
     #Creating the final data objects
     tr_x, val_x, te_x = x, x, x
     e_tr = tr_inds.numpy()
@@ -118,7 +118,7 @@ def get_data(args, data_config):
         val_data.add_time_deltas()
         te_data.add_time_deltas()
         logging.info(f"Done: adding time-deltas")
-    
+
     #Normalize data
     tr_data.x = val_data.x = te_data.x = z_norm(tr_data.x)
     if not args.model == 'rgcn':
@@ -132,10 +132,9 @@ def get_data(args, data_config):
         tr_data = create_hetero_obj(tr_data.x,  tr_data.y,  tr_data.edge_index,  tr_data.edge_attr, tr_data.timestamps, args)
         val_data = create_hetero_obj(val_data.x,  val_data.y,  val_data.edge_index,  val_data.edge_attr, val_data.timestamps, args)
         te_data = create_hetero_obj(te_data.x,  te_data.y,  te_data.edge_index,  te_data.edge_attr, te_data.timestamps, args)
-    
+
     logging.info(f'train data object: {tr_data}')
     logging.info(f'validation data object: {val_data}')
     logging.info(f'test data object: {te_data}')
 
     return tr_data, val_data, te_data, tr_inds, val_inds, te_inds
-    

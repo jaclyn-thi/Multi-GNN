@@ -7,6 +7,70 @@ from torch_geometric.loader import LinkNeighborLoader
 from sklearn.metrics import f1_score
 import json
 
+# def infonce_loss(embeddings, labels, temperature=0.5, device='cpu'):
+#     '''
+#     Compute InfoNCE (Information Noise-Contrastive Estimation) loss.
+
+#     InfoNCE treats embeddings of edges with the same label as positive pairs,
+#     and embeddings of edges with different labels as negative pairs.
+
+#     Args:
+#     - embeddings (torch.Tensor): Node embeddings of shape (num_nodes, embedding_dim)
+#     - labels (torch.Tensor): Binary labels for edges of shape (num_edges,) with values 0 or 1
+#     - temperature (float): Temperature parameter controlling the sharpness of the softmax. Default: 0.5
+#     - device (torch.device or str): Device to place tensors on. Default: 'cpu'
+
+#     Returns:
+#     - torch.Tensor: Scalar loss value
+
+#     Note:
+#     This assumes the batch contains seed edges that have been identified within the subgraph.
+#     For each seed edge, we compute similarity with all other seed edges in the batch.
+#     Edges with matching labels are positive pairs, edges with different labels are negative pairs.
+#     '''
+#     # Normalize embeddings for cosine similarity
+#     embeddings_norm = F.normalize(embeddings, p=2, dim=1)
+
+#     # Compute pairwise cosine similarity matrix
+#     # Shape: (num_nodes, num_nodes)
+#     similarity_matrix = torch.mm(embeddings_norm, embeddings_norm.t()) / temperature
+
+#     # Create positive pair mask (same label)
+#     # Shape: (num_nodes, num_nodes), where 1 indicates same label (positive pair)
+#     labels_expanded = labels.unsqueeze(1)  # (num_edges, 1)
+#     positive_mask = (labels_expanded == labels_expanded.t()).float()  # (num_edges, num_edges)
+
+#     # Diagonal elements (self-pairs) should not be considered as positives
+#     positive_mask.fill_diagonal_(0)
+
+#     # For each sample, the positive mask should have at least the self-pair removed
+#     # Compute the numerator: exp(sim(i, i+))
+#     # We need at least one positive for each sample; if none exist, use the self-pair as fallback
+
+#     # Compute loss using cross-entropy formulation
+#     # The numerator includes the similarity with self (i, i) and positives (i, i+)
+#     # The denominator includes all pairs (self + positives + negatives)
+
+#     # Add self-pair similarity (diagonal) back for numerator only
+#     exp_sim = torch.exp(similarity_matrix)
+
+#     # Sum of exponentials for positive pairs (including self)
+#     # For each row i, sum exp(sim(i, j)) where label_j == label_i
+#     positive_mask_with_self = positive_mask.clone()
+#     positive_mask_with_self.fill_diagonal_(1)  # Include self-pair
+
+#     # Numerator: sum of exp(sim(i, j)) for all j where label_j == label_i
+#     numerator = (exp_sim * positive_mask_with_self).sum(dim=1)
+
+#     # Denominator: sum of all exp(sim(i, j)) for all j (including all negatives and positives)
+#     denominator = exp_sim.sum(dim=1)
+
+#     # Compute loss: -log(numerator / denominator)
+#     loss = -torch.log(numerator / denominator + 1e-8)  # Add small epsilon to avoid log(0)
+
+#     # Return mean loss across all samples
+#     return loss.mean()
+
 class AddEgoIds(BaseTransform):
     r"""Add IDs to the centre nodes of the batch.
     """
@@ -24,19 +88,19 @@ class AddEgoIds(BaseTransform):
         ids[nodes] = 1
         if not isinstance(data, HeteroData):
             data.x = torch.cat([x, ids], dim=1)
-        else: 
+        else:
             data['node'].x = torch.cat([x, ids], dim=1)
-        
+
         return data
 
 def extract_param(parameter_name: str, args) -> float:
     """
     Extract the value of the specified parameter for the given model.
-    
+
     Args:
     - parameter_name (str): Name of the parameter (e.g., "lr").
     - args (argparser): Arguments given to this specific run.
-    
+
     Returns:
     - float: Value of the specified parameter.
     """
@@ -67,24 +131,24 @@ def get_loaders(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, transfor
         tr_edge_label = tr_data['node', 'to', 'node'].y
 
 
-        tr_loader =  LinkNeighborLoader(tr_data, num_neighbors=args.num_neighs, 
-                                    edge_label_index=(('node', 'to', 'node'), tr_edge_label_index), 
+        tr_loader =  LinkNeighborLoader(tr_data, num_neighbors=args.num_neighs,
+                                    edge_label_index=(('node', 'to', 'node'), tr_edge_label_index),
                                     edge_label=tr_edge_label, batch_size=args.batch_size, shuffle=True, transform=transform)
-        
+
         val_edge_label_index = val_data['node', 'to', 'node'].edge_index[:,val_inds]
         val_edge_label = val_data['node', 'to', 'node'].y[val_inds]
 
 
-        val_loader =  LinkNeighborLoader(val_data, num_neighbors=args.num_neighs, 
-                                    edge_label_index=(('node', 'to', 'node'), val_edge_label_index), 
+        val_loader =  LinkNeighborLoader(val_data, num_neighbors=args.num_neighs,
+                                    edge_label_index=(('node', 'to', 'node'), val_edge_label_index),
                                     edge_label=val_edge_label, batch_size=args.batch_size, shuffle=False, transform=transform)
-        
+
         te_edge_label_index = te_data['node', 'to', 'node'].edge_index[:,te_inds]
         te_edge_label = te_data['node', 'to', 'node'].y[te_inds]
 
 
-        te_loader =  LinkNeighborLoader(te_data, num_neighbors=args.num_neighs, 
-                                    edge_label_index=(('node', 'to', 'node'), te_edge_label_index), 
+        te_loader =  LinkNeighborLoader(te_data, num_neighbors=args.num_neighs,
+                                    edge_label_index=(('node', 'to', 'node'), te_edge_label_index),
                                     edge_label=te_edge_label, batch_size=args.batch_size, shuffle=False, transform=transform)
     else:
         tr_loader =  LinkNeighborLoader(tr_data, num_neighbors=args.num_neighs, batch_size=args.batch_size, shuffle=True, transform=transform)
@@ -92,7 +156,7 @@ def get_loaders(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, transfor
                                         edge_label=val_data.y[val_inds], batch_size=args.batch_size, shuffle=False, transform=transform)
         te_loader =  LinkNeighborLoader(te_data,num_neighbors=args.num_neighs, edge_label_index=te_data.edge_index[:, te_inds],
                                 edge_label=te_data.y[te_inds], batch_size=args.batch_size, shuffle=False, transform=transform)
-        
+
     return tr_loader, val_loader, te_loader
 
 @torch.no_grad()
@@ -118,7 +182,7 @@ def evaluate_homo(loader, inds, model, data, device, args):
             add_edge_index = torch.tensor([[node_mapping[val.item()] for val in row] for row in add_edge_index])
             add_edge_attr = data.edge_attr[missing_ids, :].detach().clone()
             add_y = data.y[missing_ids].detach().clone()
-        
+
             batch.edge_index = torch.cat((batch.edge_index, add_edge_index), 1)
             batch.edge_attr = torch.cat((batch.edge_attr, add_edge_attr), 0)
             batch.y = torch.cat((batch.y, add_y), 0)
@@ -127,7 +191,7 @@ def evaluate_homo(loader, inds, model, data, device, args):
 
         #remove the unique edge id from the edge features, as it's no longer needed
         batch.edge_attr = batch.edge_attr[:, 1:]
-        
+
         with torch.no_grad():
             batch.to(device)
             out = model(batch.x, batch.edge_index, batch.edge_attr)
@@ -164,7 +228,7 @@ def evaluate_hetero(loader, inds, model, data, device, args):
             add_edge_index = torch.tensor([[node_mapping[val.item()] for val in row] for row in add_edge_index])
             add_edge_attr = data['node', 'to', 'node'].edge_attr[missing_ids, :].detach().clone()
             add_y = data['node', 'to', 'node'].y[missing_ids].detach().clone()
-        
+
             batch['node', 'to', 'node'].edge_index = torch.cat((batch['node', 'to', 'node'].edge_index, add_edge_index), 1)
             batch['node', 'to', 'node'].edge_attr = torch.cat((batch['node', 'to', 'node'].edge_attr, add_edge_attr), 0)
             batch['node', 'to', 'node'].y = torch.cat((batch['node', 'to', 'node'].y, add_y), 0)
@@ -174,7 +238,7 @@ def evaluate_hetero(loader, inds, model, data, device, args):
         #remove the unique edge id from the edge features, as it's no longer needed
         batch['node', 'to', 'node'].edge_attr = batch['node', 'to', 'node'].edge_attr[:, 1:]
         batch['node', 'rev_to', 'node'].edge_attr = batch['node', 'rev_to', 'node'].edge_attr[:, 1:]
-        
+
         with torch.no_grad():
             batch.to(device)
             out = model(batch.x_dict, batch.edge_index_dict, batch.edge_attr_dict)
@@ -196,7 +260,7 @@ def save_model(model, optimizer, epoch, args, data_config):
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict()
                 }, f'{data_config["paths"]["model_to_save"]}/checkpoint_{args.unique_name}{"" if not args.finetune else "_finetuned"}.tar')
-    
+
 def load_model(model, device, args, config, data_config):
     checkpoint = torch.load(f'{data_config["paths"]["model_to_load"]}/checkpoint_{args.unique_name}.tar')
     model.load_state_dict(checkpoint['model_state_dict'])
