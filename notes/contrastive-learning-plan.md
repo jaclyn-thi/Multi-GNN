@@ -112,78 +112,148 @@ Implement three views of the same graph for contrastive learning:
 ### Phase 3: Data Loader Modifications
 **File**: `data_loading.py`
 
-Modify data loading to support contrastive learning with multiple graph views:
+Modify data loading to support contrastive learning with graph augmentations.
 
-1. **View Generation**
-   - For each original graph/subgraph, generate three augmented views as described in Phase 2b
-   - Apply augmentations during batch creation in LinkNeighborLoader
+### 1. View Generation
+- For each batch (from `LinkNeighborLoader`), generate **two augmented views** using random edge dropping
+- Use `generate_views(data, drop_rate)` from `graph_augmentations.py`
+- Apply augmentations **in the training loop**, not inside the DataLoader itself
 
-2. **Pair Generation for InfoNCE**
-   - Positive pairs:
-     - Same node representations across different views
-     - Neighbor nodes within the same view
-     - Feature-similar nodes (from KNN view)
-   - Negative pairs: All other nodes in the batch
-   - No longer rely solely on `Is Laundering` labels for pair definition
+### 2. Contrastive Pair Definition
+- Positive pairs:
+  - Same node across different views (identity)
+  - Neighbor nodes within each view (via adjacency matrix)
+- Negative pairs:
+  - All other nodes in the batch
+- Pair relationships are handled **implicitly by the contrastive loss**
+- Do not construct explicit pair labels or rely on `Is Laundering` labels
 
-3. **Batch Structure**
-   - Each batch should contain representations from all three views
-   - Ensure sufficient negatives for effective contrastive learning
-   - Consider batch size implications for computational efficiency
+### 3. Batch Structure
+- Each batch produces **two correlated graph views**
+- Each view is passed independently through the model to produce embeddings
+- Contrastive loss is computed between embeddings from the two views
+- Batch size should be chosen to ensure a sufficient number of negatives
 
-4. **Node Features Consideration**
-   - Currently using vector of 1's to prevent memorization for classification
-   - For contrastive pre-training, richer features may improve learning
-   - Plan to experiment with feature usage during pre-training phase
+### 4. Node Features Consideration
+- Node features are currently constant (vector of ones)
+- Structural information is learned via message passing over edge features
+- May experiment with richer node features during pre-training in future work
 
-**LATER:** Add support for pre-computed morphology metrics as additional contrast signals.
+### 5. Edge Metadata Preservation
+- Preserve edge IDs and timestamps for downstream evaluation
+- Ensure augmentations are applied **only within batches**
+- Maintain temporal split integrity (no leakage across train/val/test)
 
-3. **Pair Label Format**
-   - Create tensor `pair_labels` where:
-     - 1 = positive pair (same laundering status)
-     - 0 = negative pair (different laundering status)
-
-4. **Edge Metadata Preservation**
-   - Keep existing edge ID system for train/val/test tracking
-   - Prevent leakage by respecting temporal split in pair generation
+### 6. (Future Work) Morphology Metrics
+- Incorporate graph morphology metrics (e.g., centrality) as an auxiliary loss
+- Keep separate from the contrastive augmentation pipeline
 
 ---
 
 ### Phase 4: Training Loop Refactoring
 **File**: `training.py`
 
-Refactor `train_gnn()`, `train_homo()`, and `train_hetero()`:
+Refactor `train_gnn()`, `train_homo()`, and `train_hetero()` to support **contrastive pretraining followed by downstream evaluation**.
 
-1. **Training Phase**
-   - Loss function: Contrastive loss (InfoNCE, triplet, or pairwise)
-   - Input: Batches from LinkNeighborLoader (subgraph samples)
-   - Output: Node embeddings for seed edges
-   - Compute loss on positive/negative pairs within batch
 
-   ```python
-   for batch in tr_loader:
-       # Get embeddings for all nodes in subgraph
-       embeddings = model(batch.x, batch.edge_index, batch.edge_attr)
+### 1. Contrastive Pretraining Phase
 
-       # Get embeddings for seed edges (edges being trained on)
-       seed_embeddings = embeddings[seed_edge_nodes]
+- **Objective**: Learn node embeddings using multi-view contrastive learning
+- **Loss function**: Contrastive loss (InfoNCE implemented; extensible to triplet/pairwise)
+- **Input**: Batches from `LinkNeighborLoader` containing subgraph samples
+- **Output**: Node embeddings (no classification head during pretraining)
 
-       # Compute contrastive loss on pairs
-       loss = contrastive_loss(seed_embeddings, pair_labels, pair_indices)
-       loss.backward()
-       optimizer.step()
-   ```
+#### Key Design Decisions
+- Operate on **node embeddings across multiple augmented graph views**
+- Do **not restrict to seed edges** — contrastive learning is node-level
+- Positive pairs include:
+  - Same node across different views
+  - Neighbor nodes within a view
+  - Feature-similar nodes (from KNN view)
+- Negative pairs: all other nodes in the batch
 
-2. **Evaluation Phase (Classification)**
-   - Use learned embeddings for downstream classification
-   - Train simple linear classifier (logistic regression) on val/test embeddings
-   - Report F1-score as before
-   - Can be done post-training or as separate evaluation script
+#### Training Loop (Pretraining Mode)
+```python
+for batch in tr_loader:
+    optimizer.zero_grad()
 
-3. **Configuration**
-   - Add `contrastive_loss_type` to `model_settings.json`
-   - Update wandb config to log contrastive-specific metrics
-   - Add parameters: `embedding_dim`, loss-specific params (temperature, margin, etc.)
+    # Multiple augmented views per batch (generated in data loader)
+    views = batch.views
+
+    # Compute embeddings for each view
+    view_embeddings = [
+        model(view.x, view.edge_index, view.edge_attr)
+        for view in views
+    ]
+
+    # Compute contrastive loss across views
+    loss = contrastive_loss(view_embeddings)
+
+    loss.backward()
+    optimizer.step()
+```
+
+
+### 2. Evaluation Phase (Downstream Task)
+
+- **Objective**: Evaluate learned embeddings on AML-related tasks
+- **Approach**:
+  - Freeze pretrained GNN encoder
+  - Extract node embeddings
+  - Train a simple classifier (e.g., linear layer or logistic regression)
+
+#### Notes
+- Classification is **decoupled from representation learning**
+- Evaluation can be:
+  - Run after pretraining (preferred), or
+  - Performed periodically during training
+
+#### Metrics
+- Primary: **Minority-class F1 score**
+- Optional: precision, recall, AUROC
+
+
+### 3. Model Behavior Updates
+
+Modify model forward pass to support dual modes:
+```python
+def forward(self, x, edge_index, edge_attr, return_embeddings=True):
+    embeddings = self.encoder(x, edge_index, edge_attr)
+
+    if return_embeddings:
+        return embeddings
+    else:
+        return self.classifier(embeddings)
+```
+- **Pretraining**: return embeddings only
+- **Evaluation**: pass embeddings through classifier head
+
+
+### 4. Configuration Updates
+
+Update `model_settings.json`:
+
+- Contrastive learning parameters:
+  - `embedding_dim`
+  - `contrastive_loss_type` (e.g., `"infonce"`)
+  - `temperature`
+  - `margin` (if applicable)
+
+- Training control:
+  - `training_mode`: `"contrastive"` or `"supervised"`
+
+
+### 5. Logging (wandb)
+
+Track contrastive-specific metrics:
+
+- Training loss (InfoNCE)
+- Embedding statistics:
+  - Norms
+  - Cosine similarity (positive vs negative pairs)
+
+- Optional:
+  - Alignment vs uniformity metrics
 
 ---
 

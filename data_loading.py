@@ -120,7 +120,12 @@ def get_data(args, data_config):
         logging.info(f"Done: adding time-deltas")
 
     #Normalize data
-    tr_data.x = val_data.x = te_data.x = z_norm(tr_data.x)
+    # tr_data.x = val_data.x = te_data.x = z_norm(tr_data.x)
+
+    tr_data.x = z_norm(tr_data.x)
+    val_data.x = tr_data.x.clone()
+    te_data.x = tr_data.x.clone()
+
     if not args.model == 'rgcn':
         tr_data.edge_attr, val_data.edge_attr, te_data.edge_attr = z_norm(tr_data.edge_attr), z_norm(val_data.edge_attr), z_norm(te_data.edge_attr)
     else:
@@ -137,4 +142,27 @@ def get_data(args, data_config):
     logging.info(f'validation data object: {val_data}')
     logging.info(f'test data object: {te_data}')
 
+    tr_data.is_contrastive = True
+    val_data.is_contrastive = True
+    te_data.is_contrastive = True
+
     return tr_data, val_data, te_data, tr_inds, val_inds, te_inds
+
+
+def get_forward_edge_index(data):
+    """
+    Returns the correct edge_index for adjacency construction.
+
+    Supports:
+    - homogeneous GraphData
+    - heterogeneous graphs (reverse_mp)
+
+    For hetero graphs, uses only forward edges.
+    """
+
+    # Heterogeneous graph
+    if hasattr(data, "edge_types"):
+        return data['node', 'to', 'node'].edge_index
+
+    # Homogeneous graph
+    return data.edge_index
