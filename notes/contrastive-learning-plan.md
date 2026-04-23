@@ -204,21 +204,26 @@ for batch in tr_loader:
 ```
 
 
-### 2. Evaluation Phase (Downstream Task)
+### 2. Structural Contrastive Learning (Edge Adjacency)
 
-- **Objective:** Evaluate learned embeddings on AML transaction classification
+- **Objective:** Improve contrastive learning by incorporating graph structure into positive pair definitions
+
+- **Key Idea:**
+  - Phase 4.1 uses only identity positives (same edge across views)
+  - Extend this by treating **edges that share a node** as additional positives
+
 - **Approach:**
-   - Use pretrained GNN encoder
-   - Pass embeddings through classifier head
-   - Perform supervised evaluation as in original pipeline
-**Notes**
-- Classification is **decoupled from representation learning**
-- Evaluation can be:
-   - Run after pretraining (preferred), or
-   - Performed periodically during training
-**Metrics**
-   - Primary: **Minority-class F1 score**
-   - Optional: precision, recall, AUROC
+  - Build an edge-level adjacency matrix `A_edge` per batch:
+    - `A_edge[i, j] = 1` if edges i and j share a node
+  - Pass `A_edge` into `contrastive_loss`:
+    ```python
+    loss = contrastive_loss(z1, z2, A=A_edge)
+    ```
+
+- **Notes:**
+  - Edge ordering must remain consistent across views
+  - Do not apply edge dropping yet (to preserve alignment)
+  - Adjacency is constructed per batch, not globally
 
 
 ### 3. Model Behavior Updates
