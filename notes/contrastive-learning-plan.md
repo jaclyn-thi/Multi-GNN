@@ -158,36 +158,46 @@ Refactor `train_gnn()`, `train_homo()`, and `train_hetero()` to support **contra
 
 ### 1. Contrastive Pretraining Phase
 
-- **Objective**: Learn node embeddings using multi-view contrastive learning
+- **Objective**: Learn **transaction (edge) embeddings** using multi-view contrastive learning
 - **Loss function**: Contrastive loss (InfoNCE implemented; extensible to triplet/pairwise)
 - **Input**: Batches from `LinkNeighborLoader` containing subgraph samples
-- **Output**: Node embeddings (no classification head during pretraining)
+- **Output**: Edge embeddings (no classification head during pretraining)
 
 #### Key Design Decisions
-- Operate on **node embeddings across multiple augmented graph views**
-- Do **not restrict to seed edges** — contrastive learning is node-level
-- Positive pairs include:
-  - Same node across different views
-  - Neighbor nodes within a view
-  - Feature-similar nodes (from KNN view)
-- Negative pairs: all other nodes in the batch
+- Operate on **transaction (edge) embeddings**, where each embedding encodes:
+  - source node representation
+  - destination node representation
+  - edge features
+- Each edge corresponds to a **single training sample**
+- Positive pairs:
+  - Same edge across different augmented views (identity)
+- Negative pairs:
+  - All other edges in the batch
+- **Edge ordering must be preserved across views** to ensure correct alignment
+
+#### Important Constraint
+- Graph augmentations must **NOT change edge ordering**
+- Do NOT drop edges by filtering (this breaks alignment)
+- Instead:
+  - Use identical edge sets across views
+  - Introduce stochasticity via:
+    - GNN dropout
+    - (future) structure-aware perturbations
 
 #### Training Loop (Pretraining Mode)
 ```python
 for batch in tr_loader:
     optimizer.zero_grad()
 
-    # Multiple augmented views per batch (generated in data loader)
-    views = batch.views
+    # Generate two aligned views (same edge ordering)
+    view1, view2 = generate_views(batch, drop_rate)
 
-    # Compute embeddings for each view
-    view_embeddings = [
-        model(view.x, view.edge_index, view.edge_attr)
-        for view in views
-    ]
+    # Compute embeddings (edge-level)
+    z1 = model(view1.x, view1.edge_index, view1.edge_attr)
+    z2 = model(view2.x, view2.edge_index, view2.edge_attr)
 
-    # Compute contrastive loss across views
-    loss = contrastive_loss(view_embeddings)
+    # Contrastive loss (edge-aligned)
+    loss = contrastive_loss(z1, z2)
 
     loss.backward()
     optimizer.step()
@@ -196,36 +206,34 @@ for batch in tr_loader:
 
 ### 2. Evaluation Phase (Downstream Task)
 
-- **Objective**: Evaluate learned embeddings on AML-related tasks
-- **Approach**:
-  - Freeze pretrained GNN encoder
-  - Extract node embeddings
-  - Train a simple classifier (e.g., linear layer or logistic regression)
-
-#### Notes
+- **Objective:** Evaluate learned embeddings on AML transaction classification
+- **Approach:**
+   - Use pretrained GNN encoder
+   - Pass embeddings through classifier head
+   - Perform supervised evaluation as in original pipeline
+**Notes**
 - Classification is **decoupled from representation learning**
 - Evaluation can be:
-  - Run after pretraining (preferred), or
-  - Performed periodically during training
-
-#### Metrics
-- Primary: **Minority-class F1 score**
-- Optional: precision, recall, AUROC
+   - Run after pretraining (preferred), or
+   - Performed periodically during training
+**Metrics**
+   - Primary: **Minority-class F1 score**
+   - Optional: precision, recall, AUROC
 
 
 ### 3. Model Behavior Updates
 
-Modify model forward pass to support dual modes:
+Model already supports dual modes:
 ```python
 def forward(self, x, edge_index, edge_attr, return_embeddings=True):
-    embeddings = self.encoder(x, edge_index, edge_attr)
+    z = self.embedding_head(...)
 
     if return_embeddings:
-        return embeddings
+        return z
     else:
-        return self.classifier(embeddings)
+        return self.classifier(z)
 ```
-- **Pretraining**: return embeddings only
+- **Pretraining**: return embeddings (`z`)
 - **Evaluation**: pass embeddings through classifier head
 
 
