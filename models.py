@@ -3,13 +3,14 @@ from torch_geometric.nn import GINEConv, BatchNorm, Linear, GATConv, PNAConv, RG
 import torch.nn.functional as F
 import torch
 import logging
+from torch.utils.checkpoint import checkpoint
 
 
 class GINe(torch.nn.Module):
     def __init__(self, num_features, num_gnn_layers, n_classes=2,
                 n_hidden=100, edge_updates=False, residual=True,
                 edge_dim=None, dropout=0.0, final_dropout=0.5,
-                embedding_dim=128):
+                embedding_dim=128, use_gradient_checkpointing=False):
 
         super().__init__()
         self.n_hidden = n_hidden
@@ -17,6 +18,7 @@ class GINe(torch.nn.Module):
         self.edge_updates = edge_updates
         self.final_dropout = final_dropout
         self.embedding_dim = embedding_dim
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         self.node_emb = nn.Linear(num_features, n_hidden)
         self.edge_emb = nn.Linear(edge_dim, n_hidden)
@@ -53,31 +55,84 @@ class GINe(torch.nn.Module):
             nn.Linear(50, n_classes)
         )
 
+    def _input_embedding_forward(self, x: torch.Tensor, edge_attr: torch.Tensor) -> tuple:
+        return self.node_emb(x), self.edge_emb(edge_attr)
+
+    def _gine_layer_forward(
+        self,
+        layer_idx_t: torch.Tensor,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+    ) -> tuple:
+        i = int(layer_idx_t.item())
+        src, dst = edge_index
+        x = (x + F.relu(self.batch_norms[i](self.convs[i](x, edge_index, edge_attr)))) / 2
+        if self.edge_updates:
+            edge_attr = edge_attr + self.emlps[i](
+                torch.cat([x[src], x[dst], edge_attr], dim=-1)
+            ) / 2
+        return x, edge_attr
+
     def forward(self, x, edge_index, edge_attr, return_embeddings=True):
         src, dst = edge_index
 
-        x = self.node_emb(x)
-        edge_attr = self.edge_emb(edge_attr)
+        if self.use_gradient_checkpointing and self.training:
+            x, edge_attr = checkpoint(
+                self._input_embedding_forward,
+                x,
+                edge_attr,
+                use_reentrant=False,
+            )
+        else:
+            x = self.node_emb(x)
+            edge_attr = self.edge_emb(edge_attr)
 
         for i in range(self.num_gnn_layers):
-            x = (x + F.relu(self.batch_norms[i](self.convs[i](x, edge_index, edge_attr)))) / 2
-            if self.edge_updates:
-                edge_attr = edge_attr + self.emlps[i](
-                    torch.cat([x[src], x[dst], edge_attr], dim=-1)
-                ) / 2
+            if self.use_gradient_checkpointing and self.training:
+                idx = torch.tensor(i, device=x.device, dtype=torch.int64)
+                x, edge_attr = checkpoint(
+                    self._gine_layer_forward,
+                    idx,
+                    x,
+                    edge_index,
+                    edge_attr,
+                    use_reentrant=False,
+                )
+            else:
+                x = (x + F.relu(self.batch_norms[i](self.convs[i](x, edge_index, edge_attr)))) / 2
+                if self.edge_updates:
+                    edge_attr = edge_attr + self.emlps[i](
+                        torch.cat([x[src], x[dst], edge_attr], dim=-1)
+                    ) / 2
 
-        # --- edge features ---
-        x = x[edge_index.T].reshape(-1, 2 * self.n_hidden).relu()
-        x = torch.cat((x, edge_attr), dim=1)
-
-        # --- embeddings ---
-        z = self.embedding_head(x)
+        # Per-edge readout + embedding head: large activations; checkpoint when enabled.
+        if self.use_gradient_checkpointing and self.training:
+            z = checkpoint(
+                self._embedding_tail_forward,
+                x,
+                edge_index,
+                edge_attr,
+                use_reentrant=False,
+            )
+        else:
+            z = self._embedding_tail_forward(x, edge_index, edge_attr)
 
         # allow switching between representation learning and classification
         if return_embeddings:
             return z
         else:
             return self.classifier(z)
+
+    def _embedding_tail_forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+    ) -> torch.Tensor:
+        x = x[edge_index.T].reshape(-1, 2 * self.n_hidden).relu()
+        x = torch.cat((x, edge_attr), dim=1)
+        return self.embedding_head(x)
 
 
 class GATe(torch.nn.Module):

@@ -1,0 +1,11 @@
+logs/
+aml-data/
+*.zip
+slurm-logs/
+tests/
+wandb/
+*.env
+script.sh
+*.ipynb
+saved-models/
+raw-aml-data/

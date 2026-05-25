@@ -47,6 +47,15 @@ def extract_param(parameter_name: str, args) -> float:
 
     return data.get(args.model, {}).get("params", {}).get(parameter_name, None)
 
+def _strip_synthetic_edge_attr_id_column(batch: Data) -> None:
+    """If column 0 of ``edge_attr`` duplicates ``batch.edge_id`` (from :func:`add_arange_ids`), drop it."""
+    ea = batch.edge_attr
+    if ea is None or ea.shape[1] < 2:
+        return
+    if torch.equal(batch.edge_id, ea[:, 0].long().view(-1)):
+        batch.edge_attr = ea[:, 1:].clone()
+
+
 def add_arange_ids(data_list):
     '''
     Add the index as an id to the edge features to find seed edges in training, validation and testing.
@@ -62,7 +71,60 @@ def add_arange_ids(data_list):
         else:
             data.edge_attr = torch.cat([torch.arange(data.edge_attr.shape[0]).view(-1, 1), data.edge_attr], dim=1)
 
+
+def attach_edge_id_from_batch(batch: Union[Data, HeteroData]) -> None:
+    """
+    Populate ``batch.edge_id`` (long, one per message-passing edge) for contrastive pairing.
+
+    Prefer an existing stable id from the batch (``edge_id``, PyG ``e_id``). Otherwise use
+    column 0 of ``edge_attr`` from :func:`add_arange_ids`, then remove that column so the
+    GNN does not see ids as features.
+
+    When ``edge_id``/``e_id`` comes from the loader but ``edge_attr`` still has a leading
+    id column from :func:`add_arange_ids` (matching ``batch.edge_id``), that column is
+    removed as well.
+
+    Mutates ``batch`` in place (same pattern as training/eval stripping of the id column).
+    """
+    if isinstance(batch, HeteroData):
+        raise TypeError("attach_edge_id_from_batch supports homogeneous Data batches only.")
+
+    if getattr(batch, "edge_id", None) is not None:
+        if batch.edge_id.shape[0] != batch.edge_index.shape[1]:
+            raise ValueError("batch.edge_id length must match number of edges.")
+        _strip_synthetic_edge_attr_id_column(batch)
+        return
+
+    eid = getattr(batch, "e_id", None)
+    if eid is not None:
+        eid = eid.long().view(-1).clone()
+        if eid.shape[0] != batch.edge_index.shape[1]:
+            raise ValueError(
+                f"e_id length {eid.shape[0]} must match edge_index ({batch.edge_index.shape[1]})."
+            )
+        batch.edge_id = eid
+        _strip_synthetic_edge_attr_id_column(batch)
+        return
+
+    if batch.edge_attr is None or batch.edge_attr.shape[1] < 1:
+        raise ValueError(
+            "No edge_id/e_id and no edge_attr id column; run add_arange_ids on graph data "
+            "before the loader, or set batch.edge_id."
+        )
+    batch.edge_id = batch.edge_attr[:, 0].long().clone()
+    batch.edge_attr = batch.edge_attr[:, 1:].clone()
+
+def _link_neighbor_loader_kwargs(args) -> dict:
+    """``num_workers`` + ``persistent_workers`` for PyG ``LinkNeighborLoader`` (same as DataLoader)."""
+    n = max(0, int(getattr(args, "loader_num_workers", 10)))
+    kw = {"num_workers": n}
+    if n > 0:
+        kw["persistent_workers"] = True
+    return kw
+
+
 def get_loaders(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, transform, args):
+    lw = _link_neighbor_loader_kwargs(args)
     if isinstance(tr_data, HeteroData):
         tr_edge_label_index = tr_data['node', 'to', 'node'].edge_index
         tr_edge_label = tr_data['node', 'to', 'node'].y
@@ -70,7 +132,7 @@ def get_loaders(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, transfor
 
         tr_loader =  LinkNeighborLoader(tr_data, num_neighbors=args.num_neighs,
                                     edge_label_index=(('node', 'to', 'node'), tr_edge_label_index),
-                                    edge_label=tr_edge_label, batch_size=args.batch_size, shuffle=True, transform=transform)
+                                    edge_label=tr_edge_label, batch_size=args.batch_size, shuffle=True, transform=transform, **lw)
 
         val_edge_label_index = val_data['node', 'to', 'node'].edge_index[:,val_inds]
         val_edge_label = val_data['node', 'to', 'node'].y[val_inds]
@@ -78,7 +140,7 @@ def get_loaders(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, transfor
 
         val_loader =  LinkNeighborLoader(val_data, num_neighbors=args.num_neighs,
                                     edge_label_index=(('node', 'to', 'node'), val_edge_label_index),
-                                    edge_label=val_edge_label, batch_size=args.batch_size, shuffle=False, transform=transform)
+                                    edge_label=val_edge_label, batch_size=args.batch_size, shuffle=False, transform=transform, **lw)
 
         te_edge_label_index = te_data['node', 'to', 'node'].edge_index[:,te_inds]
         te_edge_label = te_data['node', 'to', 'node'].y[te_inds]
@@ -86,13 +148,13 @@ def get_loaders(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, transfor
 
         te_loader =  LinkNeighborLoader(te_data, num_neighbors=args.num_neighs,
                                     edge_label_index=(('node', 'to', 'node'), te_edge_label_index),
-                                    edge_label=te_edge_label, batch_size=args.batch_size, shuffle=False, transform=transform)
+                                    edge_label=te_edge_label, batch_size=args.batch_size, shuffle=False, transform=transform, **lw)
     else:
-        tr_loader =  LinkNeighborLoader(tr_data, num_neighbors=args.num_neighs, batch_size=args.batch_size, shuffle=True, transform=transform)
+        tr_loader =  LinkNeighborLoader(tr_data, num_neighbors=args.num_neighs, batch_size=args.batch_size, shuffle=True, transform=transform, **lw)
         val_loader = LinkNeighborLoader(val_data,num_neighbors=args.num_neighs, edge_label_index=val_data.edge_index[:, val_inds],
-                                        edge_label=val_data.y[val_inds], batch_size=args.batch_size, shuffle=False, transform=transform)
+                                        edge_label=val_data.y[val_inds], batch_size=args.batch_size, shuffle=False, transform=transform, **lw)
         te_loader =  LinkNeighborLoader(te_data,num_neighbors=args.num_neighs, edge_label_index=te_data.edge_index[:, te_inds],
-                                edge_label=te_data.y[te_inds], batch_size=args.batch_size, shuffle=False, transform=transform)
+                                edge_label=te_data.y[te_inds], batch_size=args.batch_size, shuffle=False, transform=transform, **lw)
 
     return tr_loader, val_loader, te_loader
 

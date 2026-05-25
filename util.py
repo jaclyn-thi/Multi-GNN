@@ -33,7 +33,7 @@ def create_parser():
     #Model parameters
     parser.add_argument("--batch_size", default=8192, type=int, help="Select the batch size for GNN training")
     parser.add_argument("--n_epochs", default=100, type=int, help="Select the number of epochs for GNN training")
-    parser.add_argument('--num_neighs', nargs='+', default=[100,100], help='Pass the number of neighors to be sampled in each hop (descending).')
+    parser.add_argument('--num_neighs', nargs='+', type=int, default=[100,100], help='Pass the number of neighors to be sampled in each hop (descending).')
 
     #Misc
     parser.add_argument("--seed", default=1, type=int, help="Select the random seed for reproducability")
@@ -46,6 +46,41 @@ def create_parser():
     parser.add_argument("--unique_name", type=str, default=None,help="Unique name under which the model will be stored.")
     parser.add_argument("--finetune", action='store_true', help="Fine-tune a model. Note that args.unique_name needs to point to the pre-trained model.")
     parser.add_argument("--inference", action='store_true', help="Load a trained model and only do AML inference with it. args.unique name needs to point to the trained model.")
+    parser.add_argument(
+        "--loader_num_workers",
+        type=int,
+        default=10,
+        help="CPU workers for LinkNeighborLoader prefetch/sampling (0 = single process). Often 8–12 is enough even on many-core nodes; use 0 to debug or on memory-tight login nodes.",
+    )
+
+    # Contrastive / memory (homogeneous training path)
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        help="Use CUDA automatic mixed precision for contrastive training (homogeneous path).",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="Use gradient checkpointing in GIN message-passing layers (homogeneous GIN only).",
+    )
+    parser.add_argument(
+        "--contrastive_num_neg_samples",
+        type=int,
+        default=8192,
+        help="Edge InfoNCE: negatives per anchor sampled uniformly (0 = all negatives, chunked).",
+    )
+    parser.add_argument(
+        "--contrastive_asymmetric",
+        action="store_true",
+        help="Compute view-2 embeddings with no grad and use only the z1→z2 loss term (saves VRAM vs symmetric two-branch training).",
+    )
+    parser.add_argument(
+        "--contrastive_accum_steps",
+        type=int,
+        default=1,
+        help="Homogeneous contrastive: accumulate this many loader batches before optimizer.step (loss is scaled 1/N per batch). Use with a smaller --batch_size to cut peak VRAM while keeping similar step frequency.",
+    )
 
     return parser
 

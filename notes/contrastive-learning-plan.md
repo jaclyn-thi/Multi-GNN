@@ -210,7 +210,25 @@ for batch in tr_loader:
 
 - **Key Idea:**
   - Phase 4.1 uses only identity positives (same edge across views)
-  - Extend this by treating **edges that share a node** as additional positives
+  - Extend this by defining positive examples on the edge level using tiers:
+
+### Positive Pair Definition for Edge-Level Contrastive Learning
+
+Because the model learns transaction/edge embeddings, positive pairs are defined over transactions rather than nodes.
+
+1. **Identity positives across views**
+   - If the same original transaction appears in both augmented views, its embeddings form a positive pair.
+   - This requires preserving a stable `edge_id` through augmentation.
+   - Since independent edge dropping may remove a transaction from one view, anchors without a matching `edge_id` in the other view are skipped for the identity-only loss.
+
+2. **Structural positives (future extension)**
+   - Transactions may also be treated as positives if they share endpoint accounts, e.g. same sender, same receiver, or flow continuation patterns.
+   - To avoid dense `E × E` adjacency matrices, structural positives should be sampled or constructed via account-to-transaction lookup tables.
+
+3. **Time-aware structural positives (future extension)**
+   - Shared-account positives can be filtered by temporal proximity to better capture AML-relevant transaction patterns.
+
+Labels such as `Is Laundering` are not used for pretraining positive-pair construction.
 
 - **Approach:**
   - Build an edge-level adjacency matrix `A_edge` per batch:
