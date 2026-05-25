@@ -1,6 +1,5 @@
 logs/
 aml-data/
-*.zip
 slurm-logs/
 tests/
 wandb/
