@@ -81,6 +81,12 @@ def create_parser():
         default=1,
         help="Homogeneous contrastive: accumulate this many loader batches before optimizer.step (loss is scaled 1/N per batch). Use with a smaller --batch_size to cut peak VRAM while keeping similar step frequency.",
     )
+    parser.add_argument(
+        "--contrastive_memory_bank_size",
+        type=int,
+        default=0,
+        help="Optional detached queue of prior seed-edge embeddings used as extra negatives (0 disables the queue).",
+    )
 
     return parser
 

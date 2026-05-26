@@ -7,10 +7,12 @@ from train_util import (
     extract_param,
     add_arange_ids,
     attach_edge_id_from_batch,
+    get_homo_seed_edge_ids,
     get_loaders,
     evaluate_homo,
     evaluate_hetero,
     save_model,
+    select_shared_seed_edge_embeddings,
     load_model,
 )
 from models import GINe, PNA, GATe, RGCN
@@ -19,7 +21,7 @@ from torch_geometric.nn import to_hetero, summary
 from torch_geometric.utils import degree
 from pytorch_metric_learning.losses import NTXentLoss
 from graph_augmentations import generate_views
-from contrastive_loss import edge_identity_infonce_loss
+from contrastive_loss import EdgeMemoryQueue, edge_identity_infonce_loss
 import wandb
 import logging
 
@@ -35,6 +37,8 @@ def train_homo(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, mod
     num_neg_samples = neg_kw if neg_kw > 0 else None
     contrastive_symmetric = not bool(getattr(args, "contrastive_asymmetric", False))
     accum_steps = max(1, int(getattr(args, "contrastive_accum_steps", 1)))
+    memory_bank_size = max(0, int(getattr(args, "contrastive_memory_bank_size", 0)))
+    memory_queue = EdgeMemoryQueue(memory_bank_size, device=device) if memory_bank_size > 0 else None
     try:
         n_train_batches = len(tr_loader)
     except TypeError:
@@ -47,21 +51,17 @@ def train_homo(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, mod
         accum_steps = 1
 
     for epoch in range(config.epochs):
-        total_loss = total_examples = 0
+        total_examples = 0
+        loss_sum = torch.zeros((), device=device)
         # preds = []
         # ground_truths = []
         optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(tqdm.tqdm(tr_loader, disable=not args.tqdm)):
-            # (old) seed edges and masking
-            #select the seed edges from which the batch was created
-            # inds = tr_inds.detach().cpu()
-            # batch_edge_inds = inds[batch.input_id.detach().cpu()]
-            # batch_edge_ids = tr_loader.data.edge_attr.detach().cpu()[batch_edge_inds, 0]
-            # mask = torch.isin(batch.edge_attr[:, 0].detach().cpu(), batch_edge_ids)
-
+            seed_edge_ids = get_homo_seed_edge_ids(batch, tr_loader.data)
             attach_edge_id_from_batch(batch)
 
-            batch.to(device)
+            batch.to(device, non_blocking=True)
+            seed_edge_ids = seed_edge_ids.to(device, non_blocking=True)
             if epoch == 0 and step == 0:
                 n_sub = int(batch.num_nodes) if getattr(batch, "num_nodes", None) is not None else int(batch.x.shape[0])
                 e_mp = int(batch.edge_index.shape[1])
@@ -95,15 +95,30 @@ def train_homo(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, mod
                 else:
                     with torch.no_grad():
                         z2 = model(view2.x, view2.edge_index, view2.edge_attr, return_embeddings=True)
+            z1_seed, seed_id1, z2_seed, seed_id2 = select_shared_seed_edge_embeddings(
+                z1,
+                view1.edge_id,
+                z2,
+                view2.edge_id,
+                seed_edge_ids,
+            )
+            if epoch == 0 and step == 0:
+                logging.info(
+                    "Contrastive seed-edge filtering: requested_seed_edges=%s shared_seed_edges=%s queue_size=%s",
+                    int(seed_edge_ids.numel()),
+                    int(seed_id1.numel()),
+                    0 if memory_queue is None else memory_queue.size,
+                )
             with autocast(enabled=False):
                 loss_raw = edge_identity_infonce_loss(
-                    z1,
-                    z2,
-                    view1.edge_id,
-                    view2.edge_id,
+                    z1_seed,
+                    z2_seed,
+                    seed_id1,
+                    seed_id2,
                     temperature=0.5,
                     num_neg_samples=num_neg_samples,
                     symmetric=contrastive_symmetric,
+                    memory_queue=memory_queue,
                 )
             loss = loss_raw / float(accum_steps)
 
@@ -124,14 +139,13 @@ def train_homo(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, mod
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            # (old) loss scaling
-            # total_loss += float(loss) * pred.numel()
-            # total_examples += pred.numel()
+            if memory_queue is not None and seed_id2.numel() > 0:
+                memory_queue.enqueue(z2_seed, seed_id2)
 
-            total_loss += float(loss_raw.detach().item())
+            loss_sum = loss_sum + loss_raw.detach()
             total_examples += 1
 
-        avg_loss = total_loss / total_examples
+        avg_loss = float((loss_sum / max(total_examples, 1)).cpu())
         wandb.log({"loss/train": avg_loss}, step=epoch)
         logging.info(f"Train Loss: {avg_loss:.4f}")
 
@@ -317,6 +331,7 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
             "contrastive_num_neg_samples": int(getattr(args, "contrastive_num_neg_samples", 0)),
             "contrastive_asymmetric": bool(getattr(args, "contrastive_asymmetric", False)),
             "contrastive_accum_steps": int(getattr(args, "contrastive_accum_steps", 1)),
+            "contrastive_memory_bank_size": int(getattr(args, "contrastive_memory_bank_size", 0)),
             "loader_num_workers": int(getattr(args, "loader_num_workers", 10)),
         }
     )

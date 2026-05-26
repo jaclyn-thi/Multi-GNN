@@ -23,10 +23,18 @@ import wandb
 from torch.cuda.amp import GradScaler, autocast
 from torch_geometric.data import HeteroData
 
-from contrastive_loss import edge_identity_infonce_loss
+from contrastive_loss import EdgeMemoryQueue, edge_identity_infonce_loss
 from data_loading import get_data
 from graph_augmentations import generate_views
-from train_util import AddEgoIds, add_arange_ids, attach_edge_id_from_batch, extract_param, get_loaders
+from train_util import (
+    AddEgoIds,
+    add_arange_ids,
+    attach_edge_id_from_batch,
+    extract_param,
+    get_homo_seed_edge_ids,
+    get_loaders,
+    select_shared_seed_edge_embeddings,
+)
 from training import get_model
 from util import create_parser, logger_setup, set_seed
 
@@ -104,6 +112,7 @@ def main() -> None:
             "gradient_checkpointing": bool(getattr(args, "gradient_checkpointing", False)),
             "contrastive_num_neg_samples": int(getattr(args, "contrastive_num_neg_samples", 0)),
             "contrastive_asymmetric": bool(getattr(args, "contrastive_asymmetric", False)),
+            "contrastive_memory_bank_size": int(getattr(args, "contrastive_memory_bank_size", 0)),
             "loader_num_workers": int(getattr(args, "loader_num_workers", 10)),
         },
     )
@@ -124,7 +133,9 @@ def main() -> None:
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
 
+    seed_edge_ids = get_homo_seed_edge_ids(batch, tr_loader.data)
     batch.to(device)
+    seed_edge_ids = seed_edge_ids.to(device)
     ea_before = batch.edge_attr.clone()
     logging.info(
         "pre-attach: edge_attr shape=%s, edge_id=%s, e_id=%s",
@@ -171,16 +182,14 @@ def main() -> None:
     assert view2.edge_id.shape[0] == view2.edge_index.shape[1]
     assert view1.edge_index.shape[1] > 0 and view2.edge_index.shape[1] > 0
 
-    # Avoid (E1 x E2) broadcast — real batches can have hundreds of thousands of edges (OOM on GPU).
-    overlap = torch.isin(view1.edge_id, view2.edge_id).any()
-    assert overlap.item(), "expected at least one shared edge_id between views (retry seed if this fails on a tiny batch)"
-
     model.train()
     use_amp = bool(getattr(args, "amp", False)) and device.type == "cuda"
     scaler = GradScaler(enabled=use_amp)
     neg_kw = int(getattr(args, "contrastive_num_neg_samples", 8192))
     num_neg_samples = neg_kw if neg_kw > 0 else None
     contrastive_symmetric = not bool(getattr(args, "contrastive_asymmetric", False))
+    memory_bank_size = max(0, int(getattr(args, "contrastive_memory_bank_size", 0)))
+    memory_queue = EdgeMemoryQueue(memory_bank_size, device=device) if memory_bank_size > 0 else None
 
     optimizer.zero_grad(set_to_none=True)
 
@@ -197,15 +206,23 @@ def main() -> None:
                 z2 = model(
                     view2.x, view2.edge_index, view2.edge_attr, return_embeddings=True
                 )
+    z1_seed, seed_id1, z2_seed, seed_id2 = select_shared_seed_edge_embeddings(
+        z1,
+        view1.edge_id,
+        z2,
+        view2.edge_id,
+        seed_edge_ids,
+    )
     with autocast(enabled=False):
         loss = edge_identity_infonce_loss(
-            z1,
-            z2,
-            view1.edge_id,
-            view2.edge_id,
+            z1_seed,
+            z2_seed,
+            seed_id1,
+            seed_id2,
             temperature=0.5,
             num_neg_samples=num_neg_samples,
             symmetric=contrastive_symmetric,
+            memory_queue=memory_queue,
         )
 
     if use_amp:
@@ -223,12 +240,14 @@ def main() -> None:
     print(f"batch.edge_index shape: {tuple(batch.edge_index.shape)}")
     print(f"batch.edge_attr shape:  {tuple(batch.edge_attr.shape)}")
     print(f"view1 edges: {view1.edge_index.shape[1]}, view2 edges: {view2.edge_index.shape[1]}")
-    print(f"z1 shape: {tuple(z1.shape)}")
-    print(f"z2 shape: {tuple(z2.shape)}")
+    print(f"seed edges requested: {seed_edge_ids.numel()}")
+    print(f"shared seed edges kept: {seed_id1.numel()}")
+    print(f"z1 seed shape: {tuple(z1_seed.shape)}")
+    print(f"z2 seed shape: {tuple(z2_seed.shape)}")
     print(f"loss: {loss.item():.6f}")
     print(
         f"amp: {bool(getattr(args, 'amp', False))}, num_neg_samples: {num_neg_samples}, "
-        f"symmetric: {contrastive_symmetric}"
+        f"symmetric: {contrastive_symmetric}, queue_size: {memory_bank_size}"
     )
     print(f"loss finite: {loss_ok}")
     print(f"first nonzero grad: {gname} -> {gnorm}")

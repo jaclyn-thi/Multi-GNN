@@ -1,7 +1,7 @@
 import torch
 import tqdm
 from torch_geometric.transforms import BaseTransform
-from typing import Union
+from typing import Tuple, Union
 from torch_geometric.data import Data, HeteroData
 from torch_geometric.loader import LinkNeighborLoader
 from sklearn.metrics import f1_score
@@ -113,6 +113,79 @@ def attach_edge_id_from_batch(batch: Union[Data, HeteroData]) -> None:
         )
     batch.edge_id = batch.edge_attr[:, 0].long().clone()
     batch.edge_attr = batch.edge_attr[:, 1:].clone()
+
+
+def get_homo_seed_edge_ids(batch: Data, loader_data: Data) -> torch.Tensor:
+    """
+    Resolve the stable edge ids for the *seed* edges used to form a homogeneous
+    ``LinkNeighborLoader`` batch.
+
+    ``add_arange_ids()`` stores the stable id in column 0 of ``loader_data.edge_attr``.
+    PyG exposes the seed-edge positions as ``batch.input_id``.
+    """
+    if isinstance(batch, HeteroData):
+        raise TypeError("get_homo_seed_edge_ids supports homogeneous Data batches only.")
+    input_id = getattr(batch, "input_id", None)
+    if input_id is None:
+        raise ValueError("Batch is missing input_id; cannot resolve seed edge ids.")
+    if getattr(loader_data, "edge_attr", None) is None or loader_data.edge_attr.shape[1] < 1:
+        raise ValueError("Loader data is missing edge_attr ids from add_arange_ids().")
+    seed_edge_ids = loader_data.edge_attr[input_id.long().view(-1).cpu(), 0]
+    return seed_edge_ids.long().clone()
+
+
+def select_shared_seed_edge_embeddings(
+    z1: torch.Tensor,
+    edge_id1: torch.Tensor,
+    z2: torch.Tensor,
+    edge_id2: torch.Tensor,
+    seed_edge_ids: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Keep only seed edges that survive in *both* augmented views and align them by
+    stable ``edge_id`` so the contrastive loss scales with seed edges, not the full
+    sampled subgraph.
+    """
+    edge_id1 = edge_id1.long().view(-1)
+    edge_id2 = edge_id2.long().view(-1)
+    seed_edge_ids = seed_edge_ids.to(edge_id1.device).long().view(-1)
+
+    if seed_edge_ids.numel() == 0 or edge_id1.numel() == 0 or edge_id2.numel() == 0:
+        empty1 = z1.new_empty((0, z1.shape[1]))
+        empty2 = z2.new_empty((0, z2.shape[1]))
+        empty_ids = edge_id1.new_empty((0,), dtype=torch.long)
+        return empty1, empty_ids, empty2, empty_ids.clone()
+
+    shared_ids = seed_edge_ids[
+        torch.isin(seed_edge_ids, edge_id1) & torch.isin(seed_edge_ids, edge_id2)
+    ]
+    if shared_ids.numel() == 0:
+        empty1 = z1.new_empty((0, z1.shape[1]))
+        empty2 = z2.new_empty((0, z2.shape[1]))
+        empty_ids = edge_id1.new_empty((0,), dtype=torch.long)
+        return empty1, empty_ids, empty2, empty_ids.clone()
+
+    shared_ids = torch.unique(shared_ids, sorted=True)
+
+    keep1 = torch.isin(edge_id1, shared_ids)
+    keep2 = torch.isin(edge_id2, shared_ids)
+
+    z1_seed = z1[keep1]
+    z2_seed = z2[keep2]
+    ids1 = edge_id1[keep1]
+    ids2 = edge_id2[keep2]
+
+    order1 = torch.argsort(ids1)
+    order2 = torch.argsort(ids2)
+    z1_seed = z1_seed[order1]
+    z2_seed = z2_seed[order2]
+    ids1 = ids1[order1]
+    ids2 = ids2[order2]
+
+    if ids1.numel() != ids2.numel() or not torch.equal(ids1, ids2):
+        raise ValueError("Failed to align shared seed-edge embeddings across views.")
+
+    return z1_seed, ids1, z2_seed, ids2
 
 def _link_neighbor_loader_kwargs(args) -> dict:
     """``num_workers`` + ``persistent_workers`` for PyG ``LinkNeighborLoader`` (same as DataLoader)."""

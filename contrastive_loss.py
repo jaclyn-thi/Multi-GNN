@@ -12,27 +12,12 @@ def positive_mask_identity(edge_id1: torch.Tensor, edge_id2: torch.Tensor) -> to
     """
     Identity tier: ``pos[i, j]`` iff the same stable edge / transaction id appears
     in both views.
-
-    Args:
-        edge_id1: (E1,) long
-        edge_id2: (E2,) long
-
-    Returns:
-        Boolean tensor of shape (E1, E2).
     """
     return edge_id1.unsqueeze(1) == edge_id2.unsqueeze(0)
 
 
 def merge_positive_tiers(*masks: torch.Tensor) -> torch.Tensor:
-    """
-    Combine positive tiers with logical OR (e.g. identity | shared_account later).
-
-    Args:
-        masks: one or more boolean (E1, E2) tensors.
-
-    Returns:
-        Union of all masks.
-    """
+    """Combine positive tiers with logical OR."""
     if not masks:
         raise ValueError("merge_positive_tiers requires at least one mask.")
     out = masks[0]
@@ -41,183 +26,271 @@ def merge_positive_tiers(*masks: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _sorted_edge_ids(edge_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``sorted_ids = edge_ids[sort_idx]`` in non-decreasing order for :func:`torch.searchsorted`."""
-    sort_idx = torch.argsort(edge_ids)
-    return edge_ids[sort_idx], sort_idx
+class EdgeMemoryQueue:
+    """
+    Detached FIFO queue of prior seed-edge embeddings used as extra negatives.
+
+    The queue never contributes positives; matching ids are filtered out from the
+    negative set at loss time.
+    """
+
+    def __init__(self, capacity: int, device: torch.device):
+        self.capacity = max(0, int(capacity))
+        self.device = device
+        self.embeddings: Optional[torch.Tensor] = None
+        self.edge_ids: Optional[torch.Tensor] = None
+
+    @property
+    def size(self) -> int:
+        if self.edge_ids is None:
+            return 0
+        return int(self.edge_ids.numel())
+
+    def get(
+        self,
+        *,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        out_device = device if device is not None else self.device
+        if self.size == 0 or self.embeddings is None or self.edge_ids is None:
+            empty_z = torch.empty((0, 0), device=out_device, dtype=dtype or torch.float32)
+            empty_ids = torch.empty((0,), device=out_device, dtype=torch.long)
+            return empty_z, empty_ids
+        out_z = self.embeddings
+        if device is not None or dtype is not None:
+            out_z = out_z.to(device=out_device, dtype=dtype or out_z.dtype)
+        out_ids = self.edge_ids if out_device == self.edge_ids.device else self.edge_ids.to(out_device)
+        return out_z, out_ids
+
+    @torch.no_grad()
+    def enqueue(self, embeddings: torch.Tensor, edge_ids: torch.Tensor) -> None:
+        if self.capacity <= 0 or embeddings.numel() == 0:
+            return
+        z = F.normalize(embeddings.detach().float(), dim=1).to(self.device)
+        ids = edge_ids.detach().long().view(-1).to(self.device)
+        if z.shape[0] != ids.shape[0]:
+            raise ValueError("Queued embeddings and edge ids must have matching lengths.")
+        if z.shape[0] > self.capacity:
+            z = z[-self.capacity :]
+            ids = ids[-self.capacity :]
+        if self.embeddings is None or self.edge_ids is None:
+            self.embeddings = z
+            self.edge_ids = ids
+            return
+        self.embeddings = torch.cat([self.embeddings, z], dim=0)[-self.capacity :]
+        self.edge_ids = torch.cat([self.edge_ids, ids], dim=0)[-self.capacity :]
 
 
-def _sample_negative_edge_indices(
-    e_other: int,
-    pos_js: torch.Tensor,
+def _normalize_embeddings(z: torch.Tensor) -> torch.Tensor:
+    return F.normalize(z.float(), dim=1)
+
+
+def _align_shared_edge_pairs(
+    z1: torch.Tensor,
+    edge_id1: torch.Tensor,
+    z2: torch.Tensor,
+    edge_id2: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    edge_id1 = edge_id1.long().view(-1)
+    edge_id2 = edge_id2.long().view(-1)
+    if edge_id1.shape[0] != z1.shape[0] or edge_id2.shape[0] != z2.shape[0]:
+        raise ValueError("edge_id lengths must match embedding row counts.")
+    if edge_id1.numel() == 0 or edge_id2.numel() == 0:
+        return (
+            z1.new_empty((0, z1.shape[1])),
+            edge_id1.new_empty((0,), dtype=torch.long),
+            z2.new_empty((0, z2.shape[1])),
+            edge_id2.new_empty((0,), dtype=torch.long),
+        )
+
+    shared_ids = edge_id1[torch.isin(edge_id1, edge_id2)]
+    if shared_ids.numel() == 0:
+        return (
+            z1.new_empty((0, z1.shape[1])),
+            edge_id1.new_empty((0,), dtype=torch.long),
+            z2.new_empty((0, z2.shape[1])),
+            edge_id2.new_empty((0,), dtype=torch.long),
+        )
+
+    shared_ids = torch.unique(shared_ids, sorted=True)
+    keep1 = torch.isin(edge_id1, shared_ids)
+    keep2 = torch.isin(edge_id2, shared_ids)
+
+    z1 = z1[keep1]
+    z2 = z2[keep2]
+    edge_id1 = edge_id1[keep1]
+    edge_id2 = edge_id2[keep2]
+
+    order1 = torch.argsort(edge_id1)
+    order2 = torch.argsort(edge_id2)
+    z1 = z1[order1]
+    z2 = z2[order2]
+    edge_id1 = edge_id1[order1]
+    edge_id2 = edge_id2[order2]
+
+    if edge_id1.shape[0] != edge_id2.shape[0] or not torch.equal(edge_id1, edge_id2):
+        raise ValueError("Failed to align shared positive pairs by edge_id.")
+    return z1, edge_id1, z2, edge_id2
+
+
+def _sample_negative_indices_batched_gpu(
+    candidate_ids: torch.Tensor,
+    anchor_ids: torch.Tensor,
     k: int,
+    *,
+    oversample_factor: int = 4,
+    max_rounds: int = 6,
 ) -> torch.Tensor:
     """
-    Sample up to ``k`` edge indices in ``[0, e_other)`` that are not in ``pos_js``.
+    Batched GPU negative sampling with replacement.
 
-    Runs on **CPU** and returns a small ``LongTensor`` on ``pos_js.device`` so we never
-    allocate large ``randperm`` / ``cat`` pools on GPU when VRAM is already full from
-    the GNN forwards.
+    Returns an index tensor of shape ``(B, k)`` with ``-1`` marking rows/slots that
+    could not be filled (e.g. no valid negatives available).
     """
-    out_device = pos_js.device
-    pos_u = torch.unique(pos_js.long().detach().cpu())
-    n_pos = int(pos_u.numel())
-    if e_other <= n_pos:
-        return torch.empty(0, dtype=torch.long, device=out_device)
-    kk = min(int(k), e_other - n_pos)
-    if kk <= 0:
-        return torch.empty(0, dtype=torch.long, device=out_device)
+    b = int(anchor_ids.numel())
+    if k <= 0 or b == 0 or candidate_ids.numel() == 0:
+        return torch.empty((b, 0), device=anchor_ids.device, dtype=torch.long)
 
-    pool = torch.empty(0, dtype=torch.long)
-    chunk = min(max(kk * 16, 512), 65536)
-    for _ in range(24):
-        if pool.numel() >= kk + max(kk // 4, 8):
+    neg_idx = torch.full((b, int(k)), -1, device=anchor_ids.device, dtype=torch.long)
+    filled = torch.zeros((b,), device=anchor_ids.device, dtype=torch.long)
+    sample_width = max(int(k) * int(max(1, oversample_factor)), 32)
+    n_candidates = int(candidate_ids.numel())
+
+    for _ in range(max_rounds):
+        remaining = torch.nonzero(filled < k, as_tuple=False).view(-1)
+        if remaining.numel() == 0:
             break
-        cand = torch.randint(0, e_other, (chunk,), dtype=torch.long)
-        cand = cand[~torch.isin(cand, pos_u)]
-        if cand.numel() == 0:
+        base_filled = filled[remaining]
+        cand = torch.randint(0, n_candidates, (remaining.numel(), sample_width), device=anchor_ids.device)
+        cand_ids = candidate_ids[cand]
+        valid = cand_ids != anchor_ids[remaining].unsqueeze(1)
+        if not valid.any():
             continue
-        pool = torch.cat([pool, cand])
-        if pool.numel() > 131072:
-            sub = torch.randint(0, pool.numel(), (65536,), dtype=torch.long)
-            pool = torch.unique(pool[sub])
 
-    pool = torch.unique(pool)
-    pool = pool[~torch.isin(pool, pos_u)]
-    if pool.numel() == 0:
-        return pool.to(out_device)
-    kk_eff = min(kk, int(pool.numel()))
-    if pool.numel() <= kk_eff:
-        return pool.to(out_device)
+        rank = torch.cumsum(valid.to(torch.int64), dim=1) - 1
+        take_mask = valid & (rank < (k - base_filled).unsqueeze(1))
+        if not take_mask.any():
+            continue
 
-    if pool.numel() <= 32768:
-        idx = torch.randperm(pool.numel(), dtype=torch.long)[:kk_eff]
-        return pool[idx].to(out_device)
+        local_rows = torch.arange(remaining.numel(), device=anchor_ids.device).unsqueeze(1).expand_as(cand)
+        selected_rows_local = local_rows[take_mask]
+        selected_rows = remaining[selected_rows_local]
+        selected_cols = base_filled[selected_rows_local] + rank[take_mask]
+        neg_idx[selected_rows, selected_cols] = cand[take_mask]
+        filled[remaining] = base_filled + take_mask.sum(dim=1).to(base_filled.dtype)
 
-    idx = torch.randint(0, pool.numel(), (kk_eff * 3,), dtype=torch.long)
-    chosen = torch.unique(pool[idx])
-    for _ in range(12):
-        if chosen.numel() >= kk_eff:
-            break
-        idx2 = torch.randint(0, pool.numel(), (kk_eff * 3,), dtype=torch.long)
-        chosen = torch.unique(torch.cat([chosen, pool[idx2]]))
-    if chosen.numel() > kk_eff:
-        idx3 = torch.randint(0, chosen.numel(), (kk_eff * 2,), dtype=torch.long)
-        chosen = torch.unique(chosen[idx3])
-    return chosen[:kk_eff].to(out_device)
+    return neg_idx
 
 
-def _logsumexp_neg_logits_row(
-    row_z: torch.Tensor,
-    z_other: torch.Tensor,
-    neg_js: torch.Tensor,
+def _logsumexp_over_queue(
+    z_b: torch.Tensor,
+    anchor_ids: torch.Tensor,
+    queue_z: torch.Tensor,
+    queue_ids: torch.Tensor,
     temperature: float,
-    neg_col_chunk: int = 512,
-) -> torch.Tensor:
-    """``logsumexp`` over similarities to ``z_other[neg_js]`` in column chunks."""
-    log_acc: Optional[torch.Tensor] = None
-    for s0 in range(0, neg_js.numel(), neg_col_chunk):
-        s1 = min(s0 + neg_col_chunk, neg_js.numel())
-        sl = neg_js[s0:s1]
-        part = (row_z @ z_other[sl].T) / temperature
-        lp = part.logsumexp(dim=1).squeeze(0)
-        log_acc = lp if log_acc is None else torch.logaddexp(log_acc, lp)
-    assert log_acc is not None
-    return log_acc
+    col_chunk: int,
+) -> Optional[torch.Tensor]:
+    if queue_z.numel() == 0 or queue_ids.numel() == 0:
+        return None
+    log_queue: Optional[torch.Tensor] = None
+    for j0 in range(0, queue_z.shape[0], col_chunk):
+        j1 = min(j0 + col_chunk, queue_z.shape[0])
+        chunk_z = queue_z[j0:j1]
+        chunk_ids = queue_ids[j0:j1]
+        logits = (z_b @ chunk_z.T) / temperature
+        valid = chunk_ids.unsqueeze(0) != anchor_ids.unsqueeze(1)
+        logits = torch.where(valid, logits, torch.full_like(logits, float("-inf")))
+        ls = logits.logsumexp(dim=1)
+        log_queue = ls if log_queue is None else torch.logaddexp(log_queue, ls)
+    return log_queue
 
 
-def _directional_identity_infonce_chunked(
+def _directional_aligned_infonce(
     z_anchor: torch.Tensor,
     z_other: torch.Tensor,
-    id_anchor: torch.Tensor,
-    sorted_ids_other: torch.Tensor,
-    sort_idx_other: torch.Tensor,
+    edge_ids: torch.Tensor,
     temperature: float,
+    *,
     row_chunk: int = 512,
     col_chunk: int = 1024,
     num_neg_samples: Optional[int] = None,
+    memory_queue: Optional[EdgeMemoryQueue] = None,
 ) -> torch.Tensor:
-    """
-    InfoNCE-style directional loss without ``E_anchor × E_other`` logits.
+    if z_anchor.shape != z_other.shape:
+        raise ValueError("Aligned directional InfoNCE expects z_anchor and z_other to share shape.")
+    if edge_ids.shape[0] != z_anchor.shape[0]:
+        raise ValueError("edge_ids length must match aligned embedding rows.")
+    if z_anchor.shape[0] == 0:
+        return z_anchor.new_zeros(())
 
-    If ``num_neg_samples`` is None or <= 0, the denominator is a full (chunked)
-    ``logsumexp`` over all edges in ``z_other``. If > 0, the denominator uses only
-    positives plus ``num_neg_samples`` uniformly sampled negatives (biased but cheap).
-    """
-    e_anchor = z_anchor.shape[0]
-    e_other = z_other.shape[0]
+    queue_z, queue_ids = (
+        memory_queue.get(device=z_anchor.device, dtype=z_anchor.dtype)
+        if memory_queue is not None
+        else (
+            z_anchor.new_empty((0, z_anchor.shape[1])),
+            edge_ids.new_empty((0,), dtype=torch.long),
+        )
+    )
     losses = []
     use_neg_subsample = num_neg_samples is not None and int(num_neg_samples) > 0
     k_neg = int(num_neg_samples) if use_neg_subsample else 0
 
-    for i0 in range(0, e_anchor, row_chunk):
-        i1 = min(i0 + row_chunk, e_anchor)
+    candidate_ids = edge_ids
+    candidate_z = z_other
+    if queue_ids.numel() > 0:
+        candidate_ids = torch.cat([candidate_ids, queue_ids], dim=0)
+        candidate_z = torch.cat([candidate_z, queue_z], dim=0)
+
+    for i0 in range(0, z_anchor.shape[0], row_chunk):
+        i1 = min(i0 + row_chunk, z_anchor.shape[0])
         z_b = z_anchor[i0:i1]
-        b = z_b.shape[0]
-        ids_b = id_anchor[i0:i1]
-        lo = torch.searchsorted(sorted_ids_other, ids_b, right=False)
-        hi = torch.searchsorted(sorted_ids_other, ids_b, right=True)
-        has_pos = lo < hi
-        if not has_pos.any():
-            continue
+        ids_b = edge_ids[i0:i1]
+        z_pos = z_other[i0:i1]
+        log_num = ((z_b * z_pos).sum(dim=1) / temperature)
 
         if use_neg_subsample:
-            block_vals = []
-            for r in range(b):
-                if not has_pos[r]:
-                    continue
-                row_z = z_b[r : r + 1]
-                js = sort_idx_other[lo[r] : hi[r]]
-                logits_pos = (row_z @ z_other[js].T) / temperature
-                log_num = logits_pos.logsumexp(dim=1).squeeze(0)
-                log_num = torch.where(
-                    torch.isfinite(log_num),
+            neg_idx = _sample_negative_indices_batched_gpu(candidate_ids, ids_b, k_neg)
+            if neg_idx.numel() == 0:
+                log_denom = log_num
+            else:
+                valid = neg_idx >= 0
+                safe_idx = neg_idx.clamp(min=0)
+                neg_z = candidate_z[safe_idx]
+                neg_logits = (z_b.unsqueeze(1) * neg_z).sum(dim=-1) / temperature
+                neg_logits = torch.where(valid, neg_logits, torch.full_like(neg_logits, float("-inf")))
+                log_neg = neg_logits.logsumexp(dim=1)
+                log_denom = torch.where(
+                    torch.isfinite(log_neg),
+                    torch.logaddexp(log_num, log_neg),
                     log_num,
-                    torch.zeros((), device=log_num.device, dtype=log_num.dtype),
                 )
-                neg_js = _sample_negative_edge_indices(e_other, js, k_neg)
-                if neg_js.numel() == 0:
-                    log_denom = log_num
-                else:
-                    log_neg = _logsumexp_neg_logits_row(
-                        row_z, z_other, neg_js, temperature, neg_col_chunk=512
-                    )
-                    log_denom = torch.logaddexp(log_num, log_neg)
-                block_vals.append(-(log_num - log_denom))
-            if block_vals:
-                losses.append(torch.stack(block_vals).mean())
-            continue
+        else:
+            log_denom: Optional[torch.Tensor] = None
+            for j0 in range(0, z_other.shape[0], col_chunk):
+                j1 = min(j0 + col_chunk, z_other.shape[0])
+                logits = (z_b @ z_other[j0:j1].T) / temperature
+                ls = logits.logsumexp(dim=1)
+                log_denom = ls if log_denom is None else torch.logaddexp(log_denom, ls)
 
-        log_denom: Optional[torch.Tensor] = None
-        for j0 in range(0, e_other, col_chunk):
-            j1 = min(j0 + col_chunk, e_other)
-            part = (z_b @ z_other[j0:j1].T) / temperature
-            ls = part.logsumexp(dim=1)
-            log_denom = ls if log_denom is None else torch.logaddexp(log_denom, ls)
-
-        if log_denom is None:
-            continue
-
-        block_vals = []
-        for r in range(b):
-            if not has_pos[r]:
+            if log_denom is None:
                 continue
-            row_z = z_b[r : r + 1]
-            js = sort_idx_other[lo[r] : hi[r]]
-            logits_pos = (row_z @ z_other[js].T) / temperature
-            log_num = logits_pos.logsumexp(dim=1).squeeze(0)
-            log_num = torch.where(
-                torch.isfinite(log_num),
-                log_num,
-                torch.zeros((), device=log_num.device, dtype=log_num.dtype),
+            log_queue = _logsumexp_over_queue(
+                z_b,
+                ids_b,
+                queue_z,
+                queue_ids,
+                temperature,
+                col_chunk,
             )
-            block_vals.append(-(log_num - log_denom[r]))
-        if block_vals:
-            losses.append(torch.stack(block_vals).mean())
+            if log_queue is not None:
+                log_denom = torch.logaddexp(log_denom, log_queue)
+
+        losses.append(-(log_num - log_denom))
 
     if not losses:
         return z_anchor.new_zeros(())
-    return torch.stack(losses).mean()
+    return torch.cat(losses, dim=0).mean()
 
 
 def build_edge_positive_mask(
@@ -249,84 +322,72 @@ def edge_identity_infonce_loss(
     debug: bool = False,
     num_neg_samples: Optional[int] = None,
     symmetric: bool = True,
+    memory_queue: Optional[EdgeMemoryQueue] = None,
 ):
     """
     InfoNCE-style edge contrastive loss with identity positives only.
 
-    Rows of ``z1`` / ``z2`` need not align; positives are pairs (i, j) with
-    ``edge_id1[i] == edge_id2[j]``. Anchors with no positive in the other view
-    are skipped.
+    Inputs may arrive in arbitrary row order; the loss first aligns shared edge ids
+    across the two views, then treats those aligned rows as positives. This matches
+    the seed-edge-only training path, where large sampled subgraphs are still used
+    for message passing but the contrastive objective scales with the surviving seed
+    edges rather than every message-passing edge in the subgraph.
 
-    If ``num_neg_samples`` is None or <= 0, negatives are **all** other edges in
-    the opposite view (denominator via chunked ``logsumexp``). If > 0, each anchor
-    uses that many **uniformly sampled** negatives for the denominator (memory
-    friendly; biased vs. full softmax).
-
-    Symmetric: mean of directional losses 1→2 and 2→1 over valid anchors.
-    If ``symmetric`` is False, only the 1→2 direction is used (e.g. with view-2
-    computed under ``torch.no_grad()`` to save memory).
-
-    Without negative subsampling, uses row/column-chunked logits (peak
-    ``row_chunk × col_chunk``) instead of dense ``E1×E2`` tensors.
+    If ``num_neg_samples`` is None or <= 0, the denominator uses all current aligned
+    candidates (plus optional queue negatives) via chunked ``logsumexp``. If > 0,
+    negatives are sampled on GPU in row batches from the current aligned batch plus
+    the optional queue.
     """
+    del eps  # retained for backward compatibility with older callers
+
     if z1.dim() != 2 or z2.dim() != 2:
         raise ValueError("z1 and z2 must be 2D (E, D).")
 
-    edge_id1 = edge_id1.long().view(-1)
-    edge_id2 = edge_id2.long().view(-1)
+    z1 = _normalize_embeddings(z1)
+    z2 = _normalize_embeddings(z2)
+    z1, ids1, z2, ids2 = _align_shared_edge_pairs(z1, edge_id1, z2, edge_id2)
 
-    if edge_id1.shape[0] != z1.shape[0] or edge_id2.shape[0] != z2.shape[0]:
-        raise ValueError("edge_id lengths must match embedding row counts.")
+    n_pairs = int(ids1.numel())
+    if n_pairs == 0:
+        loss = (z1.sum() + z2.sum()) * 0.0
+        if debug:
+            return {
+                "loss": loss,
+                "n_pairs": 0,
+                "queue_size": 0 if memory_queue is None else memory_queue.size,
+            }
+        return loss
 
-    z1 = F.normalize(z1, dim=1)
-    z2 = F.normalize(z2, dim=1)
-
-    sorted_ids2, sort_idx2 = _sorted_edge_ids(edge_id2)
-    sorted_ids1, sort_idx1 = _sorted_edge_ids(edge_id1)
-
-    lo_12 = torch.searchsorted(sorted_ids2, edge_id1, right=False)
-    hi_12 = torch.searchsorted(sorted_ids2, edge_id1, right=True)
-    n12 = (lo_12 < hi_12).sum()
-
-    lo_21 = torch.searchsorted(sorted_ids1, edge_id2, right=False)
-    hi_21 = torch.searchsorted(sorted_ids1, edge_id2, right=True)
-    n21 = (lo_21 < hi_21).sum()
-
-    loss_12 = _directional_identity_infonce_chunked(
-        z1, z2, edge_id1, sorted_ids2, sort_idx2, temperature, num_neg_samples=num_neg_samples
+    loss_12 = _directional_aligned_infonce(
+        z1,
+        z2,
+        ids1,
+        temperature,
+        num_neg_samples=num_neg_samples,
+        memory_queue=memory_queue,
     )
-
-    if not symmetric:
-        if n12 == 0:
-            loss = (z1.sum() + z2.sum()) * 0.0
-        else:
-            loss = loss_12
-    else:
-        loss_21 = _directional_identity_infonce_chunked(
-            z2, z1, edge_id2, sorted_ids1, sort_idx1, temperature, num_neg_samples=num_neg_samples
+    if symmetric:
+        loss_21 = _directional_aligned_infonce(
+            z2,
+            z1,
+            ids2,
+            temperature,
+            num_neg_samples=num_neg_samples,
+            memory_queue=memory_queue,
         )
-
-        # If one side has no anchors with positives, ignore that direction (0 contribution).
-        if n12 == 0 and n21 == 0:
-            loss = (z1.sum() + z2.sum()) * 0.0
-        elif n12 == 0:
-            loss = loss_21
-        elif n21 == 0:
-            loss = loss_12
-        else:
-            loss = 0.5 * (loss_12 + loss_21)
+        loss = 0.5 * (loss_12 + loss_21)
+    else:
+        loss = loss_12
 
     if debug:
         out = {
             "loss": loss,
-            "n_anchors_12": int(n12),
-            "n_anchors_21": int(n21),
+            "n_pairs": n_pairs,
+            "queue_size": 0 if memory_queue is None else memory_queue.size,
         }
-        # Dense debug tensors are O(E1·E2); omit when too large for memory.
         max_elems = 2_000_000
         if z1.shape[0] * z2.shape[0] <= max_elems:
-            pos_mask = build_edge_positive_mask(edge_id1, edge_id2)
-            out["pos_mask"] = pos_mask
+            out["pos_mask"] = build_edge_positive_mask(ids1, ids2)
             out["logits_12"] = (z1 @ z2.T) / temperature
         else:
             out["pos_mask"] = None
