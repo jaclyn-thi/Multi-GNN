@@ -1,7 +1,7 @@
 """
 One training batch from real AML data: contrastive forward, loss, single optimizer step.
 
-Homogeneous LinkNeighborLoader path only (same as train_homo). Run from repo root, e.g.:
+Homogeneous LinkNeighborLoader path only (same as train_homo_contrastive). Run from repo root, e.g.:
 
   python debug_contrastive_one_batch.py --data Small_HI --model gin --testing
 
@@ -33,7 +33,9 @@ from train_util import (
     extract_param,
     get_homo_seed_edge_ids,
     get_loaders,
+    resolve_training_setup,
     select_shared_seed_edge_embeddings,
+    validate_training_setup,
 )
 from training import get_model
 from util import create_parser, logger_setup, set_seed
@@ -65,7 +67,20 @@ def main() -> None:
     logger_setup()
     set_seed(args.seed)
 
-    if args.reverse_mp:
+    setup = resolve_training_setup(args)
+    try:
+        validate_training_setup(setup)
+    except NotImplementedError as exc:
+        logging.error("%s", exc)
+        sys.exit(1)
+
+    if not setup.is_contrastive:
+        logging.error(
+            "debug_contrastive_one_batch.py requires --objective contrastive (default)."
+        )
+        sys.exit(1)
+
+    if setup.is_hetero:
         logging.error(
             "debug_contrastive_one_batch.py supports the homogeneous path only. "
             "Run without --reverse_mp."
@@ -195,16 +210,16 @@ def main() -> None:
 
     with autocast(enabled=use_amp):
         z1 = model(
-            view1.x, view1.edge_index, view1.edge_attr, return_embeddings=True
+            view1.x, view1.edge_index, view1.edge_attr
         )
         if contrastive_symmetric:
             z2 = model(
-                view2.x, view2.edge_index, view2.edge_attr, return_embeddings=True
+                view2.x, view2.edge_index, view2.edge_attr
             )
         else:
             with torch.no_grad():
                 z2 = model(
-                    view2.x, view2.edge_index, view2.edge_attr, return_embeddings=True
+                    view2.x, view2.edge_index, view2.edge_attr
                 )
     z1_seed, seed_id1, z2_seed, seed_id2 = select_shared_seed_edge_embeddings(
         z1,

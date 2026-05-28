@@ -6,7 +6,9 @@ ordering). Identity contrastive pairs are matched via ``edge_id``, not row index
 """
 
 import torch
-from torch_geometric.data import Data
+from torch_geometric.data import Data, HeteroData
+
+from train_util import FORWARD_EDGE_TYPE, REVERSE_EDGE_TYPE
 
 
 def _edge_keep_mask(num_edges: int, drop_rate: float, device: torch.device) -> torch.Tensor:
@@ -65,6 +67,11 @@ def _slice_edge_aligned_fields(data: Data, keep: torch.Tensor) -> None:
         data.timestamps = ts[keep].clone()
 
 
+def _slice_hetero_edge_store(store, keep: torch.Tensor) -> None:
+    """Apply ``keep`` to one heterogeneous edge store (mutates ``store``)."""
+    _slice_edge_aligned_fields(store, keep)
+
+
 def _random_edge_drop_view(data: Data, drop_rate: float) -> Data:
     """
     Independent random edge subset; does not mutate the input ``data``.
@@ -84,6 +91,40 @@ def _random_edge_drop_view(data: Data, drop_rate: float) -> Data:
 
     keep = _edge_keep_mask(E, drop_rate, out.edge_index.device)
     _slice_edge_aligned_fields(out, keep)
+    return out
+
+
+def _hetero_random_edge_drop_view(
+    batch: HeteroData,
+    drop_rate: float,
+    forward_et=FORWARD_EDGE_TYPE,
+    reverse_et=REVERSE_EDGE_TYPE,
+) -> HeteroData:
+    """
+    Independent random edge drop on forward transactions; reverse edges with the same
+    transaction ``edge_id`` are dropped together (synchronized augmentation).
+    """
+    out = batch.clone()
+    fwd = out[forward_et]
+    E = fwd.edge_index.size(1)
+    if drop_rate <= 0.0:
+        return out
+
+    if getattr(fwd, "edge_id", None) is None:
+        raise ValueError(
+            "edge_id is required on forward edges when edge_drop_rate > 0; "
+            "use train_util.attach_edge_id_from_batch before augmentations."
+        )
+
+    keep_fwd = _edge_keep_mask(E, drop_rate, fwd.edge_index.device)
+    _slice_hetero_edge_store(fwd, keep_fwd)
+    kept_txn = fwd.edge_id
+
+    rev = out[reverse_et]
+    if getattr(rev, "edge_id", None) is None:
+        raise ValueError("edge_id is required on reverse edges for synchronized hetero augmentation.")
+    rev_keep = torch.isin(rev.edge_id, kept_txn)
+    _slice_hetero_edge_store(rev, rev_keep)
     return out
 
 
@@ -159,7 +200,34 @@ def generate_views(
       surviving edges of each view.
 
     Does not mutate ``data`` (including ``data.edge_attr`` / ``data.edge_id``).
+
+    For ``HeteroData``, edge drops are synchronized across forward and reverse edge
+    types by transaction ``edge_id``; attribute masking is applied independently per
+    view on both edge types.
     """
+    if isinstance(data, HeteroData):
+        view1 = _hetero_random_edge_drop_view(data, edge_drop_rate)
+        view2 = _hetero_random_edge_drop_view(data, edge_drop_rate)
+        if edge_attr_mask_rate > 0:
+            for et in (FORWARD_EDGE_TYPE, REVERSE_EDGE_TYPE):
+                store1, store2 = view1[et], view2[et]
+                if store1.edge_attr is not None:
+                    store1.edge_attr = mask_edge_attr(
+                        store1.edge_attr,
+                        mask_rate=edge_attr_mask_rate,
+                        mask_value=mask_value,
+                        mask_cols=mask_cols,
+                        exclude_last_column=exclude_last_column,
+                    )
+                    store2.edge_attr = mask_edge_attr(
+                        store2.edge_attr,
+                        mask_rate=edge_attr_mask_rate,
+                        mask_value=mask_value,
+                        mask_cols=mask_cols,
+                        exclude_last_column=exclude_last_column,
+                    )
+        return view1, view2
+
     view1 = _random_edge_drop_view(data, edge_drop_rate)
     view2 = _random_edge_drop_view(data, edge_drop_rate)
 
@@ -221,3 +289,21 @@ if __name__ == "__main__":
     assert v2d.edge_id.shape[0] == v2d.edge_index.size(1)
     assert torch.equal(d.edge_attr, ea_snap)
     print("graph_augmentations: independent edge drop OK")
+
+    from torch_geometric.data import HeteroData as HD
+
+    h = HD()
+    h["node"].x = x
+    h["node", "to", "node"].edge_index = ei
+    h["node", "rev_to", "node"].edge_index = ei.flip(0)
+    h["node", "to", "node"].edge_attr = ea.clone()
+    h["node", "rev_to", "node"].edge_attr = ea.clone()
+    h["node", "to", "node"].edge_id = torch.arange(6, dtype=torch.long)
+    h["node", "rev_to", "node"].edge_id = torch.arange(6, dtype=torch.long)
+    hv1, hv2 = generate_views(h, edge_drop_rate=0.5, edge_attr_mask_rate=0.0)
+    assert hv1["node", "to", "node"].edge_id.shape[0] == hv1["node", "to", "node"].edge_index.size(1)
+    assert torch.equal(
+        torch.sort(hv1["node", "to", "node"].edge_id).values,
+        torch.sort(hv1["node", "rev_to", "node"].edge_id).values,
+    )
+    print("graph_augmentations: hetero synchronized edge drop OK")

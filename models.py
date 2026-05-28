@@ -74,7 +74,7 @@ class GINe(torch.nn.Module):
             ) / 2
         return x, edge_attr
 
-    def forward(self, x, edge_index, edge_attr, return_embeddings=True):
+    def forward(self, x, edge_index, edge_attr):
         src, dst = edge_index
 
         if self.use_gradient_checkpointing and self.training:
@@ -118,11 +118,8 @@ class GINe(torch.nn.Module):
         else:
             z = self._embedding_tail_forward(x, edge_index, edge_attr)
 
-        # allow switching between representation learning and classification
-        if return_embeddings:
-            return z
-        else:
-            return self.classifier(z)
+        # Edge embeddings only (FX-safe for torch_geometric.to_hetero). Supervised: model.classifier(z).
+        return z
 
     def _embedding_tail_forward(
         self,
@@ -202,7 +199,7 @@ class GATe(torch.nn.Module):
             nn.Linear(50, n_classes),
         )
 
-    def forward(self, x, edge_index, edge_attr, return_embeddings=True):
+    def forward(self, x, edge_index, edge_attr):
         src, dst = edge_index
 
         x = self.node_emb(x)
@@ -226,14 +223,8 @@ class GATe(torch.nn.Module):
         x = torch.cat((x, edge_attr), dim=1)
         logging.debug(f"x.shape after concat = {x.shape}")
 
-        # --- embeddings ---
         z = self.embedding_head(x)
-
-        # --- dual mode ---
-        if return_embeddings:
-            return z
-        else:
-            return self.classifier(z)
+        return z
 
 
 class PNA(torch.nn.Module):
@@ -305,7 +296,7 @@ class PNA(torch.nn.Module):
             nn.Linear(50, n_classes),
         )
 
-    def forward(self, x, edge_index, edge_attr, return_embeddings=True):
+    def forward(self, x, edge_index, edge_attr):
         src, dst = edge_index
 
         x = self.node_emb(x)
@@ -330,14 +321,8 @@ class PNA(torch.nn.Module):
         x = torch.cat((x, edge_attr), dim=1)
         logging.debug(f"x.shape after concat = {x.shape}")
 
-        # --- embeddings ---
         z = self.embedding_head(x)
-
-        # --- dual mode ---
-        if return_embeddings:
-            return z
-        else:
-            return self.classifier(z)
+        return z
 
 
 class RGCN(nn.Module):
@@ -416,7 +401,7 @@ class RGCN(nn.Module):
             elif isinstance(m, nn.BatchNorm1d):
                 m.reset_parameters()
 
-    def forward(self, x, edge_index, edge_attr, return_embeddings=True):
+    def forward(self, x, edge_index, edge_attr):
         edge_type = edge_attr[:, -1].long()
         src, dst = edge_index
 
@@ -443,8 +428,4 @@ class RGCN(nn.Module):
         x = torch.cat((x, edge_attr), dim=1)
 
         z = self.embedding_head(x)
-
-        if return_embeddings:
-            return z
-        else:
-            return self.classifier(z)
+        return z

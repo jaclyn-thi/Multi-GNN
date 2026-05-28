@@ -4,7 +4,8 @@ slurm-logs/
 tests/
 wandb/
 *.env
-script.sh
+*.sh
 *.ipynb
 saved-models/
 raw-aml-data/
+*.out

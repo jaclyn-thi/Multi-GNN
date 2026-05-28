@@ -6,14 +6,20 @@ from train_util import (
     AddEgoIds,
     extract_param,
     add_arange_ids,
+    FORWARD_EDGE_TYPE,
     attach_edge_id_from_batch,
+    get_hetero_seed_edge_ids,
     get_homo_seed_edge_ids,
     get_loaders,
     evaluate_homo,
     evaluate_hetero,
+    edge_classifier_logits,
+    log_training_setup,
+    resolve_training_setup,
     save_model,
     select_shared_seed_edge_embeddings,
     load_model,
+    validate_training_setup,
 )
 from models import GINe, PNA, GATe, RGCN
 from torch_geometric.data import Data, HeteroData
@@ -26,8 +32,8 @@ import wandb
 import logging
 
 
-def train_homo(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, model, optimizer, loss_fn, args, config, device, val_data, te_data, data_config):
-    #training
+def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, model, optimizer, loss_fn, args, config, device, val_data, te_data, data_config):
+    # Contrastive pretraining on homogeneous graphs.
     # NOTE: The following arguments are unused in contrastive pretraining:
     # tr_inds, val_loader, te_loader, val_inds, te_inds, loss_fn, val_data, te_data
     # best_val_f1 = 0
@@ -89,12 +95,12 @@ def train_homo(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, mod
             )
 
             with autocast(enabled=use_amp):
-                z1 = model(view1.x, view1.edge_index, view1.edge_attr, return_embeddings=True)
+                z1 = model(view1.x, view1.edge_index, view1.edge_attr)
                 if contrastive_symmetric:
-                    z2 = model(view2.x, view2.edge_index, view2.edge_attr, return_embeddings=True)
+                    z2 = model(view2.x, view2.edge_index, view2.edge_attr)
                 else:
                     with torch.no_grad():
-                        z2 = model(view2.x, view2.edge_index, view2.edge_attr, return_embeddings=True)
+                        z2 = model(view2.x, view2.edge_index, view2.edge_attr)
             z1_seed, seed_id1, z2_seed, seed_id2 = select_shared_seed_edge_embeddings(
                 z1,
                 view1.edge_id,
@@ -148,6 +154,8 @@ def train_homo(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, mod
         avg_loss = float((loss_sum / max(total_examples, 1)).cpu())
         wandb.log({"loss/train": avg_loss}, step=epoch)
         logging.info(f"Train Loss: {avg_loss:.4f}")
+        if args.save_model:
+            save_model(model, optimizer, epoch, args, data_config)
 
         # old F1 computation block
         # pred = torch.cat(preds, dim=0).detach().cpu().numpy()
@@ -176,8 +184,68 @@ def train_homo(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, mod
     return model
 
 
-def train_hetero(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, model, optimizer, loss_fn, args, config, device, val_data, te_data, data_config):
-    #training
+def train_homo_supervised(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, model, optimizer, loss_fn, args, config, device, val_data, te_data, data_config):
+    """Supervised AML edge classification on homogeneous graphs."""
+    best_val_f1 = 0
+    for epoch in range(config.epochs):
+        total_loss = total_examples = 0
+        preds = []
+        ground_truths = []
+        for batch in tqdm.tqdm(tr_loader, disable=not args.tqdm):
+            optimizer.zero_grad()
+            inds = tr_inds.detach().cpu()
+            batch_edge_inds = inds[batch.input_id.detach().cpu()]
+            batch_edge_ids = tr_loader.data.edge_attr.detach().cpu()[batch_edge_inds, 0]
+            mask = torch.isin(batch.edge_attr[:, 0].detach().cpu(), batch_edge_ids)
+
+            batch.edge_attr = batch.edge_attr[:, 1:]
+
+            batch.to(device)
+            mask = mask.to(device, non_blocking=True)
+            z = model(batch.x, batch.edge_index, batch.edge_attr)
+            pred = model.classifier(z)[mask]
+            ground_truth = batch.y[mask]
+            preds.append(pred.argmax(dim=-1))
+            ground_truths.append(ground_truth)
+            loss = loss_fn(pred, ground_truth)
+
+            loss.backward()
+            optimizer.step()
+
+            total_loss += float(loss) * pred.numel()
+            total_examples += pred.numel()
+
+        pred = torch.cat(preds, dim=0).detach().cpu().numpy()
+        ground_truth = torch.cat(ground_truths, dim=0).detach().cpu().numpy()
+        f1 = f1_score(ground_truth, pred)
+        wandb.log({"f1/train": f1}, step=epoch)
+        logging.info(f"Train F1: {f1:.4f}")
+
+        val_f1 = evaluate_homo(val_loader, val_inds, model, val_data, device, args)
+        te_f1 = evaluate_homo(te_loader, te_inds, model, te_data, device, args)
+
+        wandb.log({"f1/validation": val_f1}, step=epoch)
+        wandb.log({"f1/test": te_f1}, step=epoch)
+        logging.info(f"Validation F1: {val_f1:.4f}")
+        logging.info(f"Test F1: {te_f1:.4f}")
+
+        if epoch == 0:
+            wandb.log({"best_test_f1": te_f1}, step=epoch)
+        elif val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            wandb.log({"best_test_f1": te_f1}, step=epoch)
+            if args.save_model:
+                save_model(model, optimizer, epoch, args, data_config)
+
+    if args.save_model:
+        save_model(model, optimizer, epoch, args, data_config)
+        logging.info("Saved final-epoch checkpoint for %s", args.unique_name)
+
+    return model
+
+
+def train_hetero_supervised(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, model, optimizer, loss_fn, args, config, device, val_data, te_data, data_config):
+    """Supervised AML edge classification on heterogeneous (reverse MP) graphs."""
     best_val_f1 = 0
     for epoch in range(config.epochs):
         total_loss = total_examples = 0
@@ -196,9 +264,13 @@ def train_hetero(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, m
             batch['node', 'rev_to', 'node'].edge_attr = batch['node', 'rev_to', 'node'].edge_attr[:, 1:]
 
             batch.to(device)
-            out = model(batch.x_dict, batch.edge_index_dict, batch.edge_attr_dict)
-            out = out[('node', 'to', 'node')]
-            pred = out[mask]
+            mask = mask.to(device, non_blocking=True)
+            z = model(
+                batch.x_dict,
+                batch.edge_index_dict,
+                batch.edge_attr_dict,
+            )[('node', 'to', 'node')]
+            pred = edge_classifier_logits(model, z)[mask]
             ground_truth = batch['node', 'to', 'node'].y[mask]
             preds.append(pred.argmax(dim=-1))
             ground_truths.append(batch['node', 'to', 'node'].y[mask])
@@ -232,6 +304,148 @@ def train_hetero(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, m
             wandb.log({"best_test_f1": te_f1}, step=epoch)
             if args.save_model:
                 save_model(model, optimizer, epoch, args, data_config)
+
+    if args.save_model:
+        save_model(model, optimizer, epoch, args, data_config)
+        logging.info("Saved final-epoch checkpoint for %s", args.unique_name)
+
+    return model
+
+
+def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, model, optimizer, loss_fn, args, config, device, val_data, te_data, data_config):
+    """Contrastive pretraining on heterogeneous graphs (forward transactions as anchors)."""
+    del val_loader, te_loader, tr_inds, val_inds, te_inds, loss_fn, val_data, te_data
+    use_amp = bool(getattr(args, "amp", False)) and device.type == "cuda"
+    scaler = GradScaler(enabled=use_amp)
+    neg_kw = int(getattr(args, "contrastive_num_neg_samples", 0))
+    num_neg_samples = neg_kw if neg_kw > 0 else None
+    contrastive_symmetric = not bool(getattr(args, "contrastive_asymmetric", False))
+    accum_steps = max(1, int(getattr(args, "contrastive_accum_steps", 1)))
+    memory_bank_size = max(0, int(getattr(args, "contrastive_memory_bank_size", 0)))
+    memory_queue = EdgeMemoryQueue(memory_bank_size, device=device) if memory_bank_size > 0 else None
+    try:
+        n_train_batches = len(tr_loader)
+    except TypeError:
+        n_train_batches = None
+    if accum_steps > 1 and n_train_batches is None:
+        logging.warning(
+            "contrastive_accum_steps=%s ignored: training loader has no len(); use accum_steps=1.",
+            accum_steps,
+        )
+        accum_steps = 1
+
+    for epoch in range(config.epochs):
+        total_examples = 0
+        loss_sum = torch.zeros((), device=device)
+        optimizer.zero_grad(set_to_none=True)
+        for step, batch in enumerate(tqdm.tqdm(tr_loader, disable=not args.tqdm)):
+            seed_edge_ids = get_hetero_seed_edge_ids(batch, tr_loader.data)
+            attach_edge_id_from_batch(batch, tr_loader.data)
+
+            batch.to(device, non_blocking=True)
+            seed_edge_ids = seed_edge_ids.to(device, non_blocking=True)
+            if epoch == 0 and step == 0:
+                n_sub = int(batch["node"].num_nodes)
+                e_fwd = int(batch[FORWARD_EDGE_TYPE].edge_index.shape[1])
+                e_rev = int(batch["node", "rev_to", "node"].edge_index.shape[1])
+                logging.info(
+                    "Hetero contrastive first batch: subgraph_nodes=%s forward_edges=%s reverse_edges=%s. "
+                    "Contrastive loss uses forward-edge embeddings only.",
+                    n_sub,
+                    e_fwd,
+                    e_rev,
+                )
+
+            view1, view2 = generate_views(
+                batch,
+                edge_attr_mask_rate=0.1,
+                edge_drop_rate=0.1,
+                mask_value=0.0,
+                mask_cols=None,
+                exclude_last_column=(args.model == "rgcn"),
+            )
+
+            with autocast(enabled=use_amp):
+                out1 = model(
+                    view1.x_dict,
+                    view1.edge_index_dict,
+                    view1.edge_attr_dict,
+                )
+                z1 = out1[FORWARD_EDGE_TYPE]
+                if contrastive_symmetric:
+                    out2 = model(
+                        view2.x_dict,
+                        view2.edge_index_dict,
+                        view2.edge_attr_dict,
+                    )
+                    z2 = out2[FORWARD_EDGE_TYPE]
+                else:
+                    with torch.no_grad():
+                        out2 = model(
+                            view2.x_dict,
+                            view2.edge_index_dict,
+                            view2.edge_attr_dict,
+                        )
+                        z2 = out2[FORWARD_EDGE_TYPE]
+
+            edge_id1 = view1[FORWARD_EDGE_TYPE].edge_id
+            edge_id2 = view2[FORWARD_EDGE_TYPE].edge_id
+            z1_seed, seed_id1, z2_seed, seed_id2 = select_shared_seed_edge_embeddings(
+                z1,
+                edge_id1,
+                z2,
+                edge_id2,
+                seed_edge_ids,
+            )
+            if epoch == 0 and step == 0:
+                logging.info(
+                    "Hetero contrastive seed-edge filtering: requested_seed_edges=%s shared_seed_edges=%s queue_size=%s",
+                    int(seed_edge_ids.numel()),
+                    int(seed_id1.numel()),
+                    0 if memory_queue is None else memory_queue.size,
+                )
+
+            with autocast(enabled=False):
+                loss_raw = edge_identity_infonce_loss(
+                    z1_seed,
+                    z2_seed,
+                    seed_id1,
+                    seed_id2,
+                    temperature=0.5,
+                    num_neg_samples=num_neg_samples,
+                    symmetric=contrastive_symmetric,
+                    memory_queue=memory_queue,
+                )
+            loss = loss_raw / float(accum_steps)
+
+            if use_amp:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            step_one_indexed = step + 1
+            should_step = (step_one_indexed % accum_steps == 0) or (
+                n_train_batches is not None and step_one_indexed == n_train_batches
+            )
+            if should_step:
+                if use_amp:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            if memory_queue is not None and seed_id2.numel() > 0:
+                memory_queue.enqueue(z2_seed, seed_id2)
+
+            loss_sum = loss_sum + loss_raw.detach()
+            total_examples += 1
+
+        avg_loss = float((loss_sum / max(total_examples, 1)).cpu())
+        wandb.log({"loss/train": avg_loss}, step=epoch)
+        logging.info(f"Train Loss: {avg_loss:.4f}")
+        if args.save_model:
+            save_model(model, optimizer, epoch, args, data_config)
 
     return model
 
@@ -303,6 +517,10 @@ def get_model(sample_batch, config, args):
 
 
 def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data_config):
+    setup = resolve_training_setup(args)
+    validate_training_setup(setup)
+    log_training_setup(setup, args)
+
     #set device
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -316,11 +534,15 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
             "batch_size": args.batch_size,
             "model": args.model,
             "data": args.data,
+            "graph_form": setup.graph_form,
+            "objective": setup.objective,
+            "reverse_mp": bool(args.reverse_mp),
+            "finetune": bool(args.finetune),
             "num_neighbors": args.num_neighs,
             "lr": extract_param("lr", args),
             "n_hidden": extract_param("n_hidden", args),
             "n_gnn_layers": extract_param("n_gnn_layers", args),
-            "loss": "ce",
+            "loss": "infonce" if setup.is_contrastive else "ce",
             "w_ce1": extract_param("w_ce1", args),
             "w_ce2": extract_param("w_ce2", args),
             "dropout": extract_param("dropout", args),
@@ -374,12 +596,33 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
     sample_edge_attr = sample_batch.edge_attr if not isinstance(sample_batch, HeteroData) else sample_batch.edge_attr_dict
     logging.info(summary(model, sample_x, sample_edge_index, sample_edge_attr))
 
-    # TODO switch to contrastive loss. keep class weights?
     loss_fn = torch.nn.CrossEntropyLoss(weight=torch.FloatTensor([config.w_ce1, config.w_ce2]).to(device))
 
-    if args.reverse_mp:
-        model = train_hetero(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, model, optimizer, loss_fn, args, config, device, val_data, te_data, data_config)
+    train_kwargs = (
+        tr_loader,
+        val_loader,
+        te_loader,
+        tr_inds,
+        val_inds,
+        te_inds,
+        model,
+        optimizer,
+        loss_fn,
+        args,
+        config,
+        device,
+        val_data,
+        te_data,
+        data_config,
+    )
+
+    if setup.is_hetero and setup.is_contrastive:
+        model = train_hetero_contrastive(*train_kwargs)
+    elif setup.is_hetero:
+        model = train_hetero_supervised(*train_kwargs)
+    elif setup.is_contrastive:
+        model = train_homo_contrastive(*train_kwargs)
     else:
-        model = train_homo(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, model, optimizer, loss_fn, args, config, device, val_data, te_data, data_config)
+        model = train_homo_supervised(*train_kwargs)
 
     wandb.finish()

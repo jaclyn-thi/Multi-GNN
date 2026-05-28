@@ -2,6 +2,27 @@
 
 ## References
 - Hanbin et al. (2024): "Graph Contrastive Pre-training for Anti-money Laundering" - Source of graph augmentation techniques and InfoNCE application to AML graphs.
+- Papagei (PPG foundation model) - Reference protocol for downstream evaluation: **extract frozen representations** after SSL pretrain, then **linear probing** (e.g. logistic regression for binary tasks) rather than end-to-end fine-tuning on the downstream loss. Subject-level splits in Papagei; we use **temporal** train/val/test on transactions (document when comparing).
+
+## Research framing (GFM north star)
+
+**Primary research question:** Can we pretrain a **graph foundation model (GFM)** on large-scale **financial transaction graph** data (eventually broad / synthetic / largely unlabeled), then **use** the frozen representations for downstream finance tasks (AML, fraud, and others)—primarily via **linear probing** when task labels are available on an eval set?
+
+**Not the main question:** “Does contrastive pretraining on AML-labeled graphs beat supervised CE on the same graphs?” AML is a **development benchmark** and one downstream task, not the definition of pretrain success.
+
+**Papagei-style split (conceptual):**
+- **Pretrain:** self-supervised objectives on domain data (here: contrastive / InfoNCE on transactions; future: morphology and other intrinsic signals — see `notes/morphology-metrics-plan.md`). Pretrain quality is **not** measured by downstream task F1 during this phase. Papagei does **not** use downstream-task checkpoint selection during SSL pretrain.
+- **Adapt (primary protocol):** load a **frozen** pretrained encoder; **extract** fixed edge embeddings for train/val/test seed transactions; train a **separate** simple classifier on those features (binary AML → **logistic regression**, report **AUROC** and F1). The GNN is not updated on the downstream CE loss in this protocol.
+- **Adapt (secondary / optional in repo today):** in-graph `--finetune --objective supervised` (full-model CE fine-tuning). Useful as an ablation or Multi-GNN baseline comparison, but **not** the main GFM evaluation story—it conflates representation quality with extra encoder tuning.
+
+**Explicit decisions (May 2026):**
+1. **No** per-epoch AML F1 or AML-val **encoder** selection during contrastive pretrain (declined; ties checkpoints to one task).
+2. **No** per-epoch AML linear probe **during** pretrain for the same reason (monitoring only would be optional; not planned).
+3. **Yes** to Papagei-style **post-hoc** extraction + linear probe as the **primary** downstream path for task benchmarks (AML now; fraud etc. when labels exist).
+
+**Using AML-labeled data today:** Convenient for engineering and benchmarking; contrastive loss remains **label-agnostic**. Longer term, pretrain should move toward larger finance graphs without leaning on task labels for sampling or checkpointing.
+
+---
 
 ## Current System Overview
 
@@ -14,9 +35,12 @@
 
 ### Current Training
 - **Original baseline path**: CrossEntropyLoss with class weights (`w_ce1`, `w_ce2`) and F1-score logging on the AML edge classification task
-- **Current homogeneous path**: contrastive pretraining on edge / transaction embeddings
-- **Current heterogeneous path**: still follows the older supervised classification path with F1 logging
-- **Current control-flow limitation**: graph form (`homo` vs `hetero`), training objective (`supervised` vs `contrastive`), and downstream AML evaluation are not yet fully decoupled in the training entry points
+- **Graph form** (`--reverse_mp`): homo (off) vs hetero with reverse message passing (on)
+- **Training objective** (`--objective`, default `contrastive`): contrastive pretraining vs supervised AML classification
+- **Checkpoint init** (`--finetune`): load `checkpoint_{unique_name}.tar` before training for either objective (e.g. continued contrastive on more data or supervised adaptation)
+- **Contrastive pretrain logging**: `loss/train` only (no per-epoch AML F1 by design — see Research framing)
+- **Primary downstream (Papagei-style)**: `embedding_extraction.py` → `linear_probe.py` on `embeddings/{unique_name}/`
+- **Secondary downstream (implemented)**: homo/hetero `--objective supervised` with F1 logging; optional `--finetune` loads a pretrain checkpoint then runs **end-to-end** CE (all weights trainable—not linear probe)
 - **Subgraph Sampling**: `LinkNeighborLoader` with configurable `num_neighbors` for batch sampling
   - prevents computational overload for large graphs
   - samples k-hop neighbors around seed edges
@@ -26,9 +50,12 @@
 
 ### Key Functions
 - `get_loaders()` in `train_util.py`: Creates `LinkNeighborLoader` instances
-- `train_homo()` in `training.py`: currently contrastive pretraining loop for homogeneous graphs
-- `train_hetero()` in `training.py`: supervised training loop with F1 logging
-- `evaluate_homo()` / `evaluate_hetero()` in `train_util.py`: evaluation helpers
+- `resolve_training_setup()` / `validate_training_setup()` in `train_util.py`: map CLI flags to graph form + objective
+- `train_homo_contrastive()` / `train_homo_supervised()` in `training.py`: homogeneous contrastive pretraining vs supervised CE + F1
+- `train_hetero_contrastive()` / `train_hetero_supervised()` in `training.py`: heterogeneous contrastive pretraining vs supervised F1
+- `get_hetero_seed_edge_ids()`, hetero branch of `attach_edge_id_from_batch()` in `train_util.py`
+- `train_gnn()` in `training.py`: dispatches on `TrainingSetup` (not `reverse_mp` alone)
+- `evaluate_homo()` / `evaluate_hetero()` in `train_util.py`: evaluation helpers (`return_embeddings=False` for classifier mode)
 
 ---
 
@@ -83,7 +110,7 @@ The six phases below are preserved from the original implementation plan, but ea
 #### Remaining work in this phase
 - optionally expose more loss hyperparameters cleanly
 - optionally add richer contrastive diagnostics such as positive/negative similarity summaries
-- revisit structural positive tiers only after the evaluation path is restored
+- revisit structural positive tiers only if pretrain-native eval signals a need
 
 ---
 
@@ -118,8 +145,8 @@ The six phases below are preserved from the original implementation plan, but ea
 - It is the key architectural bridge needed for later fine-tuning and evaluation
 
 #### Remaining work in this phase
-- use the classifier mode again in a meaningful homogeneous supervised fine-tuning / evaluation path
 - optionally make embedding-dimension selection cleaner in config
+- document encoder vs classifier weights for GFM release (Phase 5 / 6)
 
 #### Phase 2b: Graph Augmentations (Following Hanbin et al. 2024)
 **File**: `data_loading.py` or new file `graph_augmentations.py`
@@ -201,8 +228,7 @@ The six phases below are preserved from the original implementation plan, but ea
 - revisit `pin_memory`
 - continue tuning `loader_num_workers`
 - continue profiling startup preprocessing separately from steady-state training
-- add hetero-aware transaction-ID plumbing so forward and reverse edge copies can stay synchronized under contrastive augmentation
-- add hetero-aware batch helpers for seed-edge recovery and alignment on the forward transaction edges
+- eventual **unlabeled or label-agnostic** seed sampling for pretrain on non-AML corpora (hetero helpers for forward/reverse sync are done in Phase 4b)
 
 ---
 
@@ -211,11 +237,11 @@ The six phases below are preserved from the original implementation plan, but ea
 
 **Original goal**: Refactor training to support contrastive pretraining followed by downstream evaluation.
 
-**Current status**: Partially implemented. Homogeneous contrastive pretraining exists, but the training control flow still needs a second refactor pass so graph form, objective, and downstream evaluation become separate choices.
+**Current status**: **Phase 4a (decoupled controls) and Phase 4b (hetero contrastive) are done.** Contrastive loops are pretrain-only (`loss/train`). Phase 5 focuses on **Papagei-style downstream** (frozen extract + linear probe), not AML metrics inside contrastive training.
 
 #### What has been implemented
 1. **Homogeneous contrastive pretraining loop**
-   - `train_homo()` now runs contrastive pretraining on homogeneous graphs
+   - `train_homo_contrastive()` runs contrastive pretraining on homogeneous graphs
    - uses two augmented views
    - computes embeddings
    - filters to shared seed edges
@@ -241,130 +267,154 @@ The six phases below are preserved from the original implementation plan, but ea
   - queue support
   - GPU negative sampling
   - seed-edge filtering
-- The homogeneous AML F1 logging was not just disabled for convenience; the loop itself is now fundamentally a pretraining loop
-- The current dispatcher still effectively couples:
-  - `reverse_mp=False` with the newer homogeneous contrastive path
-  - `reverse_mp=True` with the older heterogeneous supervised path
-  rather than letting graph form and objective vary independently
+- The homogeneous AML F1 logging was not just disabled for convenience; the contrastive loop itself is fundamentally a pretraining loop (supervised homo F1 is on `train_homo_supervised()`)
 
 #### Phase 4a: Decouple Graph Form, Objective, and Evaluation
-This is now the most important near-term move.
+**Status: implemented (May 2026).**
 
-The training entry points should be able to represent all four combinations:
-- homogeneous + supervised
-- homogeneous + contrastive
-- heterogeneous + supervised
-- heterogeneous + contrastive
+Quick reference — training matrix:
 
-To get there, the training control flow should be refactored so that:
-1. **Graph form** is determined by `--reverse_mp`
-2. **Training objective** is determined independently (`supervised` vs `contrastive`)
-3. **Downstream AML evaluation** is determined independently (`on` vs `off`)
+| | `--objective contrastive` (default) | `--objective supervised` |
+|--|-------------------------------------|---------------------------|
+| **homo** (`--reverse_mp` off) | `train_homo_contrastive` (`loss/train`) | `train_homo_supervised` (+ F1) |
+| **hetero** (`--reverse_mp` on) | `train_hetero_contrastive` (`loss/train`; forward anchors) | `train_hetero_supervised` (+ F1) |
 
-Recommended control surface:
-- keep `--reverse_mp` responsible only for graph structure
-- add an explicit objective flag such as `--objective {contrastive,supervised}`
-- default that objective flag to `contrastive`
-- avoid overloading a single flag with both graph-form and objective semantics
+CLI / code touchpoints:
+- `--objective {contrastive,supervised}` in `util.py` (default `contrastive`); `--reverse_mp` is graph form only
+- `--finetune` loads checkpoint for **either** objective (not tied to supervised)
+- `train_gnn()` → `resolve_training_setup()` → dispatch; W&B logs `graph_form`, `objective`, `loss` (`infonce` vs `ce`)
+- `debug_contrastive_one_batch.py` requires homo + contrastive
 
-Concrete work in this subphase:
-1. **Split homogeneous pretraining and homogeneous supervised fine-tuning**
-   - likely `train_homo_contrastive(...)`
-   - likely `train_homo_supervised(...)`
-   - or equivalent branching inside `train_homo()`
+Deferred by design (see Research framing; detailed in Phase 5):
+- per-epoch AML F1 or AML-driven checkpointing during contrastive pretrain
+- making `--finetune` imply supervised-only (`--finetune` can init continued contrastive or downstream supervised)
 
-2. **Keep heterogeneous supervised training intact, but make it explicit**
-   - preserve current F1-based AML supervised behavior
-   - make classifier-mode calls explicit in supervised training and evaluation
+Control flow (implemented):
+1. **Graph form** — `--reverse_mp`
+2. **Training objective** — `--objective {contrastive,supervised}`
+3. **Task metrics (AML F1, AUROC, etc.)** — **downstream only** (planned: extract + sklearn probe; optional: `--objective supervised` / `--finetune`)
 
-3. **Make `--finetune` a real downstream classification mode**
-   - load pretrained weights
-   - run supervised CE on AML labels
-   - evaluate on val / test
-   - log F1 metrics
-
-4. **Restore baseline-comparable AML metrics**
-   - `f1/train`
-   - `f1/validation`
-   - `f1/test`
-   - `best_test_f1`
-
-5. **Add an explicit contrastive on/off switch via objective selection**
-   - `contrastive` should remain the default objective
-   - `supervised` should provide a clean baseline rerun path
-   - this should work independently of `homo` vs `hetero`
+Completed in 4a:
+1. Split `train_homo_contrastive` / `train_homo_supervised`; renamed hetero path to `train_hetero_supervised`
+2. Classifier-mode calls explicit in supervised train/eval (`return_embeddings=False`)
+3. `--finetune` documented and unchanged in behavior: checkpoint init before any objective
+4. Homo/hetero **supervised** paths log `f1/train`, `f1/validation`, `f1/test`, `best_test_f1`
+5. Objective switch independent of graph form (hetero + contrastive supported in 4b)
 
 #### Phase 4b: Add Heterogeneous Contrastive Training
-Once the control flow is clean, the next training-loop extension is hetero contrastive support.
+**Status: implemented (May 2026).**
 
-Concrete work in this subphase:
-1. add `train_hetero_contrastive(...)`
-2. keep reverse edges for message passing, but use forward transaction edges as the contrastive samples
-3. recover forward seed-edge IDs for hetero batches
-4. run the hetero model on two hetero augmented views
-5. compute contrastive loss only on forward-edge embeddings aligned by transaction identity
-6. keep queue entries and negatives forward-transaction-only in the first implementation
+Run: `--reverse_mp --objective contrastive` (default objective is already `contrastive`).
 
-This preserves the original motivation for Multi-GNN, where reverse message passing improves the graph representation, while keeping the contrastive supervision attached to real transactions rather than synthetic reverse edges.
+Design (as implemented):
+1. `train_hetero_contrastive(...)` mirrors homo contrastive (AMP, queue, accum, asymmetric mode).
+2. Reverse edges participate in **message passing** only; InfoNCE anchors are **forward** `('node', 'to', 'node')` embeddings.
+3. `get_hetero_seed_edge_ids(batch, loader_data)` uses forward `input_id` + global id column.
+4. `attach_edge_id_from_batch(batch, loader_data)` maps reverse `add_arange_ids` cols to the same transaction `edge_id` as forward (offset by global forward edge count).
+5. `generate_views` on `HeteroData` drops forward edges at random per view and removes reverse edges with the same transaction `edge_id` (synchronized aug).
+6. `EdgeMemoryQueue` stores forward seed embeddings only (`enqueue` after loss, same as homo).
 
-#### Why this is the next implementation step
-- We now have a stable homogeneous contrastive pretraining path
-- The missing pieces are:
-  - turning the pretrained encoder back into a meaningful AML downstream comparison
-  - extending the same ideas to the hetero setting that motivated the original Multi-GNN emphasis
+Code touchpoints: `training.py` (`train_hetero_contrastive`), `train_util.py` (`FORWARD_EDGE_TYPE`, `REVERSE_EDGE_TYPE`, `get_hetero_seed_edge_ids`, hetero branch of `attach_edge_id_from_batch`), `graph_augmentations.py` (`_hetero_random_edge_drop_view`).
+
+#### What comes after Phase 4 (pretrain → extract → linear probe)
+
+**Primary benchmark workflow (Papagei-aligned):**
+
+| Step | Action | Metrics |
+|------|--------|---------|
+| 1. Pretrain | `--objective contrastive` (+ `--reverse_mp` as needed) | `loss/train`; save `checkpoint_{unique_name}.tar` |
+| 2. Extract | Load checkpoint; `model.eval()`; forward with `return_embeddings=True` on seed edges per split | Save `Z`, `y`, `edge_id` per split (`.npz`) |
+| 3. Linear probe | `sklearn` logistic regression on `Z_train`, `y_train` | AUROC + F1 on val/test |
+
+**Optional / secondary:** `--finetune --objective supervised` (full in-GNN CE)—not the main GFM claim.
+
+**Science comparisons (same AML graph, different init for step 2–3):**
+- SSL pretrain checkpoint → extract → probe (**main**)
+- Random-init (or untrained) encoder → extract → probe (control for probe protocol)
+- Supervised-from-scratch checkpoint → extract → probe (optional)
+- Original Multi-GNN: `--objective supervised` from scratch (in-GNN CE + F1; separate baseline)
 
 ---
 
-### Phase 5: Evaluation Pipeline
-**File**: `train_util.py` or new file `evaluation.py`
+### Phase 5: Downstream adaptation & evaluation
+**Files**: new `embedding_extraction.py` (or `extract_embeddings.py`), `train_util.py` (shared batch/mask logic with `evaluate_*`), `linear_probe.py` (or probe module); existing `training.py` for optional in-GNN paths
 
-**Original goal**: Evaluate learned embeddings and compare against baseline AML classification.
+**Original goal** (from early plan): Evaluate learned embeddings and compare against baseline AML classification — including per-epoch AML logging during contrastive pretrain.
 
-**Current status**: This phase is now one of the main remaining gaps, and it needs to support both homogeneous and heterogeneous training modes.
+**Current status**: Contrastive pretrain (Phases 1–4) and **in-GNN supervised** paths exist. **Phase 5a** (`embedding_extraction.py`) and **Phase 5b** (`linear_probe.py`) implement the primary Papagei-style downstream path (frozen extract → sklearn logistic regression).
 
-#### What the original plan proposed
-1. embedding extraction
-2. embedding-based classification
-3. F1-score and related metrics for comparison
+#### Design decisions (May 2026)
 
-#### What we know now
-- The most direct short-term comparison to baseline Multi-GNN is still the AML edge classification task
-- The homogeneous contrastive path does **not** yet provide that comparison cleanly
-- `evaluate_homo()` currently calls the model in embedding mode by default, so it is not yet acting as a proper classifier evaluator
-- the long-term system should support turning AML evaluation on or off regardless of whether the underlying training run is homogeneous or heterogeneous
+**Declined during contrastive pretrain:**
+- Per-epoch AML F1 (untrained head or frozen linear probe) and encoder checkpoint selection on AML val—ties the foundation to one task; Papagei does not do this.
 
-#### Updated evaluation priority
-1. **First priority: restore direct AML comparison for both graph forms**
-   - supervised homogeneous fine-tuning on top of the pretrained encoder
-   - preserve heterogeneous supervised AML evaluation
-   - classifier-mode evaluation
-   - W&B F1 logging
+**Primary downstream protocol (Papagei-aligned):**
+1. Pretrain with SSL (contrastive) only.
+2. **Extract** frozen embeddings `z` per seed transaction (includes `embedding_head` output; GNN in `eval()`, no augmentations, `torch.no_grad()`).
+3. **Linear probe** with sklearn `LogisticRegression` on train features; evaluate AUROC (Papagei binary default) and F1 (Multi-GNN tradition) on val/test.
+4. Classifier is **not** the in-model MLP head trained with CE unless explicitly running the secondary path below.
 
-2. **Second priority: make AML evaluation an explicit switch**
-   - allow AML F1 evaluation to be enabled for both homo and hetero
-   - keep this separate from the choice of training objective
-   - leave room for future downstream financial tasks
+**Secondary path (already in repo; optional ablation):**
+- `--finetune --objective supervised`: loads checkpoint, trains **all** GNN + embedding + classifier weights with CE, logs `f1/*`. This is **end-to-end fine-tuning**, not Papagei linear probing. Do not treat as the primary GFM result.
 
-3. **Third priority: optional embedding-style evaluation**
-   - frozen encoder + linear probe
-   - logistic regression on extracted embeddings
-   - alternate downstream finance tasks
+#### Phase 5a: Frozen embedding extraction (implemented)
 
-#### Important design clarification
-- The AML task is only one downstream use case for the graph foundation model
-- However, it is the best immediate benchmark because it allows direct comparison to the original non-contrastive Multi-GNN pipeline
+**Goal:** For each split (train / val / test), produce aligned arrays `Z`, `y`, and optional `edge_id` from a fixed contrastive checkpoint.
 
-#### Remaining work in this phase
-- fix `evaluate_homo()` to use classifier logits when evaluating AML classification
-- make classifier-mode behavior explicit in both homo and hetero supervised/eval call sites
-- restore homogeneous train / val / test F1 logging
-- preserve and cleanly expose heterogeneous AML F1 evaluation
-- decide whether AML evaluation should run:
-  - every epoch in supervised mode
-  - periodically or end-of-run in contrastive mode
-- decide whether to support:
-  - full fine-tuning first
-  - frozen encoder / linear probe later
+**Reuse from `evaluate_homo` / `evaluate_hetero`:**
+- Seed-edge identification via `input_id` + global id column in `edge_attr`
+- Mask seed rows on forward edges (hetero); strip synthetic id columns; optional Small_J/Q missing-edge patch
+- **Difference from eval:** `return_embeddings=True`; collect `(edge_id, z, y)` instead of classifier `argmax`
+
+**Extraction rules:**
+- `model.eval()`; no `generate_views`
+- Same `batch_size` / `num_neighs` as pretrain (embeddings depend on sampled subgraph—document in `meta.json`)
+- Train loader `shuffle=False` for reproducibility
+- **Dedupe** by global `edge_id` after each split pass; **coverage check** vs expected split seeds
+
+**Hetero:** embeddings from `('node', 'to', 'node')` only (same as contrastive anchors).
+
+**Artifacts (example layout):**
+```text
+embeddings/{unique_name}/
+  train.npz   # Z, y, edge_id
+  val.npz
+  test.npz
+  meta.json   # embedding_dim, model, reverse_mp, num_neighs, checkpoint path, data name
+```
+
+**CLI:** `python embedding_extraction.py --data … --model … --unique_name <pretrain_run> [--reverse_mp] [--embeddings_dir embeddings]`
+
+Writes `embeddings/{unique_name}/{train,val,test}.npz` and `meta.json`.
+
+#### Phase 5b: Linear probing (implemented)
+
+**Goal:** Papagei-style downstream classifier on frozen features—separate from the PyTorch `classifier` module.
+
+- **CLI:** `python linear_probe.py --unique_name <same as extraction> [--embeddings_dir embeddings] [--class_weight balanced|model|none]`
+- Fit: `LogisticRegression` on `train.npz` (`Z`, `y`); default `class_weight=balanced`; use `--class_weight model --model gin` to mirror `w_ce1`/`w_ce2`
+- Metrics logged: **AUROC**, **F1**, precision, recall on train/val/test; W&B keys `aml_probe/linear/{split}/*`
+- Writes `embeddings/{unique_name}/probe_results.json`
+- No backprop through the GNN; probe weights are sklearn-only
+
+**Other tasks later:** fraud or regression would swap the probe (e.g. ridge for regression) and metrics; each task needs its own labels on the eval set. Pretrain on unlabeled data → extraction still works; probe only where labels exist.
+
+#### What is implemented today (secondary path only)
+
+1. `train_homo_supervised` / `train_hetero_supervised` — in-GNN CE + per-epoch `f1/*`, val-driven `save_model`
+2. `evaluate_homo` / `evaluate_hetero` — classifier mode, not feature export
+3. `--finetune` — full-state load + supervised training (not frozen extract + sklearn)
+
+#### Remaining work in this phase (priority order)
+
+1. ~~**`extract_seed_embeddings_{homo,hetero}`** + `embedding_extraction.py`**~~ (done)
+2. ~~**`linear_probe.py`**~~ (done)
+3. **Smoke test (end-to-end):** short pretrain → `embedding_extraction.py` → `linear_probe.py` on Small_HI (homo + hetero)
+4. **README / runbook:** Papagei three-step workflow; clarify temporal vs subject-level splits
+5. **Optional:** encoder-only export in checkpoint for release
+6. **Optional:** `--freeze-encoder` + train only in-model linear layer (still not identical to sklearn probe unless head is a single `Linear`)
+7. **Future:** pretrain checkpoint policy via contrastive val / morphology (not AML)
+8. **Not planned:** `--aml-eval` during contrastive; end-to-end `--finetune` as **primary** GFM metric
 
 ---
 
@@ -377,6 +427,7 @@ This preserves the original motivation for Multi-GNN, where reverse message pass
 
 #### What has been implemented
 1. **New command-line arguments**
+   - `--objective {contrastive,supervised}` (default `contrastive`; graph form still `--reverse_mp`)
    - `--amp`
    - `--gradient_checkpointing`
    - `--contrastive_num_neg_samples`
@@ -403,20 +454,14 @@ This preserves the original motivation for Multi-GNN, where reverse message pass
   - the distinction between pretraining and downstream fine-tuning
 
 #### Remaining work in this phase
-1. add explicit configuration support for:
-   - graph form (`homo` vs `hetero`)
-   - training objective (`supervised` vs `contrastive`)
-   - downstream AML evaluation (`on` vs `off`)
-2. prefer an explicit objective flag over a bare boolean:
-   - e.g. `--objective contrastive` (default)
-   - e.g. `--objective supervised`
-   - this keeps baseline reruns and debugging straightforward
-3. update README / usage docs when the supervised downstream path is restored
-4. document the recommended comparison workflow:
-   - supervised from scratch
-   - contrastive pretraining only
-   - contrastive pretraining -> supervised fine-tuning
-5. document practical run guidance:
+1. ~~explicit `--objective` and graph form via `--reverse_mp`~~ (done in Phase 4a)
+2. update README with GFM framing (pretrain vs adapt) and example Slurm invocations
+3. document the recommended comparison workflow:
+   - **GFM (primary):** contrastive pretrain → extract embeddings → sklearn linear probe (AUROC + F1)
+   - **Multi-GNN baseline:** `--objective supervised` from scratch (in-GNN CE + F1)
+   - **Optional ablation:** contrastive pretrain → `--finetune --objective supervised` (full CE fine-tune—not Papagei)
+   - contrastive pretrain only: `loss/train` (no task metrics)
+4. document practical run guidance:
    - AMP may be unstable at high fanout
    - peak VRAM is dominated largely by sampled subgraph activations
    - `contrastive_num_neg_samples=1024` increased epoch time relative to `512` in current tests
@@ -440,22 +485,22 @@ This preserves the original motivation for Multi-GNN, where reverse message pass
 
 4. **Training Loop** (Phase 4)
    - Modify `train_homo()` to use contrastive loss
-   - Status update: completed for homogeneous pretraining; next arc is to decouple graph form/objective/evaluation, then add hetero contrastive
+   - Status update: homo + hetero contrastive; Phase 4a/4b done
 
-5. **Evaluation** (Phase 5)
-   - Implement embedding-based classification evaluation
-   - Status update: partially deferred; first priority is restoring baseline-comparable AML classification metrics for both homo and hetero, ideally as an explicit switch
+5. **Downstream adaptation & evaluation** (Phase 5)
+   - Original plan included per-epoch AML during contrastive; **replaced** by Papagei-style extract + linear probe (see Phase 5a/5b)
+   - Status update: Phase 5a/5b done; **next:** end-to-end benchmark runs (pretrain → extract → probe)
 
 6. **Configuration & Documentation** (Phase 6)
    - Update configs and README
-   - Status update: partially complete; this plan has been updated, but the next documentation pass should happen after the new control-flow and evaluation switches are in place
+   - Status update: CLI for objective/graph form in place; README should reflect GFM pretrain vs adapt split
 
-7. **Next Arc of Development**
-   - Step 1: decouple graph form, objective, and downstream AML evaluation
-   - Step 2: add an explicit objective flag with `contrastive` as the default and `supervised` as the clean baseline path
-   - Step 3: restore classifier-mode AML training/evaluation for homogeneous fine-tuning
-   - Step 4: preserve and cleanly expose AML F1 evaluation on the hetero path
-   - Step 5: extend contrastive training to hetero while keeping forward transaction edges as the contrastive anchors
+7. **Next arc of development**
+   - ~~Decouple graph form / objective (4a)~~ · ~~Hetero contrastive (4b)~~
+   - **Implement Phase 5a/5b** (extract + linear probe), then benchmark: SSL pretrain → probe vs supervised-from-scratch vs random-init control
+   - Scale pretrain toward larger / less task-labeled finance graphs; keep AML labels for **probe/adapt** eval only
+   - Morphology + contrastive val for **pretrain-native** checkpoint selection (`notes/morphology-metrics-plan.md`)
+   - Optional: in-GNN `--finetune` as ablation only; encoder-only release artifact
 
 ---
 
@@ -475,14 +520,12 @@ This preserves the original motivation for Multi-GNN, where reverse message pass
      - no NaN at higher fanout when AMP is disabled
      - acceptable throughput when queue or negative sampling settings change
 
-3. **Comparison with Baseline**
-   - Train with CrossEntropyLoss (current)
-   - Train with contrastive loss (new)
-   - Compare F1-scores and embedding quality
-   - Status update: this remains the core next comparison, but it now means comparing:
-     - supervised from scratch
-     - homogeneous contrastive pretraining -> AML fine-tuning
-     - heterogeneous contrastive pretraining -> AML fine-tuning
+3. **Comparison with Baseline (downstream metrics, not pretrain F1)**
+   - **Primary:** contrastive pretrain → frozen extract → logistic regression (AUROC + F1 on val/test)
+   - **Control:** same extract + probe protocol from random-init encoder weights
+   - **Multi-GNN baseline:** supervised from scratch (`--objective supervised`, in-GNN F1)
+   - **Optional ablation:** pretrain → `--finetune --objective supervised` (not Papagei; report separately)
+   - Homo and hetero for each leg; pretrain monitored via `loss/train` only
 
 4. **Ablations**
    - Test different contrastive loss types
@@ -502,6 +545,10 @@ This preserves the original motivation for Multi-GNN, where reverse message pass
    - verify seed-edge recovery and alignment operate on forward transaction edges only
    - confirm reverse synthetic edges do not enter the queue as separate contrastive samples
 
+6. **Extraction + linear probe smoke tests** (Phase 5)
+   - short contrastive pretrain → extract train/val → shapes, no NaNs, dedupe/coverage logs
+   - logistic probe AUROC/F1 on Small_HI; hetero + homo
+
 ---
 
 ## Related Future Direction: Morphology Metrics
@@ -514,8 +561,9 @@ Another major project thread is morphology-aware representation learning, includ
 This should stay visible in the contrastive plan because it is one of the intended ways to make the embeddings more discriminative, but it is large enough to deserve its own companion planning document.
 
 Current recommendation:
-- keep the main implementation focus here on contrastive training, homo/hetero support, and AML evaluation
-- treat morphology metrics as a parallel future extension
+- keep pretrain focus on contrastive (+ future morphology), homo/hetero support, **without** AML F1 in the contrastive loop
+- use AML (and other tasks) only in **downstream** extract + probe (or optional in-GNN supervised), not inside the contrastive loop
+- treat morphology metrics as the Papagei-aligned direction for **pretrain-native** quality and checkpoint selection
 - evaluate whether morphology should be used as:
   - an auxiliary prediction target
   - an additional feature source
@@ -535,11 +583,10 @@ Open design questions that will likely matter later:
 
 ## Notes
 
-- The six-phase structure is still useful for communicating the implementation plan, but each phase now needs to reflect the design decisions we actually made
-- The most important architectural win was making the loss scale with shared seed edges rather than full sampled subgraph edges
-- The biggest remaining implementation gaps are now:
-  - decoupling graph form, objective, and downstream evaluation
-  - adding a clean objective switch so contrastive training can be turned on/off without changing graph form
-  - restoring clean AML evaluation for both homo and hetero
-  - extending contrastive learning to the hetero path that originally motivated Multi-GNN
-- Once the AML fine-tune/evaluation path is back for both graph forms, we can more cleanly assess whether contrastive pretraining improves the baseline task before expanding to broader downstream finance applications
+- The six-phase structure is preserved; phases 1–4 record what was built.
+- **May 2026 GFM decisions:** (1) no AML metrics during contrastive pretrain; (2) **primary** downstream = Papagei-style **frozen extract + sklearn linear probe**; (3) in-GNN `--finetune` supervised is **secondary**, not the main scientific claim.
+- The most important architectural win was making the loss scale with shared seed edges rather than full sampled subgraph edges.
+- **`return_embeddings=True`** is the extraction hook; `evaluate_*` already shows seed-edge masking—Phase 5a refactors that into export, Phase 5b adds sklearn probe.
+- **Biggest near-term gap:** implement Phase 5a/5b, then run SSL pretrain → probe vs baselines on AML (and later other tasks with their own labels).
+- **Pretrain checkpoint selection:** eventually contrastive val / morphology—not AML probe val.
+- **Declined:** per-epoch AML probe during contrastive; using AML val to pick encoder weights during pretrain; treating end-to-end `--finetune` CE as the definition of GFM downstream success.
