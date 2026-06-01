@@ -553,31 +553,24 @@ Writes `embeddings/{unique_name}/{train,val,test}.npz` and `meta.json`.
 
 ## Related Future Direction: Morphology Metrics
 
-Another major project thread is morphology-aware representation learning, including metrics such as:
-- betweenness centrality
-- triangle counts
-- clustering / motif-style structure signals
+Morphology-aware SSL is the intended way to strengthen contrastive pretrain beyond edge-identity InfoNCE (especially when memory limits asymmetric / subsampled negatives). **Full specification, metric tiers, node→edge lifting, and phased implementation live in the companion doc—not duplicated here.**
 
-This should stay visible in the contrastive plan because it is one of the intended ways to make the embeddings more discriminative, but it is large enough to deserve its own companion planning document.
+**Companion doc (canonical):** [`notes/morphology-metrics-plan.md`](morphology-metrics-plan.md)
 
-Current recommendation:
-- keep pretrain focus on contrastive (+ future morphology), homo/hetero support, **without** AML F1 in the contrastive loop
-- use AML (and other tasks) only in **downstream** extract + probe (or optional in-GNN supervised), not inside the contrastive loop
-- treat morphology metrics as the Papagei-aligned direction for **pretrain-native** quality and checkpoint selection
-- evaluate whether morphology should be used as:
-  - an auxiliary prediction target
-  - an additional feature source
-  - a regularizer / extra loss term
-  - a source of structure-aware positives or task design
+Summary of that plan:
 
-Companion doc:
-- `notes/morphology-metrics-plan.md`
+| Topic | Decision |
+|-------|----------|
+| **Models** | Morphology is **model-agnostic** (`gin` / `gat` / `pna` / `rgcn` share edge `z` readout); benchmark best morph config across architectures |
+| **Papagei split** | Expert heads predict some metrics; morphology-aware **contrast** uses others (or binned similarity)—AML labels not used in pretrain |
+| **Readout** | Transaction embedding `z` is **edge-level** (concat sender/receiver node embs + edge emb → 128-d); morphology targets attach to **seed edges** |
+| **Local vs global** | **v0:** `morph_local` + edge-native (batch subgraph); **later:** optional `morph_global` via offline node lookup (e.g. full-graph degree, BC) |
+| **Precompute scope** | All **nodes** per split for globals; **never** all subgraphs; train-edge tables only for cheap edge-native scalars |
+| **Phases** | M0 plumbing → M1 local expert head → M2 local morph contrast → M3 Tier 2 globals |
 
-Open design questions that will likely matter later:
-- should morphology targets be defined on nodes, edges, or transaction-local substructures?
-- should metrics be computed on homogeneous graphs, heterogeneous graphs, or both?
-- how do we avoid temporal leakage when precomputing metrics?
-- which metrics are feasible to compute exactly at project scale versus approximately or offline?
+Contrastive plan still owns: homo/hetero contrastive routing, extraction, linear probe, **no AML F1 in pretrain**. Morphology plan owns metric definitions and loss integration.
+
+**Prerequisite:** stable contrastive + probe baseline (see May 2026 Small-HI runs: contrastive ~0.83 vs supervised ~0.97 test AUROC at 20ep) before morphology ablations.
 
 ---
 

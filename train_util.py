@@ -655,11 +655,18 @@ def evaluate_hetero(loader, inds, model, data, device, args):
 
 def save_model(model, optimizer, epoch, args, data_config):
     # Save the model in a dictionary
-    torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict()
-                }, f'{data_config["paths"]["model_to_save"]}/checkpoint_{args.unique_name}{"" if not args.finetune else "_finetuned"}.tar')
+    payload = {
+        "epoch": epoch + 1,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }
+    morph_head = getattr(args, "morph_expert_head", None)
+    if morph_head is not None:
+        payload["morph_expert_state_dict"] = morph_head.state_dict()
+    torch.save(
+        payload,
+        f'{data_config["paths"]["model_to_save"]}/checkpoint_{args.unique_name}{"" if not args.finetune else "_finetuned"}.tar',
+    )
 
 def load_model(model, device, args, config, data_config):
     checkpoint = torch.load(f'{data_config["paths"]["model_to_load"]}/checkpoint_{args.unique_name}.tar')

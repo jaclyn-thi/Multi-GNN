@@ -1,8 +1,14 @@
 """
 Phase 5b: Papagei-style linear probing on frozen embeddings (Phase 5a ``.npz`` files).
 
-Fits sklearn logistic regression on train embeddings and reports AUROC + F1 on
-train / val / test.
+Fits sklearn logistic regression on train embeddings and reports AUROC (threshold-free)
+plus F1 / precision / recall at a validation-selected threshold (max F1 on val by default).
+When the selected threshold is not 0.5, also writes ``splits_at_threshold_0.5`` for comparison.
+
+``probe_results.json`` structure:
+  - ``classification_threshold``: how the flagging threshold was chosen
+  - ``splits_at_selected_threshold``: primary task metrics (train / val / test)
+  - ``splits_at_threshold_0.5``: optional baseline at fixed 0.5 (omitted if selected is 0.5)
 
 Example (after ``embedding_extraction.py``):
 
@@ -20,7 +26,13 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import wandb
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.metrics import (
+    f1_score,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 
 from train_util import extract_param
 from util import logger_setup, set_seed
@@ -55,6 +67,38 @@ def resolve_class_weight(args) -> Optional[Any]:
     raise ValueError(f"Unsupported --class_weight {args.class_weight!r}")
 
 
+def serialize_class_weight(class_weight: Optional[Any]) -> Any:
+    """JSON-safe representation of sklearn ``class_weight``."""
+    if class_weight is None:
+        return None
+    if isinstance(class_weight, str):
+        return class_weight
+    return {int(k): float(v) for k, v in class_weight.items()}
+
+
+def tune_threshold_max_f1(y: np.ndarray, proba: np.ndarray) -> Tuple[float, float]:
+    """
+    Pick the score threshold on validation that maximizes F1.
+
+    Returns ``(threshold, val_f1)``. Falls back to 0.5 if val has a single class.
+    """
+    y = y.astype(np.int64)
+    if len(np.unique(y)) < 2:
+        logging.warning("val threshold tuning: only one class present; using 0.5")
+        pred = (proba >= 0.5).astype(np.int64)
+        return 0.5, float(f1_score(y, pred, zero_division=0))
+
+    precisions, recalls, thresholds = precision_recall_curve(y, proba)
+    if thresholds.size == 0:
+        pred = (proba >= 0.5).astype(np.int64)
+        return 0.5, float(f1_score(y, pred, zero_division=0))
+
+    f1_scores = (2 * precisions[:-1] * recalls[:-1]) / (precisions[:-1] + recalls[:-1] + 1e-12)
+    best_i = int(np.argmax(f1_scores))
+    threshold = float(thresholds[best_i])
+    return threshold, float(f1_scores[best_i])
+
+
 def fit_logistic_probe(
     z_train: np.ndarray,
     y_train: np.ndarray,
@@ -78,6 +122,7 @@ def evaluate_probe(
     z: np.ndarray,
     y: np.ndarray,
     split_name: str,
+    threshold: float = 0.5,
 ) -> Dict[str, float]:
     if z.shape[0] == 0:
         logging.warning("linear probe %s: empty split", split_name)
@@ -91,7 +136,7 @@ def evaluate_probe(
         }
 
     proba = clf.predict_proba(z)[:, 1]
-    pred = (proba >= 0.5).astype(np.int64)
+    pred = (proba >= threshold).astype(np.int64)
     y = y.astype(np.int64)
 
     metrics: Dict[str, float] = {
@@ -133,13 +178,41 @@ def run_linear_probe(embeddings_root: Path, args) -> Dict[str, Any]:
         seed=int(args.seed),
     )
 
+    tuning_mode = str(getattr(args, "threshold_tuning", "max_f1_val"))
+    if tuning_mode == "max_f1_val":
+        z_val, y_val, _ = load_embedding_npz(split_paths["val"])
+        val_proba = clf.predict_proba(z_val)[:, 1]
+        selected_threshold, val_f1_at_selection = tune_threshold_max_f1(y_val, val_proba)
+        classification_threshold = {
+            "method": "max_f1_on_val",
+            "value": selected_threshold,
+            "selected_on": "val",
+        }
+        logging.info(
+            "Classification threshold selected on val: %.6f (val F1=%.4f, method=max_f1_on_val)",
+            selected_threshold,
+            val_f1_at_selection,
+        )
+    else:
+        selected_threshold = 0.5
+        classification_threshold = {
+            "method": "fixed_0.5",
+            "value": 0.5,
+            "selected_on": None,
+        }
+
     results: Dict[str, Any] = {
         "unique_name": args.unique_name,
         "embeddings_dir": str(embeddings_root),
-        "class_weight": class_weight if isinstance(class_weight, str) else dict(class_weight),
+        "class_weight": serialize_class_weight(class_weight),
         "probe_max_iter": int(args.probe_max_iter),
-        "splits": {},
+        "threshold_tuning": tuning_mode,
+        "classification_threshold": classification_threshold,
+        "splits_at_selected_threshold": {},
     }
+    include_threshold_0_5_baseline = abs(selected_threshold - 0.5) > 1e-9
+    if include_threshold_0_5_baseline:
+        results["splits_at_threshold_0.5"] = {}
 
     meta_path = embeddings_root / "meta.json"
     if meta_path.is_file():
@@ -148,25 +221,30 @@ def run_linear_probe(embeddings_root: Path, args) -> Dict[str, Any]:
 
     for split_name, path in split_paths.items():
         z, y, _ = load_embedding_npz(path)
-        metrics = evaluate_probe(clf, z, y, split_name)
-        results["splits"][split_name] = metrics
-        logging.info(
-            "aml_probe/linear/%s: AUROC=%.4f F1=%.4f precision=%.4f recall=%.4f (n=%d)",
-            split_name,
-            metrics["auroc"],
-            metrics["f1"],
-            metrics["precision"],
-            metrics["recall"],
-            int(metrics["n"]),
+        metrics_selected = evaluate_probe(
+            clf, z, y, split_name, threshold=selected_threshold
         )
-
-    val_f1 = results["splits"]["val"]["f1"]
-    te_f1 = results["splits"]["test"]["f1"]
-    results["best_test_f1_at_val"] = {
-        "note": "sklearn probe has no epoch loop; reports test F1 for this single fit",
-        "val_f1": val_f1,
-        "test_f1": te_f1,
-    }
+        results["splits_at_selected_threshold"][split_name] = metrics_selected
+        logging.info(
+            "aml_probe/linear/%s @ selected threshold %.4f: AUROC=%.4f F1=%.4f precision=%.4f recall=%.4f (n=%d)",
+            split_name,
+            selected_threshold,
+            metrics_selected["auroc"],
+            metrics_selected["f1"],
+            metrics_selected["precision"],
+            metrics_selected["recall"],
+            int(metrics_selected["n"]),
+        )
+        if include_threshold_0_5_baseline:
+            metrics_default = evaluate_probe(clf, z, y, split_name, threshold=0.5)
+            results["splits_at_threshold_0.5"][split_name] = metrics_default
+            logging.info(
+                "aml_probe/linear/%s @ threshold 0.5000: F1=%.4f precision=%.4f recall=%.4f",
+                split_name,
+                metrics_default["f1"],
+                metrics_default["precision"],
+                metrics_default["recall"],
+            )
 
     out_path = embeddings_root / "probe_results.json"
     with out_path.open("w", encoding="utf-8") as f:
@@ -203,6 +281,13 @@ def main() -> None:
         help="Logistic regression class weights (default balanced, Papagei-style).",
     )
     parser.add_argument("--probe_max_iter", type=int, default=1000)
+    parser.add_argument(
+        "--threshold_tuning",
+        type=str,
+        default="max_f1_val",
+        choices=["max_f1_val", "fixed_0.5"],
+        help="Set classification threshold for F1/precision/recall: tune on val (default) or fixed 0.5.",
+    )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--testing", action="store_true", help="Disable wandb.")
     args = parser.parse_args()
@@ -227,17 +312,19 @@ def main() -> None:
             "class_weight": args.class_weight,
             "model": args.model,
             "probe_max_iter": args.probe_max_iter,
+            "threshold_tuning": args.threshold_tuning,
         },
     )
 
     results = run_linear_probe(embeddings_root, args)
 
     log_payload = {}
-    for split_name, metrics in results["splits"].items():
+    for split_name, metrics in results["splits_at_selected_threshold"].items():
         for key, value in metrics.items():
             if key == "n":
                 continue
             log_payload[f"aml_probe/linear/{split_name}/{key}"] = value
+    log_payload["aml_probe/classification_threshold"] = results["classification_threshold"]["value"]
     wandb.log(log_payload)
     wandb.finish()
 

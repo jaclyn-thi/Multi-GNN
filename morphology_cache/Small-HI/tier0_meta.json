@@ -1,0 +1,29 @@
+{
+  "data": "Small-HI",
+  "reverse_mp": true,
+  "ports": true,
+  "tds": false,
+  "splits": {
+    "train": {
+      "path": "morphology_cache/Small-HI/train_node_morphology.csv",
+      "num_nodes": 515088,
+      "num_edges": 3248921,
+      "deg_in_sum": 3248921,
+      "deg_out_sum": 3248921
+    },
+    "val": {
+      "path": "morphology_cache/Small-HI/val_node_morphology.csv",
+      "num_nodes": 515088,
+      "num_edges": 4214445,
+      "deg_in_sum": 4214445,
+      "deg_out_sum": 4214445
+    },
+    "test": {
+      "path": "morphology_cache/Small-HI/test_node_morphology.csv",
+      "num_nodes": 515088,
+      "num_edges": 5078345,
+      "deg_in_sum": 5078345,
+      "deg_out_sum": 5078345
+    }
+  }
+}

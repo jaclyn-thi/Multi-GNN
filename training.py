@@ -28,6 +28,13 @@ from torch_geometric.utils import degree
 from pytorch_metric_learning.losses import NTXentLoss
 from graph_augmentations import generate_views
 from contrastive_loss import EdgeMemoryQueue, edge_identity_infonce_loss
+from morphology.contrastive_train import (
+    eval_morph_expert_val_hetero,
+    eval_morph_expert_val_homo,
+    morph_expert_loss_hetero_step,
+    morph_expert_loss_homo_step,
+)
+from morphology.expert import setup_morphology_expert, setup_morph_tier0_contexts
 import wandb
 import logging
 
@@ -35,7 +42,7 @@ import logging
 def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, model, optimizer, loss_fn, args, config, device, val_data, te_data, data_config):
     # Contrastive pretraining on homogeneous graphs.
     # NOTE: The following arguments are unused in contrastive pretraining:
-    # tr_inds, val_loader, te_loader, val_inds, te_inds, loss_fn, val_data, te_data
+    # tr_inds, te_loader, te_inds, loss_fn, te_data
     # best_val_f1 = 0
     use_amp = bool(getattr(args, "amp", False)) and device.type == "cuda"
     scaler = GradScaler(enabled=use_amp)
@@ -56,11 +63,13 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
         )
         accum_steps = 1
 
+    morph_head = getattr(args, "morph_expert_head", None)
+    morph_cfg = getattr(args, "morph_expert_cfg", None)
+
     for epoch in range(config.epochs):
         total_examples = 0
         loss_sum = torch.zeros((), device=device)
-        # preds = []
-        # ground_truths = []
+        morph_loss_sum = torch.zeros((), device=device)
         optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(tqdm.tqdm(tr_loader, disable=not args.tqdm)):
             seed_edge_ids = get_homo_seed_edge_ids(batch, tr_loader.data)
@@ -126,6 +135,18 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
                     symmetric=contrastive_symmetric,
                     memory_queue=memory_queue,
                 )
+                if morph_head is not None and morph_cfg is not None:
+                    morph_loss = morph_expert_loss_homo_step(
+                        view1,
+                        z1_seed,
+                        seed_id1,
+                        batch,
+                        morph_head,
+                        morph_cfg,
+                        tier0_ctx=getattr(args, "morph_tier0_train", None),
+                    )
+                    loss_raw = loss_raw + morph_loss
+                    morph_loss_sum = morph_loss_sum + morph_loss.detach()
             loss = loss_raw / float(accum_steps)
 
             if use_amp:
@@ -152,8 +173,18 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
             total_examples += 1
 
         avg_loss = float((loss_sum / max(total_examples, 1)).cpu())
-        wandb.log({"loss/train": avg_loss}, step=epoch)
-        logging.info(f"Train Loss: {avg_loss:.4f}")
+        log_payload = {"loss/train": avg_loss}
+        if morph_head is not None:
+            avg_morph = float((morph_loss_sum / max(total_examples, 1)).cpu())
+            log_payload["morph/expert_train"] = avg_morph
+            if val_loader is not None:
+                log_payload["morph/expert_val"] = eval_morph_expert_val_homo(
+                    val_loader, model, morph_head, morph_cfg, device, args
+                )
+            logging.info(f"Train Loss: {avg_loss:.4f} | morph/expert_train: {avg_morph:.4f}")
+        else:
+            logging.info(f"Train Loss: {avg_loss:.4f}")
+        wandb.log(log_payload, step=epoch)
         if args.save_model:
             save_model(model, optimizer, epoch, args, data_config)
 
@@ -314,7 +345,7 @@ def train_hetero_supervised(tr_loader, val_loader, te_loader, tr_inds, val_inds,
 
 def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, model, optimizer, loss_fn, args, config, device, val_data, te_data, data_config):
     """Contrastive pretraining on heterogeneous graphs (forward transactions as anchors)."""
-    del val_loader, te_loader, tr_inds, val_inds, te_inds, loss_fn, val_data, te_data
+    del te_loader, tr_inds, val_inds, te_inds, loss_fn, te_data
     use_amp = bool(getattr(args, "amp", False)) and device.type == "cuda"
     scaler = GradScaler(enabled=use_amp)
     neg_kw = int(getattr(args, "contrastive_num_neg_samples", 0))
@@ -334,9 +365,13 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
         )
         accum_steps = 1
 
+    morph_head = getattr(args, "morph_expert_head", None)
+    morph_cfg = getattr(args, "morph_expert_cfg", None)
+
     for epoch in range(config.epochs):
         total_examples = 0
         loss_sum = torch.zeros((), device=device)
+        morph_loss_sum = torch.zeros((), device=device)
         optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(tqdm.tqdm(tr_loader, disable=not args.tqdm)):
             seed_edge_ids = get_hetero_seed_edge_ids(batch, tr_loader.data)
@@ -416,6 +451,18 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                     symmetric=contrastive_symmetric,
                     memory_queue=memory_queue,
                 )
+                if morph_head is not None and morph_cfg is not None:
+                    morph_loss = morph_expert_loss_hetero_step(
+                        view1,
+                        z1_seed,
+                        seed_id1,
+                        batch,
+                        morph_head,
+                        morph_cfg,
+                        tier0_ctx=getattr(args, "morph_tier0_train", None),
+                    )
+                    loss_raw = loss_raw + morph_loss
+                    morph_loss_sum = morph_loss_sum + morph_loss.detach()
             loss = loss_raw / float(accum_steps)
 
             if use_amp:
@@ -442,8 +489,18 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
             total_examples += 1
 
         avg_loss = float((loss_sum / max(total_examples, 1)).cpu())
-        wandb.log({"loss/train": avg_loss}, step=epoch)
-        logging.info(f"Train Loss: {avg_loss:.4f}")
+        log_payload = {"loss/train": avg_loss}
+        if morph_head is not None:
+            avg_morph = float((morph_loss_sum / max(total_examples, 1)).cpu())
+            log_payload["morph/expert_train"] = avg_morph
+            if val_loader is not None:
+                log_payload["morph/expert_val"] = eval_morph_expert_val_hetero(
+                    val_loader, model, morph_head, morph_cfg, device, args
+                )
+            logging.info(f"Train Loss: {avg_loss:.4f} | morph/expert_train: {avg_morph:.4f}")
+        else:
+            logging.info(f"Train Loss: {avg_loss:.4f}")
+        wandb.log(log_payload, step=epoch)
         if args.save_model:
             save_model(model, optimizer, epoch, args, data_config)
 
@@ -555,6 +612,10 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
             "contrastive_accum_steps": int(getattr(args, "contrastive_accum_steps", 1)),
             "contrastive_memory_bank_size": int(getattr(args, "contrastive_memory_bank_size", 0)),
             "loader_num_workers": int(getattr(args, "loader_num_workers", 10)),
+            "morph_expert": bool(getattr(args, "morph_expert", False)),
+            "morph_targets": getattr(args, "morph_targets", "local"),
+            "morph_tier0_cache": getattr(args, "morph_tier0_cache", None),
+            "morph_expert_weight": float(getattr(args, "morph_expert_weight", 1.0)),
         }
     )
 
@@ -579,11 +640,23 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
     if args.reverse_mp:
         model = to_hetero(model, te_data.metadata(), aggr='mean')
 
+    morph_head, morph_cfg = setup_morphology_expert(args, tr_data, device, setup.is_hetero)
+    args.morph_expert_head = morph_head
+    args.morph_expert_cfg = morph_cfg
+    if morph_head is not None and morph_cfg is not None and morph_cfg.include_global:
+        setup_morph_tier0_contexts(args, tr_data, val_data, device)
+
     if args.finetune:
         model, optimizer = load_model(model, device, args, config, data_config)
+        if morph_head is not None:
+            opt_params = list(model.parameters()) + list(morph_head.parameters())
+            optimizer = torch.optim.Adam(opt_params, lr=config.lr)
     else:
         model.to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+        opt_params = list(model.parameters())
+        if morph_head is not None:
+            opt_params += list(morph_head.parameters())
+        optimizer = torch.optim.Adam(opt_params, lr=config.lr)
 
     sample_batch.to(device)
     sample_x = sample_batch.x if not isinstance(sample_batch, HeteroData) else sample_batch.x_dict

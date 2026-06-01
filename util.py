@@ -99,6 +99,44 @@ def create_parser():
         help="Optional detached queue of prior seed-edge embeddings used as extra negatives (0 disables the queue).",
     )
 
+    # Morphology expert head (contrastive pretrain, Phase M1)
+    parser.add_argument(
+        "--morph_expert",
+        action="store_true",
+        help="Add morphology expert head loss during contrastive pretraining (Tier 1 local targets).",
+    )
+    parser.add_argument(
+        "--morph_targets",
+        type=str,
+        default="local",
+        choices=["local", "local+global"],
+        help="Morphology target set: local (Tier 1) or local+global (Tier 1 + Tier 0 endpoint lift).",
+    )
+    parser.add_argument(
+        "--morph_tier0_cache",
+        type=str,
+        default=None,
+        help="Directory with {train,val,test}_node_morphology.csv from precompute_morphology_tier0.py. "
+        "If omitted with local+global, tables are computed from split graphs at startup.",
+    )
+    parser.add_argument(
+        "--morph_expert_weight",
+        type=float,
+        default=1.0,
+        help="Weight for morphology expert MSE loss vs InfoNCE.",
+    )
+    parser.add_argument(
+        "--morph_expert_hidden",
+        type=int,
+        default=64,
+        help="Hidden size of morphology expert MLP.",
+    )
+    parser.add_argument(
+        "--no_morph_edge_native",
+        action="store_true",
+        help="Do not append forward edge_attr values to morphology targets.",
+    )
+
     return parser
 
 def set_seed(seed: int = 0) -> None:
