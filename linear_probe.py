@@ -105,13 +105,14 @@ def fit_logistic_probe(
     class_weight: Optional[Any],
     max_iter: int,
     seed: int,
+    n_jobs: int = -1,
 ) -> LogisticRegression:
     clf = LogisticRegression(
         class_weight=class_weight,
         max_iter=max_iter,
         random_state=seed,
         solver="lbfgs",
-        n_jobs=-1,
+        n_jobs=n_jobs,
     )
     clf.fit(z_train, y_train)
     return clf

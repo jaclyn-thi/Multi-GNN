@@ -1,4 +1,8 @@
-"""Graph accessors for morphology (homogeneous and hetero forward edges)."""
+"""Graph accessors for morphology (homogeneous and hetero forward edges).
+
+Morphology is defined on **forward** transactions ``('node', 'to', 'node')`` in
+hetero mode. Reverse edges exist for message passing only and are not used here.
+"""
 
 from __future__ import annotations
 
@@ -58,10 +62,23 @@ def seed_endpoints_from_edge_ids(
     edge_index: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-  Map seed ``EdgeID`` values to ``(sender, receiver)`` node ids.
+    Map seed ``EdgeID`` values to ``(sender, receiver)`` node ids.
 
-  Assumes ``edge_id`` equals the column index in ``edge_index`` on this graph.
-  """
+    Assumes ``edge_id`` equals the column index in ``edge_index`` on this graph
+    (convention after ``add_arange_ids`` in data loading).
+
+    Parameters
+    ----------
+    edge_ids :
+        Seed transaction ids, shape ``(S,)``.
+    edge_index :
+        Forward ``[2, E]`` with row 0 = sender, row 1 = receiver.
+
+    Returns
+    -------
+    tuple of Tensor
+        ``(senders, receivers)`` each shape ``(S,)``.
+    """
     eid = edge_ids.long().view(-1).cpu()
     ei = edge_index.cpu()
     if eid.max().item() >= ei.shape[1] or eid.min().item() < 0:

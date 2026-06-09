@@ -1,3 +1,20 @@
+"""
+Edge-level contrastive losses for transaction-graph self-supervised learning.
+
+Primary API
+-----------
+``edge_identity_infonce_loss`` — InfoNCE on aligned seed-edge embeddings across
+two augmented views. Optional extensions:
+
+- ``num_neg_samples`` — GPU subsampled negatives (memory-friendly at large batch)
+- ``memory_queue`` — detached FIFO queue of past seed embeddings as extra negatives
+- ``morph_bin_ids`` — Phase M2: same morphology bin → additional positives in the
+  numerator via **bin-grouped** indexing (no dense ``(B, B)`` mask)
+
+Supporting utilities align shared ``edge_id`` rows across views before loss
+computation. See ``morphology/contrast.py`` and ``morphology/contrastive_train.py``.
+"""
+
 from typing import Optional, Tuple
 
 import torch
@@ -84,6 +101,27 @@ class EdgeMemoryQueue:
 
 def _normalize_embeddings(z: torch.Tensor) -> torch.Tensor:
     return F.normalize(z.float(), dim=1)
+
+
+def _align_morph_bin_ids_to_shared(
+    morph_bin_ids: torch.Tensor,
+    edge_id1: torch.Tensor,
+    edge_id2: torch.Tensor,
+) -> torch.Tensor:
+    """Reorder morphology bins to match ``_align_shared_edge_pairs`` row order."""
+    edge_id1 = edge_id1.long().view(-1)
+    edge_id2 = edge_id2.long().view(-1)
+    if morph_bin_ids.shape[0] != edge_id1.shape[0]:
+        raise ValueError("morph_bin_ids must align with edge_id1 rows before pairing.")
+    shared_ids = edge_id1[torch.isin(edge_id1, edge_id2)]
+    if shared_ids.numel() == 0:
+        return morph_bin_ids.new_empty((0,), dtype=torch.long)
+    shared_ids = torch.unique(shared_ids, sorted=True)
+    keep1 = torch.isin(edge_id1, shared_ids)
+    bins = morph_bin_ids[keep1]
+    ids = edge_id1[keep1]
+    order = torch.argsort(ids)
+    return bins[order]
 
 
 def _align_shared_edge_pairs(
@@ -206,6 +244,125 @@ def _logsumexp_over_queue(
     return log_queue
 
 
+def morphology_soft_positive_mask(morph_bin_ids: torch.Tensor) -> torch.Tensor:
+    """``(B, B)`` bool: soft positives share the same morphology bin (debug / tests only)."""
+    return morph_bin_ids.unsqueeze(0) == morph_bin_ids.unsqueeze(1)
+
+
+def _bin_positive_index_segments(morph_bin_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Sort seed rows by morphology bin for group-wise positive lookup.
+
+    Returns ``(inv, group_starts, sorted_row_indices)`` where positives for
+    anchor row ``i`` lie in ``sorted_row_indices[group_starts[inv[i]]:group_starts[inv[i+1]]]``.
+
+    Avoids materializing a ``(B, B)`` soft-positive mask at large batch sizes.
+    """
+    if morph_bin_ids.numel() == 0:
+        empty = morph_bin_ids.new_empty((0,), dtype=torch.long)
+        return empty, empty, empty
+    _, inv = torch.unique(morph_bin_ids, return_inverse=True)
+    order = torch.argsort(inv)
+    sorted_idx = order
+    sorted_inv = inv[order]
+    n_groups = int(inv.max().item()) + 1
+    counts = torch.bincount(inv, minlength=n_groups)
+    starts = torch.zeros(n_groups + 1, device=inv.device, dtype=torch.long)
+    starts[1:] = torch.cumsum(counts, dim=0)
+    return inv, starts, sorted_idx
+
+
+def _cap_positive_row_indices(
+    pos_idx: torch.Tensor,
+    anchor_row: int,
+    max_positives: int,
+) -> torch.Tensor:
+    if pos_idx.numel() <= max_positives:
+        return pos_idx
+    keep = pos_idx[pos_idx == anchor_row]
+    if keep.numel() == 0:
+        keep = pos_idx[:1]
+    others = pos_idx[pos_idx != anchor_row]
+    n_other = max(0, max_positives - int(keep.numel()))
+    if others.numel() > n_other:
+        pick = torch.randperm(others.numel(), device=others.device)[:n_other]
+        others = others[pick]
+    return torch.cat([keep, others], dim=0)
+
+
+def _logsumexp_positive_logits_bin_grouped(
+    z_row: torch.Tensor,
+    z_other: torch.Tensor,
+    pos_idx: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    if pos_idx.numel() == 0:
+        return z_row.new_tensor(float("-inf"))
+    if pos_idx.numel() == 1:
+        return (z_row * z_other[pos_idx[0]]).sum() / temperature
+    logits = (z_row @ z_other[pos_idx].T) / temperature
+    return torch.logsumexp(logits.reshape(-1), dim=0)
+
+
+def _sample_negative_indices_by_bin(
+    morph_bin_ids: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    anchor_ids: torch.Tensor,
+    anchor_bins: torch.Tensor,
+    k: int,
+    *,
+    oversample_factor: int = 4,
+    max_rounds: int = 6,
+) -> torch.Tensor:
+    """
+    Sample negatives without a dense mask.
+
+    Batch columns ``j < B`` are negatives when ``morph_bin_ids[j] != anchor_bin``.
+    Queue columns ``j >= B`` are negatives when ``candidate_ids[j] != anchor_id``.
+    """
+    b = int(anchor_ids.numel())
+    n_batch = int(morph_bin_ids.numel())
+    if k <= 0 or b == 0 or candidate_ids.numel() == 0:
+        return torch.empty((b, 0), device=anchor_ids.device, dtype=torch.long)
+
+    neg_idx = torch.full((b, int(k)), -1, device=anchor_ids.device, dtype=torch.long)
+    filled = torch.zeros((b,), device=anchor_ids.device, dtype=torch.long)
+    n_candidates = int(candidate_ids.numel())
+    sample_width = max(int(k) * int(max(1, oversample_factor)), 32)
+
+    for _ in range(max_rounds):
+        remaining = torch.nonzero(filled < k, as_tuple=False).view(-1)
+        if remaining.numel() == 0:
+            break
+        base_filled = filled[remaining]
+        cand = torch.randint(0, n_candidates, (remaining.numel(), sample_width), device=anchor_ids.device)
+        is_queue = cand >= n_batch
+        in_batch = cand < n_batch
+        bin_mismatch = torch.zeros_like(is_queue)
+        if n_batch > 0:
+            bin_mismatch = in_batch & (
+                morph_bin_ids[cand.clamp(max=n_batch - 1)]
+                != anchor_bins[remaining].unsqueeze(1)
+            )
+        valid = (candidate_ids[cand] != anchor_ids[remaining].unsqueeze(1)) & (is_queue | bin_mismatch)
+        if not valid.any():
+            continue
+
+        rank = torch.cumsum(valid.to(torch.int64), dim=1) - 1
+        take_mask = valid & (rank < (k - base_filled).unsqueeze(1))
+        if not take_mask.any():
+            continue
+
+        local_rows = torch.arange(remaining.numel(), device=anchor_ids.device).unsqueeze(1).expand_as(cand)
+        selected_rows_local = local_rows[take_mask]
+        selected_rows = remaining[selected_rows_local]
+        selected_cols = base_filled[selected_rows_local] + rank[take_mask]
+        neg_idx[selected_rows, selected_cols] = cand[take_mask]
+        filled[remaining] = base_filled + take_mask.sum(dim=1).to(base_filled.dtype)
+
+    return neg_idx
+
+
 def _directional_aligned_infonce(
     z_anchor: torch.Tensor,
     z_other: torch.Tensor,
@@ -216,6 +373,8 @@ def _directional_aligned_infonce(
     col_chunk: int = 1024,
     num_neg_samples: Optional[int] = None,
     memory_queue: Optional[EdgeMemoryQueue] = None,
+    morph_bin_ids: Optional[torch.Tensor] = None,
+    max_soft_positives: Optional[int] = None,
 ) -> torch.Tensor:
     if z_anchor.shape != z_other.shape:
         raise ValueError("Aligned directional InfoNCE expects z_anchor and z_other to share shape.")
@@ -242,15 +401,47 @@ def _directional_aligned_infonce(
         candidate_ids = torch.cat([candidate_ids, queue_ids], dim=0)
         candidate_z = torch.cat([candidate_z, queue_z], dim=0)
 
+    use_morph = morph_bin_ids is not None
+    bin_inv: Optional[torch.Tensor] = None
+    bin_starts: Optional[torch.Tensor] = None
+    bin_sorted_idx: Optional[torch.Tensor] = None
+    if use_morph:
+        bin_inv, bin_starts, bin_sorted_idx = _bin_positive_index_segments(morph_bin_ids)
+
     for i0 in range(0, z_anchor.shape[0], row_chunk):
         i1 = min(i0 + row_chunk, z_anchor.shape[0])
         z_b = z_anchor[i0:i1]
         ids_b = edge_ids[i0:i1]
-        z_pos = z_other[i0:i1]
-        log_num = ((z_b * z_pos).sum(dim=1) / temperature)
+        chunk_rows = int(z_b.shape[0])
+        log_num = z_b.new_empty((chunk_rows,))
+
+        if use_morph and bin_inv is not None and bin_starts is not None and bin_sorted_idx is not None:
+            bins_b = morph_bin_ids[i0:i1]
+            for ii in range(chunk_rows):
+                i = i0 + ii
+                g = int(bin_inv[i].item())
+                s, e = int(bin_starts[g].item()), int(bin_starts[g + 1].item())
+                pos_idx = bin_sorted_idx[s:e]
+                if max_soft_positives is not None and max_soft_positives > 0:
+                    pos_idx = _cap_positive_row_indices(pos_idx, i, int(max_soft_positives))
+                log_num[ii] = _logsumexp_positive_logits_bin_grouped(
+                    z_b[ii], z_other, pos_idx, temperature
+                )
+        else:
+            z_pos = z_other[i0:i1]
+            log_num = ((z_b * z_pos).sum(dim=1) / temperature)
 
         if use_neg_subsample:
-            neg_idx = _sample_negative_indices_batched_gpu(candidate_ids, ids_b, k_neg)
+            if use_morph and morph_bin_ids is not None:
+                neg_idx = _sample_negative_indices_by_bin(
+                    morph_bin_ids,
+                    candidate_ids,
+                    ids_b,
+                    bins_b,
+                    k_neg,
+                )
+            else:
+                neg_idx = _sample_negative_indices_batched_gpu(candidate_ids, ids_b, k_neg)
             if neg_idx.numel() == 0:
                 log_denom = log_num
             else:
@@ -312,6 +503,21 @@ def build_edge_positive_mask(
     return merge_positive_tiers(identity, *extra_tiers)
 
 
+def _merged_positive_mask(
+    ids1: torch.Tensor,
+    ids2: torch.Tensor,
+    morph_bin_ids: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Identity positives OR same morphology bin (debug/tests; training uses bin groups)."""
+    if morph_bin_ids is None:
+        return None
+    if morph_bin_ids.shape[0] != ids1.numel():
+        raise ValueError("morph_bin_ids length must match aligned seed count.")
+    identity = positive_mask_identity(ids1, ids2)
+    morph = morphology_soft_positive_mask(morph_bin_ids)
+    return merge_positive_tiers(identity, morph)
+
+
 def edge_identity_infonce_loss(
     z1: torch.Tensor,
     z2: torch.Tensor,
@@ -323,9 +529,12 @@ def edge_identity_infonce_loss(
     num_neg_samples: Optional[int] = None,
     symmetric: bool = True,
     memory_queue: Optional[EdgeMemoryQueue] = None,
+    morph_bin_ids: Optional[torch.Tensor] = None,
+    max_soft_positives: Optional[int] = 256,
 ):
     """
-    InfoNCE-style edge contrastive loss with identity positives only.
+    InfoNCE-style edge contrastive loss with identity positives, optionally merged
+    with morphology-bin soft positives (same bin across views, Phase M2).
 
     Inputs may arrive in arbitrary row order; the loss first aligns shared edge ids
     across the two views, then treats those aligned rows as positives. This matches
@@ -337,6 +546,20 @@ def edge_identity_infonce_loss(
     candidates (plus optional queue negatives) via chunked ``logsumexp``. If > 0,
     negatives are sampled on GPU in row batches from the current aligned batch plus
     the optional queue.
+
+    Parameters
+    ----------
+    morph_bin_ids :
+        Optional long tensor aligned with shared seeds after ``_align_shared_edge_pairs``.
+        When set, seeds in the same bin are soft positives (cross-view) in addition
+        to identity matches. Capped by ``max_soft_positives`` per anchor.
+    max_soft_positives :
+        Max same-bin positives in the numerator (default 256). ``None`` disables cap.
+
+    Returns
+    -------
+    Tensor or dict
+        Scalar loss, or debug dict when ``debug=True``.
     """
     del eps  # retained for backward compatibility with older callers
 
@@ -346,6 +569,8 @@ def edge_identity_infonce_loss(
     z1 = _normalize_embeddings(z1)
     z2 = _normalize_embeddings(z2)
     z1, ids1, z2, ids2 = _align_shared_edge_pairs(z1, edge_id1, z2, edge_id2)
+    if morph_bin_ids is not None:
+        morph_bin_ids = _align_morph_bin_ids_to_shared(morph_bin_ids, edge_id1, edge_id2)
 
     n_pairs = int(ids1.numel())
     if n_pairs == 0:
@@ -365,6 +590,8 @@ def edge_identity_infonce_loss(
         temperature,
         num_neg_samples=num_neg_samples,
         memory_queue=memory_queue,
+        morph_bin_ids=morph_bin_ids,
+        max_soft_positives=max_soft_positives,
     )
     if symmetric:
         loss_21 = _directional_aligned_infonce(
@@ -374,6 +601,8 @@ def edge_identity_infonce_loss(
             temperature,
             num_neg_samples=num_neg_samples,
             memory_queue=memory_queue,
+            morph_bin_ids=morph_bin_ids,
+            max_soft_positives=max_soft_positives,
         )
         loss = 0.5 * (loss_12 + loss_21)
     else:
@@ -387,7 +616,8 @@ def edge_identity_infonce_loss(
         }
         max_elems = 2_000_000
         if z1.shape[0] * z2.shape[0] <= max_elems:
-            out["pos_mask"] = build_edge_positive_mask(ids1, ids2)
+            pm = _merged_positive_mask(ids1, ids2, morph_bin_ids)
+            out["pos_mask"] = pm if pm is not None else build_edge_positive_mask(ids1, ids2)
             out["logits_12"] = (z1 @ z2.T) / temperature
         else:
             out["pos_mask"] = None

@@ -1,4 +1,13 @@
-"""Tier 1: batch-local morphology on a forward subgraph (matches loader support)."""
+"""Tier 1: batch-local morphology on a forward subgraph (matches loader support).
+
+These metrics are computed on the **view1** subgraph visible in the current
+``LinkNeighborLoader`` batch. They differ from Tier 0 global degrees: a hub node
+may have low *local* degree if the sampled neighborhood is small.
+
+Used by:
+- M1 expert targets (``build_morph_targets``)
+- M2 contrast binning (``build_morph_features_for_contrast``)
+"""
 
 from __future__ import annotations
 
@@ -135,8 +144,10 @@ def align_seed_embeddings_with_morph(
     subgraph_edge_ids: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-  Drop seed rows whose EdgeID is not present in the subgraph (for target build).
-  """
+    Drop seed rows whose EdgeID is not present in the subgraph.
+
+    Returns aligned ``(z_seed, seed_edge_ids)`` for expert target construction.
+    """
     positions, valid = _seed_positions_in_subgraph(seed_edge_ids, subgraph_edge_ids)
     if valid.all():
         return z_seed, seed_edge_ids
@@ -159,8 +170,13 @@ def transform_morph_targets(
     local_feats: torch.Tensor,
     edge_native: Optional[torch.Tensor] = None,
     global_feats: Optional[torch.Tensor] = None,
+    tier2_feats: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """log1p on count features; concat global and edge-native columns if provided."""
+    """
+    Concatenate local / global / tier2 / edge-native blocks into the expert target vector.
+
+    Applies log1p to count-like columns (local, global degree, Tier 2 BC lift).
+    """
     from morphology.tier0_global import GLOBAL_COUNT_FEATURE_INDICES
 
     out = local_feats.clone()
@@ -172,6 +188,11 @@ def transform_morph_targets(
         for idx in GLOBAL_COUNT_FEATURE_INDICES:
             g[:, idx] = torch.log1p(g[:, idx].clamp(min=0))
         parts.append(g)
+    if tier2_feats is not None and tier2_feats.numel() > 0:
+        t2 = tier2_feats.clone()
+        for idx in range(t2.shape[1]):
+            t2[:, idx] = torch.log1p(t2[:, idx].clamp(min=0))
+        parts.append(t2)
     if edge_native is not None and edge_native.numel() > 0:
         parts.append(edge_native.float())
     return torch.cat(parts, dim=1)

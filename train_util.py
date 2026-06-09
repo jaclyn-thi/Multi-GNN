@@ -351,10 +351,142 @@ def expected_seed_edge_ids(loader_data, split_inds, hetero: bool) -> torch.Tenso
     return attr[split_inds.long(), 0].long().clone()
 
 
-def checkpoint_path(data_config, unique_name: str, *, finetuned: bool = False) -> Path:
-    """Path to ``checkpoint_{unique_name}[ _finetuned].tar`` under ``model_to_load``."""
-    suffix = "_finetuned" if finetuned else ""
-    return Path(data_config["paths"]["model_to_load"]) / f"checkpoint_{unique_name}{suffix}.tar"
+def checkpoint_path(
+    data_config,
+    unique_name: str,
+    *,
+    finetuned: bool = False,
+    suffix: str = "",
+) -> Path:
+    """Path to ``checkpoint_{unique_name}[ _finetuned][ suffix].tar`` under ``model_to_load``."""
+    finetune_suffix = "_finetuned" if finetuned else ""
+    return Path(data_config["paths"]["model_to_load"]) / (
+        f"checkpoint_{unique_name}{finetune_suffix}{suffix}.tar"
+    )
+
+
+def checkpoint_selection_score(log_payload: dict, args) -> Optional[float]:
+    """
+    Composite SSL validation score for best-checkpoint selection. Lower is better.
+
+    When morphology val metrics are logged this epoch, sum all available val losses.
+    When no morphology is enabled, use ``loss/train``. Returns ``None`` on morph runs
+    when val metrics were skipped this epoch (e.g. ``--morph_val_every > 1``).
+    """
+    morph_head = getattr(args, "morph_expert_head", None)
+    morph_contrast_cfg = getattr(args, "morph_contrast_cfg", None)
+    score = 0.0
+    n = 0
+    if morph_head is not None and "morph/expert_val" in log_payload:
+        score += float(log_payload["morph/expert_val"])
+        n += 1
+    if morph_contrast_cfg is not None and "morph/contrast_val" in log_payload:
+        score += float(log_payload["morph/contrast_val"])
+        n += 1
+    if n > 0:
+        return score
+    if morph_head is None and morph_contrast_cfg is None:
+        return float(log_payload["loss/train"])
+    return None
+
+
+@dataclass
+class CheckpointTracker:
+    """
+    Selects and saves checkpoints for contrastive training (M4).
+
+    ``last``: overwrite ``checkpoint_{unique_name}.tar`` every epoch (legacy).
+    ``best``: keep the lowest ``checkpoint_selection_score`` in the main checkpoint;
+    after training, write the final epoch to ``checkpoint_{unique_name}_last.tar``.
+    """
+
+    policy: str
+    best_score: float = float("inf")
+    best_epoch: int = -1
+
+    def on_epoch_end(
+        self,
+        epoch: int,
+        log_payload: dict,
+        model,
+        optimizer,
+        args,
+        data_config,
+    ) -> None:
+        if not getattr(args, "save_model", False):
+            return
+
+        if self.policy == "last":
+            save_model(model, optimizer, epoch, args, data_config)
+            return
+
+        score = checkpoint_selection_score(log_payload, args)
+        if score is not None:
+            log_payload["checkpoint/score"] = score
+        if score is not None and score < self.best_score:
+            self.best_score = score
+            self.best_epoch = epoch + 1
+            save_model(model, optimizer, epoch, args, data_config)
+            logging.info(
+                "New best checkpoint (epoch %s, score=%.4f, policy=best)",
+                self.best_epoch,
+                score,
+            )
+
+    def finalize(
+        self,
+        last_epoch: int,
+        model,
+        optimizer,
+        args,
+        data_config,
+    ) -> None:
+        if not getattr(args, "save_model", False) or self.policy == "last":
+            return
+
+        unique = args.unique_name
+        if self.best_epoch < 0:
+            logging.warning(
+                "No best checkpoint selected; saving final epoch to checkpoint_%s.tar",
+                unique,
+            )
+            save_model(model, optimizer, last_epoch, args, data_config)
+            return
+
+        if last_epoch + 1 != self.best_epoch:
+            save_model(model, optimizer, last_epoch, args, data_config, suffix="_last")
+        logging.info(
+            "Best checkpoint: epoch=%s score=%.4f → checkpoint_%s.tar%s",
+            self.best_epoch,
+            self.best_score,
+            unique,
+            (
+                f" | last epoch={last_epoch + 1} → checkpoint_{unique}_last.tar"
+                if last_epoch + 1 != self.best_epoch
+                else " (same as final epoch)"
+            ),
+        )
+
+
+def save_model(model, optimizer, epoch, args, data_config, *, suffix: str = ""):
+    # Save the model in a dictionary
+    payload = {
+        "epoch": epoch + 1,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }
+    morph_head = getattr(args, "morph_expert_head", None)
+    if morph_head is not None:
+        payload["morph_expert_state_dict"] = morph_head.state_dict()
+    proj_head = getattr(args, "contrast_projection_module", None)
+    if proj_head is not None:
+        payload["contrast_projection_state_dict"] = proj_head.state_dict()
+    finetune_suffix = "_finetuned" if getattr(args, "finetune", False) else ""
+    path = (
+        Path(data_config["paths"]["model_to_save"])
+        / f"checkpoint_{args.unique_name}{finetune_suffix}{suffix}.tar"
+    )
+    torch.save(payload, path)
 
 
 def load_checkpoint_weights(model, device, args, data_config) -> int:
@@ -653,21 +785,6 @@ def evaluate_hetero(loader, inds, model, data, device, args):
 
     return f1
 
-def save_model(model, optimizer, epoch, args, data_config):
-    # Save the model in a dictionary
-    payload = {
-        "epoch": epoch + 1,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-    }
-    morph_head = getattr(args, "morph_expert_head", None)
-    if morph_head is not None:
-        payload["morph_expert_state_dict"] = morph_head.state_dict()
-    torch.save(
-        payload,
-        f'{data_config["paths"]["model_to_save"]}/checkpoint_{args.unique_name}{"" if not args.finetune else "_finetuned"}.tar',
-    )
-
 def load_model(model, device, args, config, data_config):
     checkpoint = torch.load(f'{data_config["paths"]["model_to_load"]}/checkpoint_{args.unique_name}.tar')
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -676,3 +793,17 @@ def load_model(model, device, args, config, data_config):
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
     return model, optimizer
+
+
+def load_checkpoint_auxiliary_modules(args, data_config, device) -> None:
+    """Load morphology expert and/or contrastive projection from a pretrain checkpoint."""
+    path = Path(data_config["paths"]["model_to_load"]) / f"checkpoint_{args.unique_name}.tar"
+    if not path.is_file():
+        return
+    checkpoint = torch.load(path, map_location=device)
+    morph_head = getattr(args, "morph_expert_head", None)
+    if morph_head is not None and "morph_expert_state_dict" in checkpoint:
+        morph_head.load_state_dict(checkpoint["morph_expert_state_dict"])
+    proj_head = getattr(args, "contrast_projection_module", None)
+    if proj_head is not None and "contrast_projection_state_dict" in checkpoint:
+        proj_head.load_state_dict(checkpoint["contrast_projection_state_dict"])

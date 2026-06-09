@@ -37,7 +37,12 @@ GLOBAL_COUNT_FEATURE_INDICES: tuple[int, ...] = tuple(range(len(DEFAULT_LIFT_FEA
 
 @dataclass
 class MorphTier0Context:
-    """Split-global Tier 0 data for endpoint lift at training time."""
+    """
+    Split-global Tier 0 lookup tensors for endpoint lift at training time.
+
+    Built from the **train** or **val** split graph only (never mixed) to avoid
+    leakage. ``deg_*`` tensors are indexed by ``node_id``.
+    """
 
     edge_index: torch.Tensor
     deg_in: torch.Tensor
@@ -268,14 +273,21 @@ def lift_global_to_seed_edges_torch(
     )
 
 
+def morph_targets_includes_global(targets: str) -> bool:
+    """True for M1b / M3 target modes that use Tier 0 endpoint lift."""
+    t = str(targets).lower()
+    return t in ("local+global", "local+global+tier2")
+
+
 def setup_morph_tier0_contexts(args, tr_data, val_data, device: torch.device) -> None:
     """
-  Attach ``args.morph_tier0_train`` and ``args.morph_tier0_val`` when ``--morph_targets local+global``.
+  Attach ``args.morph_tier0_train`` and ``args.morph_tier0_val`` when ``--morph_targets``
+  includes Tier 0 (``local+global`` or ``local+global+tier2``).
 
   Uses ``--morph_tier0_cache`` if set; otherwise computes from split graphs at startup.
-  """
+    """
     targets = str(getattr(args, "morph_targets", "local")).lower()
-    if targets != "local+global":
+    if not morph_targets_includes_global(targets):
         return
     cache_dir = getattr(args, "morph_tier0_cache", None)
     if cache_dir:

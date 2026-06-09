@@ -48,7 +48,17 @@ def create_parser():
     parser.add_argument("--data", default=None, type=str, help="Select the AML dataset. Needs to be either small or medium.", required=True)
     parser.add_argument("--model", default=None, type=str, help="Select the model architecture. Needs to be one of [gin, gat, rgcn, pna]", required=True)
     parser.add_argument("--testing", action='store_true', help="Disable wandb logging while running the script in 'testing' mode.")
-    parser.add_argument("--save_model", action='store_true', help="Save the best model.")
+    parser.add_argument("--save_model", action='store_true', help="Save training checkpoints to saved-models/.")
+    parser.add_argument(
+        "--checkpoint_policy",
+        type=str,
+        default="last",
+        choices=("last", "best"),
+        help="Checkpoint selection for contrastive pretrain when --save_model: "
+        "'last' overwrites each epoch (legacy); 'best' keeps the lowest SSL val score "
+        "(morph/expert_val + morph/contrast_val when available, else loss/train) in "
+        "checkpoint_{unique_name}.tar and writes the final epoch to checkpoint_{unique_name}_last.tar.",
+    )
     # parser.add_argument("--unique_name", action='store_true', help="Unique name under which the model will be stored.")
     parser.add_argument("--unique_name", type=str, default=None,help="Unique name under which the model will be stored.")
     parser.add_argument(
@@ -98,6 +108,24 @@ def create_parser():
         default=0,
         help="Optional detached queue of prior seed-edge embeddings used as extra negatives (0 disables the queue).",
     )
+    parser.add_argument(
+        "--contrast_projection_head",
+        action="store_true",
+        help="GraphCL-style MLP on seed embeddings before edge InfoNCE only; morphology expert and "
+        "embedding extraction still use the encoder readout (128-d).",
+    )
+    parser.add_argument(
+        "--contrast_projection_hidden",
+        type=int,
+        default=128,
+        help="Hidden width for --contrast_projection_head (default 128).",
+    )
+    parser.add_argument(
+        "--contrast_projection_dim",
+        type=int,
+        default=128,
+        help="Output width for --contrast_projection_head (default 128).",
+    )
 
     # Morphology expert head (contrastive pretrain, Phase M1)
     parser.add_argument(
@@ -109,15 +137,30 @@ def create_parser():
         "--morph_targets",
         type=str,
         default="local",
-        choices=["local", "local+global"],
-        help="Morphology target set: local (Tier 1) or local+global (Tier 1 + Tier 0 endpoint lift).",
+        choices=["local", "local+global", "local+tier2", "local+global+tier2"],
+        help="Morphology target set: local (Tier 1); local+global (M1b); "
+        "local+tier2 (BC-only global lift ablation); local+global+tier2 (M1b + BC).",
     )
     parser.add_argument(
         "--morph_tier0_cache",
         type=str,
         default=None,
         help="Directory with {train,val,test}_node_morphology.csv from precompute_morphology_tier0.py. "
-        "If omitted with local+global, tables are computed from split graphs at startup.",
+        "If omitted with local+global(+tier2), tables are computed from split graphs at startup.",
+    )
+    parser.add_argument(
+        "--morph_tier2_cache",
+        type=str,
+        default=None,
+        help="Directory with {train,val,test}_node_tier2.csv from precompute_morphology_tier2.py. "
+        "Required for practical local+tier2 / local+global+tier2 runs; otherwise BC is computed at startup (slow).",
+    )
+    parser.add_argument(
+        "--morph_tier2_lift",
+        type=str,
+        default="full",
+        choices=["full", "max"],
+        help="Tier 2 BC expert lift: full (4 endpoint cols) or max (bc_max_global only).",
     )
     parser.add_argument(
         "--morph_expert_weight",
@@ -132,9 +175,75 @@ def create_parser():
         help="Hidden size of morphology expert MLP.",
     )
     parser.add_argument(
+        "--morph_expert_layout",
+        type=str,
+        default="shared",
+        choices=["shared", "grouped"],
+        help="Expert head layout: shared (single MLP) or grouped (one MLP per block; M5a).",
+    )
+    parser.add_argument(
+        "--morph_expert_group_weight_tier2",
+        type=float,
+        default=1.0,
+        help="Tier 2 block MSE weight when --morph_expert_layout grouped (0 disables BC gradients).",
+    )
+    parser.add_argument(
         "--no_morph_edge_native",
         action="store_true",
         help="Do not append forward edge_attr values to morphology targets.",
+    )
+
+    # Morphology-aware contrast (Phase M2): soft positives merged into edge InfoNCE
+    parser.add_argument(
+        "--morph_contrast",
+        action="store_true",
+        help="Merge morphology-bin soft positives into edge InfoNCE (cross-view, same bin).",
+    )
+    parser.add_argument(
+        "--morph_contrast_features",
+        type=str,
+        default="local_ego,local_degree",
+        help="Comma-separated feature groups for binning: local_ego, local_degree, global_degree, edge_native.",
+    )
+    parser.add_argument(
+        "--morph_contrast_scope",
+        type=str,
+        default="local",
+        choices=["local", "local+global"],
+        help="Whether global_degree lift is available for contrast binning (train/val split-safe).",
+    )
+    parser.add_argument(
+        "--morph_contrast_bins",
+        type=int,
+        default=5,
+        help="Quantile buckets per morphology contrast feature dimension (train-split edges).",
+    )
+    parser.add_argument(
+        "--morph_contrast_calib_batches",
+        type=int,
+        default=32,
+        help="Train loader batches used to estimate morphology contrast bin edges at startup.",
+    )
+    parser.add_argument(
+        "--morph_contrast_max_soft_positives",
+        type=int,
+        default=256,
+        help="Max same-bin soft positives per anchor in InfoNCE numerator (0 = no cap). "
+        "Limits work when many seeds share one bin; does not reduce batch_size.",
+    )
+    parser.add_argument(
+        "--morph_val_every",
+        type=int,
+        default=1,
+        help="Run morph/expert_val and morph/contrast_val every N epochs (1 = every epoch). "
+        "Always runs on the final epoch. Skips the expensive full val-loader forward passes otherwise.",
+    )
+    parser.add_argument(
+        "--morph_val_max_batches",
+        type=int,
+        default=0,
+        help="Cap val-loader batches for morphology val metrics (0 = full val pass). "
+        "Each batch still runs two augmented views + GNN forward(s).",
     )
 
     return parser

@@ -1,5 +1,5 @@
 """
-Morphology metrics for transaction-graph SSL (Tier 0 global + Tier 1 local).
+Morphology metrics for transaction-graph SSL (Tier 0 global, Tier 1 local, Tier 2 BC).
 
 See ``morphology/IDS.md`` and ``notes/morphology-metrics-plan.md``.
 """
@@ -29,13 +29,30 @@ from morphology.tier0_global import (
 )
 from morphology.expert import (
     MorphExpertConfig,
+    MorphExpertHead,
     MorphologyExpertHead,
+    MorphologyGroupedExpertHead,
     build_morph_targets,
     create_morph_expert_bundle,
+    morph_expert_grouped_mse_loss,
     morph_expert_mse_loss,
+    morph_target_blocks,
     morphology_expert_step,
     setup_morphology_expert,
+    setup_morph_tier2_contexts,
     target_dim_for_config,
+)
+from morphology.tier2_global import (
+    MorphTier2Context,
+    TIER2_BC_LIFT_FEATURE_NAMES,
+    TIER2_NODE_COLUMNS,
+    compute_betweenness_centrality_directed,
+    compute_tier2_node_stats,
+    lift_tier2_bc_to_seed_edges_np,
+    lift_tier2_bc_to_seed_edges_torch,
+    precompute_tier2_for_split,
+    tier2_context_from_cache,
+    tier2_context_from_graph,
 )
 from morphology.tier1_local import (
     LOCAL_FEATURE_NAMES,
@@ -47,6 +64,16 @@ from morphology.tier1_local import (
 __all__ = [
     "DEFAULT_LIFT_FEATURE_NAMES",
     "GLOBAL_LIFT_FEATURE_NAMES",
+    "MorphTier2Context",
+    "TIER2_BC_LIFT_FEATURE_NAMES",
+    "TIER2_NODE_COLUMNS",
+    "compute_betweenness_centrality_directed",
+    "compute_tier2_node_stats",
+    "lift_tier2_bc_to_seed_edges_np",
+    "lift_tier2_bc_to_seed_edges_torch",
+    "precompute_tier2_for_split",
+    "tier2_context_from_cache",
+    "tier2_context_from_graph",
     "LOCAL_FEATURE_NAMES",
     "MorphExpertConfig",
     "MorphTier0Context",
@@ -72,6 +99,7 @@ __all__ = [
     "save_node_table",
     "seed_endpoints_from_edge_ids",
     "setup_morph_tier0_contexts",
+    "setup_morph_tier2_contexts",
     "setup_morphology_expert",
     "target_dim_for_config",
     "tier0_context_from_cache",

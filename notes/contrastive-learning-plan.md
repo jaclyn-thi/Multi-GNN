@@ -399,6 +399,18 @@ Writes `embeddings/{unique_name}/{train,val,test}.npz` and `meta.json`.
 
 **Other tasks later:** fraud or regression would swap the probe (e.g. ridge for regression) and metrics; each task needs its own labels on the eval set. Pretrain on unlabeled data → extraction still works; probe only where labels exist.
 
+#### Phase 5c: Label-efficiency probing (implemented)
+
+**Goal:** Compare frozen encoders when only a **fraction** of train AML labels are available for the downstream classifier (GCPAL / Papagei / RWTH motivation) — **without** retraining the GNN.
+
+- **Script:** `scripts/label_efficiency_probe.py` (reuses `linear_probe.py` fit/eval helpers)
+- **Defaults:** train fractions `0.1, 0.25, 0.5, 1.0` (stratified subsample); val threshold tuning unchanged
+- **Batch:** `--unique_names` loops multiple embedding dirs; writes per-run JSON + `embeddings/label_efficiency_summary.json`
+- **Slurm:** `run_label_efficiency.sh` (`--mem=128G`, `--probe_n_jobs 1`)
+- **Not a replacement** for Phase 5b full-label `probe_results.json`; run both when comparing M1b vs M2 under label scarcity
+
+**Results (Jun 2026):** M1b (`hi_morphology_global_20ep`) beats contrastive and all M2 variants at 10/25/50/100% train fractions (test AUROC). Largest gap at **10%** labels: M1b **0.896** vs contrastive **0.818** (+0.078). M2 does not outperform M1b under scarcity. See [`morphology-metrics-plan.md`](morphology-metrics-plan.md) § Label-efficiency results.
+
 #### What is implemented today (secondary path only)
 
 1. `train_homo_supervised` / `train_hetero_supervised` — in-GNN CE + per-epoch `f1/*`, val-driven `save_model`
@@ -413,8 +425,9 @@ Writes `embeddings/{unique_name}/{train,val,test}.npz` and `meta.json`.
 4. **README / runbook:** Papagei three-step workflow; clarify temporal vs subject-level splits
 5. **Optional:** encoder-only export in checkpoint for release
 6. **Optional:** `--freeze-encoder` + train only in-model linear layer (still not identical to sklearn probe unless head is a single `Linear`)
-7. **Future:** pretrain checkpoint policy via contrastive val / morphology (not AML)
-8. **Not planned:** `--aml-eval` during contrastive; end-to-end `--finetune` as **primary** GFM metric
+7. ~~**Future:** pretrain checkpoint policy via contrastive val / morphology~~ → **done:** `--checkpoint_policy best` in `train_util.py` (see morphology plan M4)
+8. ~~**Label-efficiency benchmarks** on existing `.npz` (Phase 5c — `run_label_efficiency.sh`)~~ — done; M1b wins all fractions
+9. **Not planned:** `--aml-eval` during contrastive; end-to-end `--finetune` as **primary** GFM metric
 
 ---
 
@@ -567,6 +580,7 @@ Summary of that plan:
 | **Local vs global** | **v0:** `morph_local` + edge-native (batch subgraph); **later:** optional `morph_global` via offline node lookup (e.g. full-graph degree, BC) |
 | **Precompute scope** | All **nodes** per split for globals; **never** all subgraphs; train-edge tables only for cheap edge-native scalars |
 | **Phases** | M0 plumbing → M1 local expert head → M2 local morph contrast → M3 Tier 2 globals |
+| **VRAM @ large B** | No dense `(B,B)` morphology masks; bin-grouped pairing — see morphology plan § **GPU memory & batch scale** |
 
 Contrastive plan still owns: homo/hetero contrastive routing, extraction, linear probe, **no AML F1 in pretrain**. Morphology plan owns metric definitions and loss integration.
 
