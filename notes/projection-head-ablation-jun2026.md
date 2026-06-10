@@ -30,14 +30,61 @@ At fixed threshold 0.5, test F1: contrastive+proj **0.137**; M1b+proj 0.092 (AUR
 
 2. **M1b + projection beats M1b on AUROC but not on F1** — 0.924 vs 0.920 ranking; **0.096 vs 0.108** at the val-optimal operating point. Tuned threshold favors recall (0.289) at the cost of precision (0.058), similar to other “stack more objectives” runs that hurt practical flagging.
 
-3. **Best overall probe in this table: contrastive + projection** — highest test AUROC and F1 among projection runs and prior M1b default.
+3. ~~**Best overall probe: contrastive + projection**~~ — superseded by clustering+proj (see below).
 
-4. **Morph expert is not required for the projection benefit** — contrastive-only + proj slightly edges morph+proj on both AUROC and F1.
+4. **Morph expert is not required for the baseline projection benefit** — contrastive-only + proj edges M1b+proj on AUROC/F1 in the Jun 4 table; later **M1b + clustering + projection** beats both (0.929 AUROC).
+
+## Label-efficiency (Jun 2026, nine encoders)
+
+**Source:** `embeddings/label_efficiency_summary.json` · stratified train subsamples · val-tuned threshold · test AUROC.
+
+| Encoder | 10% | 25% | 50% | 100% |
+|---------|-----|-----|-----|------|
+| **M1b + projection** | **0.918** | 0.922 | 0.919 | 0.922 |
+| **Contrastive + projection** | 0.906 | **0.918** | **0.925** | **0.928** |
+| M1b (no projection) | 0.896 | 0.910 | 0.915 | 0.919 |
+| M1b + clustering (no projection) | 0.877 | 0.892 | 0.904 | 0.908 |
+| Contrastive (no projection) | 0.818 | 0.849 | 0.857 | 0.863 |
+
+**Takeaways:**
+
+1. **Projection flips the scarcity story vs plain M1b.** Contrastive+proj beats M1b at all fractions (+0.008 to +0.010 test AUROC). The first label-efficiency batch (pre-projection) had M1b winning all fractions vs plain contrastive — that still holds for **non-projection** encoders only.
+2. **M1b + projection is best at 10% labels** (0.918 vs 0.906 contrastive+proj). Stacking morph expert with projection helps under extreme scarcity; contrastive+proj leads at 25–100%.
+3. **Default SSL recipe (label-efficiency, pending clustering+proj LE):** contrastive+proj @ 25–100%; M1b+proj @ 10%. Full-label leader is now clustering+proj (0.929).
+4. **Clustering expert alone regresses** at all label fractions (0.877–0.908) and full-label (0.903). **With projection:** see below.
+
+## M1b + clustering + projection (Jun 2026)
+
+| `unique_name` | Script | Config | Ckpt ep |
+|---------------|--------|--------|---------|
+| `hi_morphology_global_clustering_proj_20ep_bestckpt` | `ablation_m1b_clustering_projection_20ep.sh` | M1b (11 local incl. clustering) + `--contrast_projection_head` | 20 |
+
+| Run | Val AUROC | Test AUROC | Test F1 | Test prec | Test recall |
+|-----|-----------|------------|---------|-----------|-------------|
+| **clustering + proj** | **0.930** | **0.929** | **0.156** | 0.117 | 0.235 |
+| contrastive + proj | 0.941 | 0.927 | 0.144 | 0.098 | 0.272 |
+| M1b + proj | 0.934 | 0.924 | 0.096 | 0.058 | 0.289 |
+| clustering expert only | 0.917 | 0.903 | 0.117 | 0.076 | 0.254 |
+
+**Takeaways:**
+
+1. **Best full-label SSL on Small-HI** — test AUROC **0.929**, F1 **0.156** (vs prior best contrastive+proj 0.927 / 0.144).
+2. **Interaction effect** — clustering expert **hurts** without projection (0.903) but **helps** with projection (+0.026 vs clustering-only; +0.002 vs contrastive+proj AUROC).
+3. Val→test AUROC stable (0.930 → 0.929). Label-efficiency on this encoder **pending** before adopting as default under scarcity.
+
+## MAE vs MSE expert loss (Jun 2026)
+
+| `unique_name` | Loss | Test AUROC | Test F1 |
+|---------------|------|------------|---------|
+| `hi_morphology_global_clustering_20ep` | MSE | 0.903 | 0.117 |
+| `hi_morphology_global_mae_20ep_bestckpt` | MAE | **0.898** | **0.145** |
+
+MAE did not improve AUROC vs MSE on the same 11-dim M1b targets; F1 higher at val-tuned threshold (recall-heavy). Default remains **MSE**.
 
 ## Open questions / next steps
 
-- Label-efficiency probe on `hi_contrastive_proj_20ep_bestckpt` (M1b still won at low label fractions pre-projection).
-- Whether M1b+proj F1 can be recovered with a different threshold policy (e.g. target precision on val).
-- Confirm training curves / morph val metrics for epoch-15 vs 20 on the M1b+proj run.
+- Label-efficiency on **`hi_morphology_global_clustering_proj_20ep_bestckpt`** — does full-label win hold @ 10% labels?
+- Whether M1b+proj / clustering+proj F1 can be recovered with a different threshold policy.
+- Confirm training curves / morph val metrics for clustering+proj vs contrastive+proj.
 
-Artifacts: `embeddings/<unique_name>/probe_results.json`.
+Artifacts: `embeddings/<unique_name>/probe_results.json`, `embeddings/<unique_name>/label_efficiency_results.json`.

@@ -3,13 +3,14 @@
 The expert head is a small MLP that predicts **detached** morphology target vectors
 from seed-edge embeddings ``z_seed``. Targets combine:
 
-- Tier 1 local subgraph stats (always)
+- Tier 1 local subgraph stats (11 dims: degree/ego + undirected clustering on view1)
 - Tier 0 global endpoint lift (M1b, ``--morph_targets local+global``)
 - Tier 2 betweenness centrality lift (M3: ``local+tier2`` or ``local+global+tier2``)
 - Forward edge-native attributes (default on; disable with ``--no_morph_edge_native``)
 
-Loss is weighted MSE (``--morph_expert_weight``). With ``--morph_expert_layout grouped``,
-separate block MLPs and per-block MSE (``--morph_expert_group_weight_tier2`` for Tier 2).
+Loss is weighted MSE or MAE (``--morph_expert_loss``, default MSE; Papagei uses MAE).
+With ``--morph_expert_layout grouped``, separate block MLPs and per-block loss
+(``--morph_expert_group_weight_tier2`` for Tier 2).
 The head is checkpointed for resume but **not** used during embedding extraction.
 """
 
@@ -66,8 +67,10 @@ class MorphExpertConfig:
         Append Tier 2 BC endpoint lift after global block (width set by ``tier2_lift_mode``).
     tier2_lift_mode :
         ``full`` (4 BC lift cols) or ``max`` (``bc_max_global`` only).
+    loss_type :
+        ``mse`` or ``mae`` (``--morph_expert_loss``).
     loss_weight :
-        Scale on MSE relative to InfoNCE (``--morph_expert_weight``).
+        Scale on expert regression loss relative to InfoNCE (``--morph_expert_weight``).
     layout :
         ``shared`` = single MLP; ``grouped`` = one MLP per target block (M5a).
     edge_attr_dim :
@@ -83,6 +86,7 @@ class MorphExpertConfig:
     include_tier2: bool = False
     tier2_lift_mode: str = "full"
     loss_weight: float = 1.0
+    loss_type: str = "mse"
     layout: str = "shared"
     edge_attr_dim: int = 0
     group_weight_local: float = 1.0
@@ -171,11 +175,47 @@ def _group_weight_for_block(block_name: str, cfg: MorphExpertConfig) -> float:
     }.get(block_name, 1.0)
 
 
+VALID_MORPH_EXPERT_LOSS_TYPES = frozenset({"mse", "mae"})
+
+
+def _morph_expert_elementwise_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    loss_type: str,
+) -> torch.Tensor:
+    loss_type = str(loss_type).lower()
+    if loss_type == "mse":
+        return F.mse_loss(pred, target)
+    if loss_type == "mae":
+        return F.l1_loss(pred, target)
+    raise ValueError(
+        f"morph expert loss_type {loss_type!r} is invalid; use 'mse' or 'mae'."
+    )
+
+
 def morph_expert_mse_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Unweighted MSE; returns zero scalar when ``pred`` is empty."""
     if pred.numel() == 0:
         return pred.new_zeros(())
-    return F.mse_loss(pred, target)
+    return _morph_expert_elementwise_loss(pred, target, "mse")
+
+
+def morph_expert_mae_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Unweighted MAE (L1); returns zero scalar when ``pred`` is empty."""
+    if pred.numel() == 0:
+        return pred.new_zeros(())
+    return _morph_expert_elementwise_loss(pred, target, "mae")
+
+
+def morph_expert_regression_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    loss_type: str,
+) -> torch.Tensor:
+    """Unweighted MSE or MAE on the full target vector."""
+    if pred.numel() == 0:
+        return pred.new_zeros(())
+    return _morph_expert_elementwise_loss(pred, target, loss_type)
 
 
 def morph_expert_grouped_mse_loss(
@@ -184,6 +224,25 @@ def morph_expert_grouped_mse_loss(
     cfg: MorphExpertConfig,
 ) -> torch.Tensor:
     """Sum of per-block MSE terms with optional block weights (grouped layout)."""
+    return morph_expert_grouped_regression_loss(pred, target, cfg, "mse")
+
+
+def morph_expert_grouped_mae_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    cfg: MorphExpertConfig,
+) -> torch.Tensor:
+    """Sum of per-block MAE terms with optional block weights (grouped layout)."""
+    return morph_expert_grouped_regression_loss(pred, target, cfg, "mae")
+
+
+def morph_expert_grouped_regression_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    cfg: MorphExpertConfig,
+    loss_type: str,
+) -> torch.Tensor:
+    """Sum of per-block MSE/MAE terms with optional block weights (grouped layout)."""
     if pred.numel() == 0:
         return pred.new_zeros(())
     loss = pred.new_zeros(())
@@ -191,7 +250,7 @@ def morph_expert_grouped_mse_loss(
         w = _group_weight_for_block(block_name, cfg)
         if w == 0.0:
             continue
-        block_loss = F.mse_loss(pred[:, sl], target[:, sl])
+        block_loss = _morph_expert_elementwise_loss(pred[:, sl], target[:, sl], loss_type)
         loss = loss + w * block_loss
     return loss
 
@@ -286,10 +345,11 @@ def morphology_expert_step(
         targets = targets[:min_n]
 
     pred = expert_head(z_use)
+    loss_type = str(cfg.loss_type).lower()
     if cfg.layout == "grouped":
-        loss = morph_expert_grouped_mse_loss(pred, targets, cfg)
+        loss = morph_expert_grouped_regression_loss(pred, targets, cfg, loss_type)
     else:
-        loss = morph_expert_mse_loss(pred, targets)
+        loss = morph_expert_regression_loss(pred, targets, loss_type)
     loss = loss * float(cfg.loss_weight)
     return loss, targets
 
@@ -387,6 +447,11 @@ def setup_morphology_expert(args, tr_data, device, is_hetero: bool):
         raise ValueError(
             f"--morph_expert_layout {layout!r} is invalid; use 'shared' or 'grouped'."
         )
+    loss_type = str(getattr(args, "morph_expert_loss", "mse")).lower()
+    if loss_type not in VALID_MORPH_EXPERT_LOSS_TYPES:
+        raise ValueError(
+            f"--morph_expert_loss {loss_type!r} is invalid; use 'mse' or 'mae'."
+        )
     cfg = MorphExpertConfig(
         embedding_dim=128,
         hidden_dim=int(getattr(args, "morph_expert_hidden", 64)),
@@ -395,6 +460,7 @@ def setup_morphology_expert(args, tr_data, device, is_hetero: bool):
         include_tier2=morph_targets_includes_tier2(targets),
         tier2_lift_mode=str(getattr(args, "morph_tier2_lift", "full")).lower(),
         loss_weight=float(getattr(args, "morph_expert_weight", 1.0)),
+        loss_type=loss_type,
         layout=layout,
         group_weight_tier2=float(getattr(args, "morph_expert_group_weight_tier2", 1.0)),
     )
@@ -410,10 +476,11 @@ def setup_morphology_expert(args, tr_data, device, is_hetero: bool):
     if cfg.layout == "grouped":
         layout_extra = f" layout=grouped w_tier2={cfg.group_weight_tier2:g}"
     logging.info(
-        "Morphology expert head: target_dim=%d (local=%d%s) weight=%.4f morph_targets=%s%s",
+        "Morphology expert head: target_dim=%d (local=%d%s) loss=%s weight=%.4f morph_targets=%s%s",
         head.target_dim,
         len(LOCAL_FEATURE_NAMES),
         extra,
+        cfg.loss_type,
         cfg.loss_weight,
         targets,
         layout_extra,
@@ -429,8 +496,12 @@ __all__ = [
     "MorphologyGroupedExpertHead",
     "build_morph_targets",
     "create_morph_expert_bundle",
+    "morph_expert_grouped_mae_loss",
     "morph_expert_grouped_mse_loss",
+    "morph_expert_grouped_regression_loss",
+    "morph_expert_mae_loss",
     "morph_expert_mse_loss",
+    "morph_expert_regression_loss",
     "morph_target_blocks",
     "morphology_expert_step",
     "setup_morphology_expert",

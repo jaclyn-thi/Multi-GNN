@@ -2,14 +2,14 @@
 
 This repository extends [IBM Multi-GNN](https://github.com/IBM/Multi-GNN) for anti-money laundering (AML) on financial transaction graphs. It keeps the original Multi-GNN architectures and graph adaptations ([GIN](https://arxiv.org/abs/1810.00826), [GAT](https://arxiv.org/abs/1710.10903), [PNA](https://arxiv.org/abs/2004.05718), [RGCN](https://arxiv.org/abs/1703.06103)) and adds a **graph foundation model (GFM)** workflow:
 
-1. **Self-supervised pretraining** — contrastive learning on transaction graphs (`--objective contrastive`, the default); optional **morphology expert** + **morphology-aware contrast** (M1/M1b/M2)
+1. **Self-supervised pretraining** — contrastive learning on transaction graphs (`--objective contrastive`, the default); optional **contrastive projection head** (GraphCL-style; recommended for pure SSL) and/or **morphology expert** + **morphology-aware contrast** (M1/M1b/M2)
 2. **Frozen embedding extraction** — seed-edge representations written to disk (`embedding_extraction.py`); use `--checkpoint_policy best` for morph runs so extraction does not use a regressed last epoch
 3. **Linear probing** — sklearn logistic regression on frozen features (`linear_probe.py`)
 4. **Label-efficiency probing** (optional) — same embeddings, stratified subsets of train labels (`scripts/label_efficiency_probe.py`) to compare encoders under scarce labels (GCPAL / Papagei-style)
 
-The original **supervised** Multi-GNN path (`--objective supervised`) remains available as a baseline and ablation. For design rationale and implementation status, see [`notes/contrastive-learning-plan.md`](notes/contrastive-learning-plan.md), [`notes/morphology-metrics-plan.md`](notes/morphology-metrics-plan.md), and [`notes/lit-review-index.md`](notes/lit-review-index.md).
+The original **supervised** Multi-GNN path (`--objective supervised`) remains available as a baseline and ablation (~0.97 test AUROC in-GNN on Small-HI; still above frozen SSL + linear probe). For design rationale and implementation status, see [`notes/contrastive-learning-plan.md`](notes/contrastive-learning-plan.md), [`notes/morphology-metrics-plan.md`](notes/morphology-metrics-plan.md), [`notes/projection-head-ablation-jun2026.md`](notes/projection-head-ablation-jun2026.md), and [`notes/lit-review-index.md`](notes/lit-review-index.md).
 
-**Quick links:** [Primary workflow](#primary-workflow--contrastive-pretrain--extract--linear-probe) · [Morphology (M1/M2)](#morphology-aware-contrastive-pretraining-optional) · [Label-efficiency probe](#label-efficiency-probe-scriptslabel_efficiency_probepy) · [Repository guide](#repository-guide) · [CLI reference](#command-line-arguments) · [Slurm / cluster](#slurm-and-cluster-jobs)
+**Quick links:** [Primary workflow](#primary-workflow--contrastive-pretrain--extract--linear-probe) · [Contrastive projection head](#contrastive-projection-head-recommended-for-pure-ssl) · [Morphology (M1/M2)](#morphology-aware-contrastive-pretraining-optional) · [Label-efficiency probe](#label-efficiency-probe-scriptslabel_efficiency_probepy) · [Repository guide](#repository-guide) · [CLI reference](#command-line-arguments) · [Slurm / cluster](#slurm-and-cluster-jobs)
 
 ---
 
@@ -121,7 +121,29 @@ python linear_probe.py \
 
 Reads `embeddings/{unique_name}/{train,val,test}.npz` and writes metrics to `embeddings/{unique_name}/probe_results.json`.
 
-During contrastive pretraining, monitor **training loss** and **morphology val losses** — AML metrics are not used for encoder checkpoint selection. With `--checkpoint_policy best` (recommended for morph runs), extraction loads the epoch with the lowest composite morph val score, not the final epoch. After extraction, report **AUROC** (primary) and **F1** (secondary) from the probe.
+During contrastive pretraining, monitor **training loss** and **morphology val losses** — AML metrics are not used for encoder checkpoint selection. With `--checkpoint_policy best` (recommended for morph and projection runs), extraction loads the epoch with the lowest SSL val score (morph composite or `loss/train`), not necessarily the final epoch. After extraction, report **AUROC** (primary) and **F1** (secondary) from the probe.
+
+### Contrastive projection head (recommended for pure SSL)
+
+GraphCL/GCPAL-style **projection MLP** applied only during InfoNCE; extraction and morphology expert still use encoder `z` (128-d). On Small-HI this closed most of the gap to supervised for frozen linear probe: test AUROC **0.839 → 0.927** vs plain contrastive (Jun 2026). See [`notes/projection-head-ablation-jun2026.md`](notes/projection-head-ablation-jun2026.md).
+
+```bash
+python main.py \
+  --data Small-HI --model gin \
+  --objective contrastive \
+  --unique_name hi_contrastive_proj_20ep_bestckpt \
+  --save_model --n_epochs 20 \
+  --reverse_mp --ego --ports \
+  --batch_size 32768 --num_neighs 100 100 \
+  --contrast_projection_head \
+  --contrast_projection_hidden 128 --contrast_projection_dim 128 \
+  --contrastive_asymmetric --contrastive_num_neg_samples 1024 \
+  --contrastive_memory_bank_size 32768 \
+  --checkpoint_policy best \
+  --tqdm --testing
+```
+
+Then **extract → probe** as in the primary workflow. Slurm: [`ablation_contrastive_projection_20ep .sh`](ablation_contrastive_projection_20ep%20.sh). To stack projection with M1b: [`ablation_m1b_projection_20ep.sh`](ablation_m1b_projection_20ep.sh) (AUROC ↑ vs M1b, F1 ↓ at val-tuned threshold).
 
 ### Morphology-aware contrastive pretraining (optional)
 
@@ -129,11 +151,12 @@ Beyond edge-identity InfoNCE, you can add a **morphology expert head** (Papagei-
 
 | Phase | Flag | What it adds |
 |-------|------|--------------|
-| **M1** | `--morph_expert --morph_targets local` | Tier 1 **local** subgraph stats (degrees, ego size) + **edge-native** features from `edge_attr` |
-| **M1b** | `--morph_targets local+global` | Tier 0 **global** endpoint degrees (split-safe lookup / lift) in addition to M1 targets |
+| **M1** | `--morph_expert --morph_targets local` | Tier 1 **local** subgraph stats (11 dims: ego, degrees, **clustering**) + **edge-native** from `edge_attr` |
+| **M1b** | `--morph_targets local+global` | Tier 0 **global** endpoint degrees (split-safe lookup / lift) in addition to Tier 1 local |
 | **M1b + BC** | `--morph_targets local+global+tier2` | M3: M1b + betweenness centrality endpoint lift (requires Tier 2 cache) |
 | **BC-only ablation** | `--morph_targets local+tier2` | M3 ablation: Tier 1 local + BC lift only (no Tier 0 degrees) |
 | **M2** | `--morph_contrast` | **Merged soft positives** in edge InfoNCE: same morphology bin across views (identity positives unchanged) |
+| **Projection** | `--contrast_projection_head` | GraphCL-style MLP before InfoNCE only; encoder `z` at extract (stacks with morph expert optionally) |
 
 **Example — M2 pretrain (M1b expert + morphology contrast, Small-HI):**
 
@@ -155,9 +178,43 @@ python main.py \
   --tqdm --testing
 ```
 
-Use `--morph_contrast_scope local+global` and add `global_degree` to `--morph_contrast_features` to include Tier 0 bins. Diagnostic: `--morph_contrast` without `--morph_expert` (contrast-only).
+Use `--morph_contrast_scope local+global` and add `global_degree` to `--morph_contrast_features` to include Tier 0 bins. Add **`local_clustering`** to bin on sender/receiver/mean clustering (see Tier-1 table below). Diagnostic: `--morph_contrast` without `--morph_expert` (contrast-only).
 
-**Example — M1b pretrain (recommended morph expert config after ablations on Small-HI):**
+**Example — M2 with local clustering bins (M1b expert + triadic soft positives):**
+
+```bash
+python main.py \
+  --data Small-HI --model gin \
+  --objective contrastive \
+  --unique_name hi_morph_global_clustering_m2_10ep \
+  --save_model --n_epochs 10 \
+  --reverse_mp --ego --ports \
+  --batch_size 32768 --num_neighs 100 100 \
+  --morph_expert --morph_targets local+global \
+  --morph_tier0_cache morphology_cache/Small-HI \
+  --morph_contrast \
+  --morph_contrast_features local_ego,local_degree,local_clustering \
+  --morph_contrast_scope local \
+  --checkpoint_policy best \
+  --contrastive_asymmetric --contrastive_num_neg_samples 1024 \
+  --contrastive_memory_bank_size 32768 \
+  --morph_val_every 2 --morph_val_max_batches 10 \
+  --tqdm --testing
+```
+
+Slurm: [`ablation_m1b_clustering_m2_10ep.sh`](ablation_m1b_clustering_m2_10ep.sh).
+
+**Tier-1 local features** (always included when `--morph_expert` is on; computed on **view1** subgraph):
+
+| Index | Name | M2 group | log1p in expert? |
+|-------|------|----------|------------------|
+| 0–1 | `n_edges_sub`, `n_nodes_sub` | `local_ego` | yes |
+| 2–7 | sender/receiver degrees, degree sums | `local_degree` | yes |
+| 8–10 | `sender_clustering_local`, `receiver_clustering_local`, `mean_clustering_local` | `local_clustering` | no (in [0, 1]) |
+
+Clustering uses **undirected** local clustering on the batch subgraph: closed triangles → 1.0, chains → 0.0. No extra CLI flag — it is part of `LOCAL_FEATURE_NAMES` in [`morphology/tier1_local.py`](morphology/tier1_local.py).
+
+**Example — M1b pretrain (recommended morph expert config; includes clustering since Jun 2026):**
 
 ```bash
 # Optional: precompute Tier 0 node tables once (reuse across runs)
@@ -190,25 +247,36 @@ python main.py \
 
 Then run **extract → probe** as in the primary workflow (same `--unique_name`). The morphology expert head is trained during pretrain but **not** used at extraction — only the GNN encoder embeddings are written to `.npz`.
 
-**Small-HI benchmark (linear probe, val-tuned threshold):**
+**Small-HI benchmark (linear probe, val-tuned threshold, GIN hetero):**
 
 | Run | Config | Epochs | Test AUROC | Test F1 |
 |-----|--------|--------|------------|---------|
-| Contrastive baseline | identity InfoNCE | 20 | 0.839 | 0.076 |
+| **M1b + clustering + projection** | M1b + 11 local + `--contrast_projection_head` | 20 | **0.929** | **0.156** |
+| Contrastive + projection | `--contrast_projection_head` | 20 | 0.927 | 0.144 |
+| M1b + projection | M1b + projection head | 20 → **ep 15** | 0.924 | 0.096 |
+| M1b | `--morph_expert`, `local+global` (8 local dims) | 20 | 0.920 | 0.108 |
+| M1b + MAE expert | `--morph_expert_loss mae` | 20 | 0.898 | 0.145 |
+| M1b + clustering (MSE) | M1b, 11 local dims (incl. clustering) | 20 | 0.903 | 0.117 |
+| M3 BC-only | `local+tier2` | 20 | 0.904 | 0.093 |
+| M2 expert + contrast | + `--checkpoint_policy best` | 10 → **ep 9** | 0.906 | 0.058 |
+| M2 expert + contrast | + `--checkpoint_policy best` | 20 → ep 20 | 0.891 | 0.107 |
 | M1 | `--morph_expert`, `local` | 20 | 0.910 | 0.079 |
-| M1b | `--morph_expert`, `local+global` | 20 | **0.920** | **0.108** |
-| M2 expert + contrast | M1b + `--morph_contrast` | 10 (last) | 0.900 | 0.037 |
-| M2 expert + contrast | + `--checkpoint_policy best` | 10 → **ep 9** | **0.906** | 0.058 |
-| M2 expert + contrast | M1b + `--morph_contrast` | 20 (last) | 0.864 | 0.025 |
-| M2 expert + contrast | + `--checkpoint_policy best` | 20 → ep 20 | 0.891 | **0.107** |
-| M2 expert + contrast | `morph_expert_weight=0.5` (10 ep best) | 10 | 0.876 | 0.027 |
-| M2 contrast only | `--morph_contrast` (no expert) | 10 | 0.680 | 0.012 |
 | M3 M1b + BC (4 lift cols) | `local+global+tier2`, best ckpt | 20 → **ep 14** | 0.896 | 0.033 |
-| M3 M1b + BC (last epoch) | same, no M4 | 20 | 0.861 | 0.029 |
-| M3 BC-only | `local+tier2` | 20 | **0.904** | 0.093 |
 | M3 M1b + bc_max | `lift max` | 20 | 0.889 | 0.086 |
+| M5a grouped BC | `layout=grouped`, `w_tier2=1` | 20 | 0.887 | 0.028 |
+| M2 expert + contrast | `morph_expert_weight=0.5` (10 ep best) | 10 | 0.876 | 0.027 |
+| M3 M1b + BC (last epoch) | same, no M4 | 20 | 0.861 | 0.029 |
+| Contrastive baseline | identity InfoNCE | 20 | 0.839 | 0.076 |
+| M2 expert + contrast | M1b + `--morph_contrast` | 20 (last) | 0.864 | 0.025 |
+| M2 contrast only | `--morph_contrast` (no expert) | 10 | 0.680 | 0.012 |
+| Supervised CE (in-GNN) | `--objective supervised` | — | ~0.972 | ~0.493 |
 
-**Default morph config:** **M1b** @ 20 ep (best test AUROC **0.920**). Stacking BC on M1b hurts; BC-only (0.904) points to shared-head interference — try **`--morph_expert_layout grouped`**. See [`notes/morphology-metrics-plan.md`](notes/morphology-metrics-plan.md).
+**Default SSL configs (Jun 2026):**
+
+- **Full-label frozen probe:** **M1b + clustering + projection** (`hi_morphology_global_clustering_proj_20ep_bestckpt`) — best test AUROC/F1 among SSL runs (**0.929 / 0.156**). Clustering expert alone regressed (0.903); stacking with projection beats contrastive+proj (0.927).
+- **Label-efficiency (10–100% train labels):** **contrastive + projection** leads at 25/50/100% (0.918–0.928 test AUROC); **M1b + projection** is best at **10%** labels (0.918). Label-efficiency on clustering+proj **pending**.
+- **Morphology expert path:** **M1b** @ 20 ep (8 local dims) — best morph-only config (0.920 AUROC). **MAE expert loss** (`--morph_expert_loss mae`) did not improve AUROC vs MSE (0.898 vs 0.903 on same 11-dim targets).
+- **Morphology negatives:** stacking BC on M1b hurts; M5a grouped heads did not fix interference (0.887 AUROC). See [`notes/morphology-metrics-plan.md`](notes/morphology-metrics-plan.md) and [`notes/projection-head-ablation-jun2026.md`](notes/projection-head-ablation-jun2026.md).
 
 Results: `embeddings/{unique_name}/probe_results.json`. **AUROC** is the primary metric; **F1** is val-threshold-tuned and noisy on imbalanced AML data.
 
@@ -345,11 +413,12 @@ Requires `--objective contrastive` and `--morph_expert`. Adds `L_morph_expert` (
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--morph_expert` | off | Enable morphology expert auxiliary loss during contrastive pretraining |
-| `--morph_targets` | `local` | `local` = Tier 1; `local+global` = M1b; `local+tier2` = BC-only global ablation; `local+global+tier2` = M1b + BC (M3) |
+| `--morph_targets` | `local` | `local` = Tier 1 (**11** local dims incl. clustering); `local+global` = M1b; `local+tier2` = BC-only global ablation; `local+global+tier2` = M1b + BC (M3) |
 | `--morph_tier0_cache` | — | Directory with `{train,val,test}_node_morphology.csv` from `scripts/precompute_morphology_tier0.py`. If omitted with global targets, tables are computed at startup |
 | `--morph_tier2_cache` | — | Directory with `{train,val,test}_node_tier2.csv` from `scripts/precompute_morphology_tier2.py` (required for practical Tier 2 runs) |
 | `--morph_tier2_lift` | `full` | BC endpoint lift for expert: `full` = 4 cols (`bc_sender`, `bc_receiver`, `bc_sum`, `bc_max`); `max` = `bc_max_global` only |
-| `--morph_expert_weight` | `1.0` | Scale morphology MSE vs InfoNCE |
+| `--morph_expert_loss` | `mse` | Expert regression loss: `mse` (default) or `mae` (Papagei-style L1) |
+| `--morph_expert_weight` | `1.0` | Scale morphology expert loss vs InfoNCE |
 | `--morph_expert_hidden` | `64` | Hidden size of each expert MLP (shared or per-block) |
 | `--morph_expert_layout` | `shared` | `shared` = one MLP; `grouped` = block heads + per-block MSE (M5a) |
 | `--morph_expert_group_weight_tier2` | `1.0` | Tier 2 block loss weight when `layout=grouped` (`0` disables BC gradients) |
@@ -362,15 +431,15 @@ Requires `--objective contrastive` and `--morph_contrast`. Merges **soft positiv
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--morph_contrast` | off | Enable morphology-bin soft positives in edge InfoNCE |
-| `--morph_contrast_features` | `local_ego,local_degree` | Comma-separated groups: `local_ego`, `local_degree`, `global_degree`, `edge_native` |
-| `--morph_contrast_scope` | `local` | `local+global` enables `global_degree` lift (requires Tier 0 cache or startup compute) |
+| `--morph_contrast_features` | `local_ego,local_degree` | Comma-separated **groups** (not individual column names): `local_ego` (cols 0–1), `local_degree` (2–7), `local_clustering` (8–10), `global_degree`, `edge_native` |
+| `--morph_contrast_scope` | `local` | `local+global` enables `global_degree` lift for binning (requires Tier 0 cache or startup compute) |
 | `--morph_contrast_bins` | `5` | Quantile buckets per feature dimension (edges estimated from train loader at startup) |
 | `--morph_contrast_calib_batches` | `32` | Train batches used to estimate bin quantile edges |
 | `--morph_contrast_max_soft_positives` | `256` | Cap same-bin positives per anchor in the InfoNCE numerator (`0` = no cap). Safe with large `--batch_size`; no dense `(B,B)` mask is allocated |
 | `--morph_val_every` | `1` | Run `morph/expert_val` and `morph/contrast_val` every N epochs (`1` = every epoch). Always runs on the final epoch |
 | `--morph_val_max_batches` | `0` | Cap val-loader batches per morphology val pass (`0` = full val loader). Each batch still runs two augmented views + forward(s) |
 
-**Target dimensions (defaults):** `local` → 8 local + 4 edge-native = **12**; `local+global` → 8 + 9 global + 4 edge-native = **21**. Count features use log1p before MSE. Train morph targets use the **train-split** graph only; val morph loss uses the **val-split** graph (no leakage).
+**Target dimensions (defaults):** `local` → **11** local (8 degree/ego + 3 clustering) + 4 edge-native = **15**; `local+global` → 11 + 9 global + 4 edge-native = **24**. Count-like local/global degree columns use log1p before MSE; clustering coeffs stay in **[0, 1]**. Train morph targets use the **train-split** graph only; val morph loss uses the **val-split** graph (no leakage).
 
 Checkpoints with `--morph_expert` also store `morph_expert_state_dict`; with `--contrast_projection_head`, `contrast_projection_state_dict` is saved too (for resume only — extraction uses the encoder).
 
@@ -393,7 +462,7 @@ Checkpoints with `--morph_expert` also store `morph_expert_state_dict`; with `--
 
 ### Label-efficiency probe (`scripts/label_efficiency_probe.py`)
 
-**Why:** Full-label probes favor M1b on AUROC, but AML teams often have only a **fraction** of train transactions labeled. GCPAL and Papagei evaluate SSL encoders under **label scarcity** — same frozen embeddings, less train supervision. This does **not** retrain the GNN.
+**Why:** Full-label probes favor **M1b + clustering + projection** (0.929 AUROC; LE pending), but AML teams often have only a **fraction** of train transactions labeled. GCPAL and Papagei evaluate SSL encoders under **label scarcity** — same frozen embeddings, less train supervision. This does **not** retrain the GNN. The Jun 2026 refresh (nine encoders) shows projection beats plain M1b at all fractions; **M1b + projection** still wins at **10%** labels.
 
 **How:** Stratified subsets of **train** labels (default 10/25/50/100%), logistic regression per fraction, threshold tuned on **full val**, metrics on val/test.
 
@@ -414,16 +483,18 @@ python scripts/label_efficiency_probe.py \
 
 **Outputs:** `embeddings/{unique_name}/label_efficiency_results.json`, `embeddings/label_efficiency_summary.json`.
 
-**Slurm:** [`run_label_efficiency.sh`](run_label_efficiency.sh) — `#SBATCH --mem=128G`, no GPU; fits ~6 runs × 4 fractions (100% train fit is the slow step).
+**Slurm:** [`run_label_efficiency.sh`](run_label_efficiency.sh) — `#SBATCH --mem=64G`, no GPU. Single-encoder runs merge into `label_efficiency_summary.json` (see script docstring). Full batch re-run: pass all `--unique_names` in the script.
 
-**Results (Jun 2026, test AUROC):** M1b wins at all train fractions; gap vs contrastive is largest at 10% labels.
+**Results (Jun 2026, test AUROC, ten encoders in summary):** Source: `embeddings/label_efficiency_summary.json`. Projection encoders lead vs plain M1b at every fraction; **M1b + projection** is strongest at **10%** labels.
 
-| Train labels | M1b | Contrastive | Δ | Best M2 (20 ep M4) |
-|--------------|-----|-------------|---|---------------------|
-| 10% | **0.896** | 0.818 | +0.078 | 0.880 |
-| 25% | **0.910** | 0.849 | +0.061 | 0.897 |
-| 50% | **0.915** | 0.857 | +0.058 | 0.898 |
-| 100% | **0.919** | 0.863 | +0.056 | 0.896 |
+| Train labels | M1b+proj | Contrastive+proj | M1b | M1b+clustering | Contrastive |
+|--------------|----------|------------------|-----|----------------|-------------|
+| 10% | **0.918** | 0.906 | 0.896 | 0.877 | 0.818 |
+| 25% | 0.922 | **0.918** | 0.910 | 0.892 | 0.849 |
+| 50% | 0.919 | **0.925** | 0.915 | 0.904 | 0.857 |
+| 100% | 0.922 | **0.928** | 0.919 | 0.908 | 0.863 |
+
+**Pending label-efficiency:** `hi_morphology_global_clustering_proj_20ep_bestckpt`, `hi_morphology_global_mae_20ep_bestckpt`.
 
 Full tables and interpretation: [`notes/morphology-metrics-plan.md`](notes/morphology-metrics-plan.md) § Label-efficiency results. Source: `embeddings/label_efficiency_summary.json`.
 
@@ -449,7 +520,11 @@ or pass `--testing` to disable W&B for smoke runs. **Always** pass `--testing` t
 
 [`smoketest_rerun_probe.sh`](smoketest_rerun_probe.sh) re-runs probe only when embeddings already exist.
 
-[`run_label_efficiency.sh`](run_label_efficiency.sh) — label-efficiency on benchmark embeddings (**128G RAM**, CPU-only). If the job dies with `oom_kill`, request more memory or fewer `--unique_names` per job.
+[`run_label_efficiency.sh`](run_label_efficiency.sh) — label-efficiency on benchmark embeddings (**128G RAM**, CPU-only, nine encoders). If the job dies with `oom_kill`, request more memory or fewer `--unique_names` per job.
+
+[`ablation_contrastive_projection_20ep .sh`](ablation_contrastive_projection_20ep%20.sh) — GPU ablation: contrastive + `--contrast_projection_head` only (result: **0.927** test AUROC, **0.144** F1).
+
+[`ablation_m1b_projection_20ep.sh`](ablation_m1b_projection_20ep.sh) — GPU ablation: M1b + projection head (result: 0.924 test AUROC, 0.096 F1).
 
 [`ablation_morph_expert_weight_05_10ep.sh`](ablation_morph_expert_weight_05_10ep.sh) — GPU ablation: expert+M2 @ 10 ep with `--morph_expert_weight 0.5` and `--checkpoint_policy best` (result: 0.876 test AUROC — worse than w=1.0).
 
@@ -462,6 +537,14 @@ or pass `--testing` to disable W&B for smoke runs. **Always** pass `--testing` t
 [`ablation_morph_bc_max_global_20ep.sh`](ablation_morph_bc_max_global_20ep.sh) — train M3 ablation: M1b + `--morph_tier2_lift max` (result: 0.889 test AUROC).
 
 [`ablation_morph_grouped_wtier2_20ep.sh`](ablation_morph_grouped_wtier2_20ep.sh) — M5a grouped heads on M1b+BC; `WTIER2=0|0.5|1 sbatch ...` for sweep.
+
+[`ablation_m1b_clustering_20ep.sh`](ablation_m1b_clustering_20ep.sh) — M1b with Tier-1 local clustering in expert targets (11 local dims; **0.903** AUROC / **0.117** F1; LE **0.877–0.908** test AUROC).
+
+[`ablation_m1b_clustering_m2_10ep.sh`](ablation_m1b_clustering_m2_10ep.sh) — M1b + M2 with `local_clustering` contrast bins (@ 10 ep; pending).
+
+[`ablation_m1b_clustering_projection_20ep.sh`](ablation_m1b_clustering_projection_20ep.sh) — M1b + clustering + projection → `hi_morphology_global_clustering_proj_20ep_bestckpt` (result: **0.929** test AUROC, **0.156** F1).
+
+[`ablation_m1b_mae_20ep.sh`](ablation_m1b_mae_20ep.sh) — M1b + `--morph_expert_loss mae` → `hi_morphology_global_mae_20ep_bestckpt` (result: **0.898** test AUROC, **0.145** F1 — below MSE baseline 0.903).
 
 ---
 
@@ -504,7 +587,7 @@ Contrastive pretrain never uses AML labels in the loss loop. Downstream evaluati
 | `embeddings/{unique_name}/` | `.npz` embeddings, `meta.json`, `probe_results.json` |
 | `saved-models/` | Checkpoints (`checkpoint_{unique_name}.tar`) |
 | `tests/` | Unit tests (`test_morphology_metrics.py`, `test_morphology_contrast.py`, …) |
-| `notes/` | Design docs: contrastive plan, morphology plan |
+| `notes/` | Design docs: contrastive plan, morphology plan, projection ablation |
 | `smoketest.sh` | Slurm template for full pipeline |
 
 ### Morphology package (`morphology/`)
@@ -515,7 +598,7 @@ Contrastive pretrain never uses AML labels in the loss loop. Downstream evaluati
 | `graph_access.py` | Homo/hetero accessors for forward `edge_index`, `edge_attr`, endpoints |
 | `tier0_global.py` | Split-global node degrees; endpoint **lift** to seed edges (M1b) |
 | `tier2_global.py` | Split-global betweenness centrality; endpoint lift (M3) |
-| `tier1_local.py` | Batch-local subgraph stats on view1 (degrees, ego size) |
+| `tier1_local.py` | Batch-local subgraph stats on view1 (degrees, ego size, **local clustering**) |
 | `expert.py` | `MorphologyExpertHead`, MSE loss, `setup_morphology_expert()` |
 | `contrast.py` | M2: feature groups, quantile bins, `build_morph_bin_ids_for_seeds()` |
 | `contrastive_train.py` | Training-loop glue: per-step losses, val eval, `--morph_val_*` gating |
@@ -534,13 +617,20 @@ Bin edges for M2 are estimated once at startup from the **train** loader (`--mor
 | Goal | Flags |
 |------|-------|
 | Baseline contrastive | *(none)* |
+| Contrastive + projection | `--contrast_projection_head --contrast_projection_hidden 128 --contrast_projection_dim 128` |
+| M1b + clustering + projection (best full-label SSL) | M1b expert + projection flags above — `ablation_m1b_clustering_projection_20ep.sh` |
+| M1b + MAE expert | add `--morph_expert_loss mae` (ablation: 0.898 AUROC — below MSE default) |
+| M1b + projection | M1b expert flags above **and** `--contrast_projection_head …` |
 | M1 local expert | `--morph_expert --morph_targets local` |
 | M1b global expert | `--morph_expert --morph_targets local+global --morph_tier0_cache morphology_cache/Small-HI` |
 | M1b + BC expert (M3) | `--morph_targets local+global+tier2 --morph_tier2_cache morphology_cache/Small-HI` (+ Tier 0 cache) |
 | BC-only ablation | `--morph_targets local+tier2 --morph_tier2_cache morphology_cache/Small-HI` |
 | BC max-only lift | above + `--morph_tier2_lift max` |
-| M2 soft positives | `--morph_contrast` (+ feature/scope flags) |
-| M1b + M2 | expert flags above **and** `--morph_contrast …` (retune stop/weight; M1b alone is best @ 20 ep today) |
+| M2 soft positives (degree bins) | `--morph_contrast --morph_contrast_features local_ego,local_degree` |
+| M2 + clustering bins | add `local_clustering` to `--morph_contrast_features` (see clustering M2 example above) |
+| M1b + clustering expert only | same M1b flags — clustering is automatic; Slurm: `ablation_m1b_clustering_20ep.sh` → `hi_morphology_global_clustering_20ep` |
+| M1b + M2 (prior recipe) | M1b expert + `--morph_contrast --morph_contrast_features local_ego,local_degree` @ **10 ep** |
+| M1b + M2 + clustering | M1b expert + `--morph_contrast_features local_ego,local_degree,local_clustering` @ 10 ep — `ablation_m1b_clustering_m2_10ep.sh` |
 | Faster morph val | `--morph_val_every 2 --morph_val_max_batches 10` |
 
 Expert head weights are saved in the checkpoint but **not** used at extraction — only the GNN encoder is frozen and probed.
@@ -548,7 +638,8 @@ Expert head weights are saved in the checkpoint but **not** used at extraction �
 ### Tests
 
 ```bash
-python -m pytest tests/test_morphology_expert_grouped.py tests/test_morphology_expert_tier2.py tests/test_morphology_tier2.py -q
+python -m pytest tests/test_morphology_metrics.py tests/test_morphology_contrast.py \
+  tests/test_morphology_expert_grouped.py tests/test_morphology_expert_tier2.py tests/test_morphology_tier2.py -q
 ```
 
 ---
@@ -572,7 +663,7 @@ python -m pytest tests/test_morphology_expert_grouped.py tests/test_morphology_e
 | `format_kaggle_files.py` | Kaggle CSV → formatted transactions |
 | `model_settings.json` | Per-architecture hyperparameters |
 | `smoketest.sh` | Slurm train → extract → probe template |
-| `notes/` | Design documents (contrastive plan, morphology metrics, [lit review index](notes/lit-review-index.md)) |
+| `notes/` | Design documents (contrastive plan, morphology metrics, [projection ablation](notes/projection-head-ablation-jun2026.md), [lit review index](notes/lit-review-index.md)) |
 
 ---
 
@@ -598,6 +689,7 @@ We adopt Papagei's **pretrain → frozen encoder → linear probe** workflow (no
 
 - Hanbin et al., *Graph Contrastive Pre-training for Anti-money Laundering* (GCPAL), *International Journal of Computational Intelligence Systems*, 2024. [Springer](https://link.springer.com/article/10.1007/s44196-024-00720-4) — graph augmentations and contrastive pretraining on AML transaction networks.
 - Morphology-aware contrastive pretraining (expert heads, Tier 0/1 metrics): [`notes/morphology-metrics-plan.md`](notes/morphology-metrics-plan.md).
+- Contrastive projection head ablation (Jun 2026): [`notes/projection-head-ablation-jun2026.md`](notes/projection-head-ablation-jun2026.md).
 - Literature ↔ implementation mapping: [`notes/lit-review-index.md`](notes/lit-review-index.md).
 
 ---

@@ -58,13 +58,14 @@ Companion to [`contrastive-learning-plan.md`](contrastive-learning-plan.md) and 
 | Tier-0 global degree precompute | This repo (M1b) | ✅ | `scripts/precompute_morphology_tier0.py` |
 | Morph val throttling | This repo | ✅ | `--morph_val_every`, `--morph_val_max_batches` |
 | Third **KNN view** | GCPAL | ❌ | Documented divergence in contrastive plan |
-| **Projection head** for contrast only | GraphCL, GCPAL | ❌ | Contrast on `embedding_head` output directly |
+| **Projection head** for contrast only | GraphCL, GCPAL | ✅ | `--contrast_projection_head` — InfoNCE only; extract uses encoder `z`; see [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md) |
 | **Neighbor / KNN soft positives** (non-morph) | GCPAL | ❌ | M2 uses morphology bins instead |
 | **Label-efficiency** probe (10/25/50% train labels) | GCPAL, Papagei, RWTH | ✅ | `scripts/label_efficiency_probe.py` |
 | **Disjoint** morph dims for contrast vs expert | Papagei | ❌ | Default overlap `local_ego,local_degree` |
-| **MoE / per-metric expert heads** | Papagei | ❌ | Single shared MLP; **M5b per-metric** preferred long-term if grouped insufficient |
+| **MoE / per-metric expert heads** | Papagei | ⚠️ | Shared MLP default; **M5a grouped** implemented (0.887 AUROC — did not fix M3); **M5b per-metric** deprioritized |
 | **Best checkpoint** by SSL + morph val | Papagei spirit / M4 plan | ✅ | `--checkpoint_policy best` |
 | Tier-2 **BC** lift (expert) | Gao & Ye, M3 plan | ✅ | `local+global+tier2`, `local+tier2`; **no probe gain vs M1b** (Jun 2026) |
+| Tier-1 **local clustering** (expert + M2 group) | This repo (M1c) | ✅ | Expert-only 0.903; **+projection 0.929** (best SSL); LE pending; M2 bins optional |
 | Tier-2 PageRank | Gao & Ye, M3 plan | ❌ | BC only so far |
 | **Node-level** semi-supervised AML | RWTH | ❌ | Different task; edge-centric here |
 | Pipeline: Node2Vec → XGBoost on nodes | RWTH | ⚠️ | Analogue: extract → `linear_probe.py` (edge-level) |
@@ -77,24 +78,33 @@ GIN, hetero, full-train linear probe, val max-F1 threshold. Full table in [`morp
 
 | Config | Ckpt | Test AUROC | Test F1 |
 |--------|------|------------|---------|
-| Contrastive baseline | 20 | 0.839 | 0.076 |
-| **M1b expert** | 20 | **0.920** | **0.108** |
-| Expert + M2 | 10ep best (ep 9) | **0.906** | 0.058 |
-| Expert + M2 | `w=0.5`, 10ep best | 0.876 | 0.027 |
+| **M1b + clustering + projection** | 20 | **0.929** | **0.156** |
+| Contrastive + projection | 20 | 0.927 | 0.144 |
+| M1b + projection | 20 → ep 15 | 0.924 | 0.096 |
+| **M1b expert** (8 local dims) | 20 | 0.920 | 0.108 |
+| M1b + clustering (MSE) | 20 | 0.903 | 0.117 |
+| M1b + MAE expert | 20 | 0.898 | 0.145 |
+| M3 BC-only | 20 | 0.904 | 0.093 |
+| Expert + M2 | 10ep best (ep 9) | 0.906 | 0.058 |
 | Expert + M2 | 20ep best (ep 20) | 0.891 | 0.107 |
-| Expert + M2 last @ 20ep (pre-M4) | 20 | 0.864 | 0.025 |
-| M2 only | 10 | 0.680 | 0.012 |
 | M3 M1b + BC (4 cols) | 20ep best (ep 14) | 0.896 | 0.033 |
-| M3 M1b + BC (last epoch) | 20 | 0.861 | 0.029 |
+| M5a grouped BC | `w_tier2=1` | 0.887 | 0.028 |
+| Expert + M2 | `w=0.5`, 10ep best | 0.876 | 0.027 |
+| Expert + M2 last @ 20ep (pre-M4) | 20 | 0.864 | 0.025 |
+| Contrastive baseline | 20 | 0.839 | 0.076 |
+| M2 only | 10 | 0.680 | 0.012 |
+| Supervised CE (in-GNN) | — | ~0.972 | ~0.493 |
 
 **Takeaways:**
 
+- **Projection head** is the largest SSL win on full labels: contrastive 0.839 → **0.927** test AUROC (+0.088); morph expert not required for that gain.
 - Expert heads carry representation; M2 contrast alone fails.
-- **M4** (`--checkpoint_policy best`) recovers much of the 20 ep regression; **M1b still best on AUROC**.
-- **M3 BC** on top of M1b **hurt** probe AUROC (0.896 best / 0.861 last vs 0.920 M1b); morph val picked epoch 14, not 20.
+- **M4** (`--checkpoint_policy best`) recovers much of the 20 ep expert+M2 regression; **M1b** remains best **morph-only** config (0.920 AUROC).
+- **M3 BC** stacked on M1b **hurt** (0.896 best vs 0.920 M1b); **M5a grouped** did not fix interference (0.887).
 - **`morph_expert_weight=0.5`** hurt expert+M2 vs w=1.0.
-- **M5a grouped heads** (`w_tier2=1`) → 0.887 test AUROC — block MSE did not fix M3 stack interference.
-- **Label-efficiency** (✅ Jun 2026): M1b wins at 10/25/50/100% train labels; **+0.078 AUROC vs contrastive at 10%** — morphology expert is most valuable under label scarcity. M2 does not flip the ranking.
+- **Full-label SSL leader:** M1b+clustering+projection **0.929** AUROC (clustering alone 0.903; projection rescues + surpasses contrastive+proj).
+- **Label-efficiency** (ten encoders): contrastive+proj @ 25–100%; M1b+proj @ 10%. Clustering+proj LE **pending**.
+- **MAE expert loss:** 0.898 AUROC — no win vs MSE (0.903).
 
 ---
 
@@ -127,9 +137,9 @@ GIN, hetero, full-train linear probe, val max-F1 threshold. Full table in [`morp
 - **M2 soft positives** are the closest analogue to “similar-feature positives,” but on **edge morphology bins** (cross-view), not KNN in node feature space.
 
 **High-value future work:**
-1. ~~**Label-efficiency probes**~~ — done: M1b wins all fractions; +0.078 test AUROC @ 10% vs contrastive; M2 does not beat M1b under scarcity.
+1. ~~**Label-efficiency probes**~~ — nine-encoder batch done: contrastive+proj leads vs M1b at all fractions; M1b+proj best @ 10% (0.918 AUROC).
 2. **KNN or similarity view** — mitigate link sparsity (GCPAL motivation); engineering cost non-trivial on edge/batch sampling path.
-3. ~~**Optional contrast projection head**~~ — implemented (`--contrast_projection_head`); run `ablation_m1b_projection_20ep.sh`.
+3. ~~**Contrast projection head**~~ — done (Jun 4): contrastive+proj **0.927** test AUROC; M1b+proj 0.924 AUROC / 0.096 F1. See [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md).
 
 ---
 
@@ -141,7 +151,8 @@ GIN, hetero, full-train linear probe, val max-F1 threshold. Full table in [`morp
 
 **Repo connection:**
 - `graph_augmentations.py`: independent **edge drop** + **edge attr mask** per view; positives aligned by `edge_id` (robust to different edge sets per view).
-- No subgraph/node-drop views; no separate projection head.
+- **Projection head** implemented (`--contrast_projection_head`) — GraphCL-style; applied before InfoNCE only; encoder `z` at extraction.
+- No subgraph/node-drop views; no third KNN view.
 
 **Caution for AML:** Transactions may be “edge-sensitive” like molecules — monitor whether aggressive `edge_drop_rate` (0.1) hurts morph-aware runs; M2 bins use **view1** features only (good).
 
@@ -201,7 +212,7 @@ GIN, hetero, full-train linear probe, val max-F1 threshold. Full table in [`morp
 - **M1b already implements Tier-0 degree lift** (9 global features per seed).
 - **Finding:** stacked BC did **not** improve AML linear probe vs M1b on Small-HI (0.896 vs 0.920 test AUROC). Global degrees may subsume most hub signal; shared MLP + unified MSE may dilute BC gradients — see **M5 grouped heads** in morphology plan.
 
-**Future:** PageRank Tier 2; BC contrast bins (Phase 2, deferred); **grouped expert heads** if bc_only / bc_max ablations still negative. See [`morphology-metrics-plan.md`](morphology-metrics-plan.md) Phase M3 / M5.
+**Future:** PageRank Tier 2; BC contrast bins (Phase 2, deferred). ~~Grouped expert heads~~ — M5a done (0.887 AUROC; did not fix stack). See [`morphology-metrics-plan.md`](morphology-metrics-plan.md) Phase M3 / M5.
 
 ---
 
@@ -216,8 +227,8 @@ GIN, hetero, full-train linear probe, val max-F1 threshold. Full table in [`morp
 | Augmentations | GraphCL, GCPAL | Edge drop + attr mask; **no KNN view** |
 | Similarity positives | GCPAL, Papagei | **M2 morphology bins** (not KNN) |
 | Global structure signal | Gao & Ye, M1b | Tier-0 **degree lift** ✅; Tier-2 **BC lift** ✅ but **no probe gain** vs M1b |
-| Expert head layout | Papagei MoE | **Single shared MLP**; M5 ladder: grouped blocks → **per-metric heads** |
-| Expert loss | Papagei MAE | **MSE** on log1p targets (`morph_expert_mse_loss`) |
+| Expert head layout | Papagei MoE | **Single shared MLP** default; M5a grouped implemented (0.887 AUROC — insufficient); M5b per-metric deprioritized |
+| Expert loss | Papagei MAE | **MSE** default; MAE ablation **0.898** vs MSE **0.903** — keep MSE |
 | Contrastive projection head | GraphCL, GCPAL | ✅ `--contrast_projection_head` (InfoNCE only; extract uses encoder z) |
 | Stochastic subgraphs | GraphCL, Papagei precompute | **In-batch Tier-1** local morph; Tier-0 precompute |
 
@@ -231,17 +242,18 @@ Ordered by impact vs effort for **this** codebase (updated after M2 @ 20 ep):
 |----------|------|---------------|--------|
 | 1 | ~~**M4:** save best checkpoint by morph val composite~~ | Papagei | ✅ `--checkpoint_policy best` |
 | 2 | ~~Re-run expert+M2 with `--checkpoint_policy best`~~ | This repo | Done — see morphology plan table |
-| 3 | ~~**Analyze label-efficiency** (`run_label_efficiency.sh`)~~ | GCPAL, Papagei, RWTH | ✅ M1b wins all fractions; +0.078 @ 10% vs contrastive |
-| 4 | **Disjoint morph features** (contrast vs expert ablation) | Papagei | Low — CLI/flags |
-| 5 | ~~**M3 BC ablations** (`bc_only`, `bc_max`)~~ | Gao & Ye | ✅ done; stack hurts, bc_only 0.904 |
-| 6 | ~~**M5 grouped expert heads**~~ | Papagei | ✅ done; 0.887 — **M5b per-metric deprioritized** |
-| 7 | **MAE vs MSE** expert loss ablation | Papagei | Low |
-| 8 | **Contrast projection head** ablation on M1b | GraphCL, GCPAL | Medium — **implemented**; `ablation_m1b_projection_20ep.sh` |
-| 9 | **KNN view** or neighbor soft positives | GCPAL | High |
-| 10 | Tier-2 **PageRank** lift | Gao & Ye | High (precompute) |
+| 3 | ~~**Analyze label-efficiency** (`run_label_efficiency.sh`)~~ | GCPAL, Papagei, RWTH | ✅ nine encoders: contrastive+proj leads; M1b+proj @ 10% |
+| 4 | **Tier-1 local clustering** benchmark | This repo | ✅ clustering+proj **0.929**; LE on clustering+proj pending |
+| 5 | **Disjoint morph features** (contrast vs expert ablation) | Papagei | Low — CLI/flags |
+| 6 | ~~**M3 BC ablations** (`bc_only`, `bc_max`)~~ | Gao & Ye | ✅ done; stack hurts, bc_only 0.904 |
+| 7 | ~~**M5 grouped expert heads**~~ | Papagei | ✅ done; 0.887 — **M5b per-metric deprioritized** |
+| 8 | ~~**MAE vs MSE** expert loss ablation~~ | Papagei | ✅ MAE 0.898 — no AUROC win vs MSE 0.903 |
+| 9 | ~~**Contrast projection head** ablation~~ | GraphCL, GCPAL | ✅ contrastive+proj **0.927** AUROC; M1b+proj 0.924 / 0.096 F1 — see projection ablation note |
+| 10 | **KNN view** or neighbor soft positives | GCPAL | High |
+| 11 | Tier-2 **PageRank** lift | Gao & Ye | High (precompute) |
 | ~~10~~ | ~~**M3 BC** in expert head~~ | Gao & Ye | ✅ implemented; **no AUROC gain** vs M1b |
 
-~~Complete M2 @ 20 ep vs M1b~~ — **done:** M1b wins (0.920 vs 0.864 test AUROC).
+~~Complete M2 @ 20 ep vs M1b~~ — **done.** **Full-label SSL leader:** M1b+clustering+projection **0.929** AUROC (Jun 2026).
 
 ---
 
@@ -262,7 +274,8 @@ Add PDFs to `lit review/` and extend this table if those become relevant.
 | Topic | Document / code |
 |-------|-----------------|
 | Contrastive workflow & Phase history | [`contrastive-learning-plan.md`](contrastive-learning-plan.md) |
-| Morphology phases M0–M4 | [`morphology-metrics-plan.md`](morphology-metrics-plan.md) |
+| Morphology phases M0–M5 | [`morphology-metrics-plan.md`](morphology-metrics-plan.md) |
+| Projection head ablation (Jun 2026) | [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md) |
 | CLI & benchmarks | [`README.md`](../README.md) |
 | Augmentations | [`graph_augmentations.py`](../graph_augmentations.py) |
 | InfoNCE + M2 soft positives | [`contrastive_loss.py`](../contrastive_loss.py) |

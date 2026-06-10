@@ -6,10 +6,16 @@ Fits logistic regression on stratified subsets of the **train** split, tunes the
 classification threshold on the **full val** split (unchanged), and reports val/test
 metrics. Compare curves across ``--unique_names`` without retraining the encoder.
 
-Example:
+Example (batch):
 
   python scripts/label_efficiency_probe.py \\
     --unique_names hi_morphology_global_20ep hi_morph_global_contrast_10ep \\
+    --class_weight model --model gin --testing
+
+Example (single run; merges into existing ``label_efficiency_summary.json``):
+
+  python scripts/label_efficiency_probe.py \\
+    --unique_name hi_morphology_global_clustering_20ep \\
     --class_weight model --model gin --testing
 """
 
@@ -179,6 +185,19 @@ def run_label_efficiency_for_run(
     return results
 
 
+def load_summary_runs_by_name(summary_path: Path) -> Dict[str, Any]:
+    """Load prior ``runs_by_name`` entries so incremental runs do not wipe the summary."""
+    if not summary_path.is_file():
+        return {}
+    with summary_path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    runs = payload.get("runs_by_name")
+    if not isinstance(runs, dict):
+        logging.warning("Ignoring malformed summary at %s", summary_path)
+        return {}
+    return runs
+
+
 def parse_fractions(raw: str) -> List[float]:
     parts = [p.strip() for p in raw.split(",") if p.strip()]
     if not parts:
@@ -274,7 +293,10 @@ def main() -> None:
         },
     )
 
-    all_results: Dict[str, Any] = {"runs_by_name": {}}
+    summary_path = Path(args.embeddings_dir) / "label_efficiency_summary.json"
+    all_results: Dict[str, Any] = {
+        "runs_by_name": load_summary_runs_by_name(summary_path),
+    }
     for name in names:
         args.unique_name = name
         embeddings_root = Path(args.embeddings_dir) / name
@@ -296,10 +318,14 @@ def main() -> None:
                         continue
                     wandb.log({f"{prefix}/{key}": value})
 
-    summary_path = Path(args.embeddings_dir) / "label_efficiency_summary.json"
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2)
-    logging.info("Wrote combined summary to %s", summary_path)
+    logging.info(
+        "Wrote combined summary to %s (%d encoder(s) this run, %d total)",
+        summary_path,
+        len(names),
+        len(all_results["runs_by_name"]),
+    )
     wandb.finish()
 
 

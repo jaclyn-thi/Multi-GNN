@@ -23,18 +23,22 @@ import torch
 
 from morphology.expert import MorphExpertConfig, build_morph_targets
 from morphology.tier0_global import MorphTier0Context
-from morphology.tier1_local import LOCAL_FEATURE_NAMES, LOCAL_COUNT_FEATURE_INDICES
+from morphology.tier1_local import (
+    LOCAL_CLUSTERING_INDICES,
+    LOCAL_DEGREE_INDICES,
+    LOCAL_FEATURE_NAMES,
+)
 
 # Feature groups for binning (toggle via CLI).
 MORPH_CONTRAST_FEATURE_GROUPS = (
     "local_ego",
     "local_degree",
+    "local_clustering",
     "global_degree",
     "edge_native",
 )
 
 _LOCAL_EGO_INDICES = (0, 1)  # n_edges_sub, n_nodes_sub
-_LOCAL_DEGREE_INDICES = tuple(range(2, len(LOCAL_FEATURE_NAMES)))
 
 
 @dataclass
@@ -158,7 +162,9 @@ def _column_indices_for_groups(cfg: MorphContrastConfig, edge_native_dim: int = 
     if "local_ego" in cfg.feature_groups:
         cols.extend(offset + i for i in _LOCAL_EGO_INDICES)
     if "local_degree" in cfg.feature_groups:
-        cols.extend(offset + i for i in _LOCAL_DEGREE_INDICES)
+        cols.extend(offset + i for i in LOCAL_DEGREE_INDICES)
+    if "local_clustering" in cfg.feature_groups:
+        cols.extend(offset + i for i in LOCAL_CLUSTERING_INDICES)
     offset += n_local
 
     if cfg.include_global and "global_degree" in cfg.feature_groups:

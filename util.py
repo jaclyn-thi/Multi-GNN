@@ -163,10 +163,17 @@ def create_parser():
         help="Tier 2 BC expert lift: full (4 endpoint cols) or max (bc_max_global only).",
     )
     parser.add_argument(
+        "--morph_expert_loss",
+        type=str,
+        default="mse",
+        choices=["mse", "mae"],
+        help="Morphology expert regression loss: mse (default) or mae (Papagei-style L1).",
+    )
+    parser.add_argument(
         "--morph_expert_weight",
         type=float,
         default=1.0,
-        help="Weight for morphology expert MSE loss vs InfoNCE.",
+        help="Weight for morphology expert loss vs InfoNCE.",
     )
     parser.add_argument(
         "--morph_expert_hidden",
@@ -203,7 +210,7 @@ def create_parser():
         "--morph_contrast_features",
         type=str,
         default="local_ego,local_degree",
-        help="Comma-separated feature groups for binning: local_ego, local_degree, global_degree, edge_native.",
+        help="Comma-separated feature groups for binning: local_ego, local_degree, local_clustering, global_degree, edge_native.",
     )
     parser.add_argument(
         "--morph_contrast_scope",
