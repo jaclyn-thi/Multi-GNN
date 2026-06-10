@@ -143,7 +143,8 @@ python main.py \
   --tqdm --testing
 ```
 
-Then **extract → probe** as in the primary workflow. Slurm: [`ablation_contrastive_projection_20ep .sh`](ablation_contrastive_projection_20ep%20.sh). To stack projection with M1b: [`ablation_m1b_projection_20ep.sh`](ablation_m1b_projection_20ep.sh) (AUROC ↑ vs M1b, F1 ↓ at val-tuned threshold).
+Then **extract → probe** as in the primary workflow.
+<!-- Slurm: [`ablation_contrastive_projection_20ep .sh`](ablation_contrastive_projection_20ep%20.sh). To stack projection with M1b: [`ablation_m1b_projection_20ep.sh`](ablation_m1b_projection_20ep.sh) (AUROC ↑ vs M1b, F1 ↓ at val-tuned threshold). -->
 
 ### Morphology-aware contrastive pretraining (optional)
 
@@ -202,7 +203,7 @@ python main.py \
   --tqdm --testing
 ```
 
-Slurm: [`ablation_m1b_clustering_m2_10ep.sh`](ablation_m1b_clustering_m2_10ep.sh).
+<!-- Slurm: [`ablation_m1b_clustering_m2_10ep.sh`](ablation_m1b_clustering_m2_10ep.sh). -->
 
 **Tier-1 local features** (always included when `--morph_expert` is on; computed on **view1** subgraph):
 
@@ -483,7 +484,7 @@ python scripts/label_efficiency_probe.py \
 
 **Outputs:** `embeddings/{unique_name}/label_efficiency_results.json`, `embeddings/label_efficiency_summary.json`.
 
-**Slurm:** [`run_label_efficiency.sh`](run_label_efficiency.sh) — `#SBATCH --mem=64G`, no GPU. Single-encoder runs merge into `label_efficiency_summary.json` (see script docstring). Full batch re-run: pass all `--unique_names` in the script.
+<!-- **Slurm:** [`run_label_efficiency.sh`](run_label_efficiency.sh) — `#SBATCH --mem=64G`, no GPU. Single-encoder runs merge into `label_efficiency_summary.json` (see script docstring). Full batch re-run: pass all `--unique_names` in the script. -->
 
 **Results (Jun 2026, test AUROC, ten encoders in summary):** Source: `embeddings/label_efficiency_summary.json`. Projection encoders lead vs plain M1b at every fraction; **M1b + projection** is strongest at **10%** labels.
 
@@ -502,10 +503,10 @@ Full tables and interpretation: [`notes/morphology-metrics-plan.md`](notes/morph
 
 ## Slurm and cluster jobs
 
-[`smoketest.sh`](smoketest.sh) is a template Slurm script for train → extract → probe on Small-HI. Edit the `RUN_NAME`, `N_EPOCHS`, and morphology blocks at the top, then:
+<!-- [`smoketest.sh`](smoketest.sh) is a template Slurm script for train → extract → probe on Small-HI. Edit the `RUN_NAME`, `N_EPOCHS`, and morphology blocks at the top, then:
 
 ```bash
-sbatch smoketest.sh
+sbatch smoketest.sh -->
 ```
 
 **W&B on batch nodes:** `main.py` loads `.env` via `load_dotenv()`, but bare `wandb login` in a shell script does **not** read `.env` automatically. Either:
@@ -516,9 +517,9 @@ set -a && source .env && set +a && wandb login "$WANDB_API_KEY"
 
 or pass `--testing` to disable W&B for smoke runs. **Always** pass `--testing` to `linear_probe.py` on Slurm unless you export the API key first (probe calls `wandb.init()` before writing `probe_results.json`).
 
-**Morphology val cost:** expert + M2 runs two val-loader passes per morph-val epoch (`morph/expert_val`, `morph/contrast_val`). Use `--morph_val_every 2 --morph_val_max_batches 10` (see [`smoketest.sh`](smoketest.sh)) to fit long jobs within a 6 h GPU limit. Use `--checkpoint_policy best` so extraction does not use a regressed final epoch.
+**Morphology val cost:** expert + M2 runs two val-loader passes per morph-val epoch (`morph/expert_val`, `morph/contrast_val`). Use `--morph_val_every 2 --morph_val_max_batches 10` to fit long jobs within a 6 h GPU limit. Use `--checkpoint_policy best` so extraction does not use a regressed final epoch.
 
-[`smoketest_rerun_probe.sh`](smoketest_rerun_probe.sh) re-runs probe only when embeddings already exist.
+<!-- [`smoketest_rerun_probe.sh`](smoketest_rerun_probe.sh) re-runs probe only when embeddings already exist.
 
 [`run_label_efficiency.sh`](run_label_efficiency.sh) — label-efficiency on benchmark embeddings (**128G RAM**, CPU-only, nine encoders). If the job dies with `oom_kill`, request more memory or fewer `--unique_names` per job.
 
@@ -544,7 +545,7 @@ or pass `--testing` to disable W&B for smoke runs. **Always** pass `--testing` t
 
 [`ablation_m1b_clustering_projection_20ep.sh`](ablation_m1b_clustering_projection_20ep.sh) — M1b + clustering + projection → `hi_morphology_global_clustering_proj_20ep_bestckpt` (result: **0.929** test AUROC, **0.156** F1).
 
-[`ablation_m1b_mae_20ep.sh`](ablation_m1b_mae_20ep.sh) — M1b + `--morph_expert_loss mae` → `hi_morphology_global_mae_20ep_bestckpt` (result: **0.898** test AUROC, **0.145** F1 — below MSE baseline 0.903).
+[`ablation_m1b_mae_20ep.sh`](ablation_m1b_mae_20ep.sh) — M1b + `--morph_expert_loss mae` → `hi_morphology_global_mae_20ep_bestckpt` (result: **0.898** test AUROC, **0.145** F1 — below MSE baseline 0.903). -->
 
 ---
 
@@ -588,7 +589,7 @@ Contrastive pretrain never uses AML labels in the loss loop. Downstream evaluati
 | `saved-models/` | Checkpoints (`checkpoint_{unique_name}.tar`) |
 | `tests/` | Unit tests (`test_morphology_metrics.py`, `test_morphology_contrast.py`, …) |
 | `notes/` | Design docs: contrastive plan, morphology plan, projection ablation |
-| `smoketest.sh` | Slurm template for full pipeline |
+<!-- | `smoketest.sh` | Slurm template for full pipeline | -->
 
 ### Morphology package (`morphology/`)
 
@@ -618,7 +619,7 @@ Bin edges for M2 are estimated once at startup from the **train** loader (`--mor
 |------|-------|
 | Baseline contrastive | *(none)* |
 | Contrastive + projection | `--contrast_projection_head --contrast_projection_hidden 128 --contrast_projection_dim 128` |
-| M1b + clustering + projection (best full-label SSL) | M1b expert + projection flags above — `ablation_m1b_clustering_projection_20ep.sh` |
+| M1b + clustering + projection (best full-label SSL) | M1b expert + projection flags above|
 | M1b + MAE expert | add `--morph_expert_loss mae` (ablation: 0.898 AUROC — below MSE default) |
 | M1b + projection | M1b expert flags above **and** `--contrast_projection_head …` |
 | M1 local expert | `--morph_expert --morph_targets local` |
@@ -628,9 +629,9 @@ Bin edges for M2 are estimated once at startup from the **train** loader (`--mor
 | BC max-only lift | above + `--morph_tier2_lift max` |
 | M2 soft positives (degree bins) | `--morph_contrast --morph_contrast_features local_ego,local_degree` |
 | M2 + clustering bins | add `local_clustering` to `--morph_contrast_features` (see clustering M2 example above) |
-| M1b + clustering expert only | same M1b flags — clustering is automatic; Slurm: `ablation_m1b_clustering_20ep.sh` → `hi_morphology_global_clustering_20ep` |
+| M1b + clustering expert only | same M1b flags — clustering is automatic|
 | M1b + M2 (prior recipe) | M1b expert + `--morph_contrast --morph_contrast_features local_ego,local_degree` @ **10 ep** |
-| M1b + M2 + clustering | M1b expert + `--morph_contrast_features local_ego,local_degree,local_clustering` @ 10 ep — `ablation_m1b_clustering_m2_10ep.sh` |
+| M1b + M2 + clustering | M1b expert + `--morph_contrast_features local_ego,local_degree,local_clustering` @ 10 ep |
 | Faster morph val | `--morph_val_every 2 --morph_val_max_batches 10` |
 
 Expert head weights are saved in the checkpoint but **not** used at extraction — only the GNN encoder is frozen and probed.
@@ -662,7 +663,7 @@ python -m pytest tests/test_morphology_metrics.py tests/test_morphology_contrast
 | `data_loading.py` | CSV → PyG graph objects and temporal splits |
 | `format_kaggle_files.py` | Kaggle CSV → formatted transactions |
 | `model_settings.json` | Per-architecture hyperparameters |
-| `smoketest.sh` | Slurm train → extract → probe template |
+<!-- | `smoketest.sh` | Slurm train → extract → probe template | -->
 | `notes/` | Design documents (contrastive plan, morphology metrics, [projection ablation](notes/projection-head-ablation-jun2026.md), [lit review index](notes/lit-review-index.md)) |
 
 ---
