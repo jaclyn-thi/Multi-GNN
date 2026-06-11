@@ -9,7 +9,7 @@ This repository extends [IBM Multi-GNN](https://github.com/IBM/Multi-GNN) for an
 
 The original **supervised** Multi-GNN path (`--objective supervised`) remains available as a baseline and ablation (~0.97 test AUROC in-GNN on Small-HI; still above frozen SSL + linear probe). For design rationale and implementation status, see [`notes/contrastive-learning-plan.md`](notes/contrastive-learning-plan.md) and [`notes/morphology-metrics-plan.md`](notes/morphology-metrics-plan.md) (phases M0–M5 are described in detail at the end of the morphology plan).
 
-**Quick links:** [Primary workflow](#primary-workflow--contrastive-pretrain--extract--linear-probe) · [Contrastive projection head](#contrastive-projection-head-recommended-for-pure-ssl) · [Morphology (M1/M2)](#morphology-aware-contrastive-pretraining-optional) · [Key concepts & metrics](#key-concepts-and-metrics) · [Label-efficiency probe](#label-efficiency-probe-scriptslabel_efficiency_probepy) · [Repository guide](#repository-guide) · [CLI reference](#command-line-arguments) · [Slurm / cluster](#slurm-and-cluster-jobs)
+**Quick links:** [Primary workflow](#primary-workflow--contrastive-pretrain--extract--linear-probe) · [Contrastive projection head](#contrastive-projection-head-recommended-for-pure-ssl) · [Morphology (M1/M2)](#morphology-aware-contrastive-pretraining-optional) · [**Morphology metrics**](#morphology-metrics-reference) · [Key concepts & metrics](#key-concepts-and-metrics) · [Label-efficiency probe](#label-efficiency-probe-scriptslabel_efficiency_probepy) · [Repository guide](#repository-guide) · [CLI reference](#command-line-arguments) · [Slurm / cluster](#slurm-and-cluster-jobs)
 
 ---
 
@@ -160,6 +160,74 @@ Beyond edge-identity InfoNCE, you can add a **morphology expert head** (Papagei-
 
 Phases **M0–M5** (spec, expert, contrast, BC, checkpoint policy, grouped heads) are summarized in the table above; full phase write-ups live in [`notes/morphology-metrics-plan.md`](notes/morphology-metrics-plan.md) § Implementation plan.
 
+#### Morphology metrics reference
+
+Label-free structural features attached to each **seed transaction** during contrastive pretrain. Two uses:
+
+- **Expert head (M1+):** MLP predicts detached targets from encoder `z_seed` (MSE/MAE).
+- **Morph contrast (M2):** quantile **bins** on selected feature groups → soft positives in InfoNCE (in addition to same-`edge_id` positives).
+
+**Target assembly** (expert column order): `local` → `global` (M1b) → `tier2` (M3) → `edge_native`. Computed on **view1** of each batch. Train targets use the **train-split** graph; val morph loss uses the **val-split** graph only.
+
+| `--morph_targets` | Blocks included | Default expert dims |
+|-------------------|-----------------|---------------------|
+| `local` (M1) | Tier 1 + edge-native | **15** (11 + 4) |
+| `local+global` (M1b) | Tier 1 + Tier 0 lift + edge-native | **24** (11 + 9 + 4) |
+| `local+tier2` | Tier 1 + BC lift + edge-native | **19** (11 + 4 + 4) |
+| `local+global+tier2` (M3) | all blocks | **28** (11 + 9 + 4 + 4) |
+
+**`log1p` rule:** count-like columns (ego, degrees, global lift, BC) are transformed with `log1p` before expert loss. Clustering coefficients stay in **[0, 1]**. Edge-native attributes are used as-is.
+
+**Tier 1 — local** (11 cols; always on when `--morph_expert` is set). Stats on the **batch subgraph** from `LinkNeighborLoader` — what message passing actually sees, not the full split graph.
+
+| Col | Name | Definition | M2 group | log1p? |
+|-----|------|------------|----------|--------|
+| 0 | `n_edges_sub` | Edge count of the **entire view1 batch subgraph** (same value for all seeds in the batch) | `local_ego` | yes |
+| 1 | `n_nodes_sub` | Unique node count of that same subgraph (batch-level, not per-seed k-hop ego) | `local_ego` | yes |
+| 2 | `sender_deg_out_local` | Sender out-degree **within** the batch subgraph | `local_degree` | yes |
+| 3 | `sender_deg_in_local` | Sender in-degree within subgraph | `local_degree` | yes |
+| 4 | `receiver_deg_out_local` | Receiver out-degree within subgraph | `local_degree` | yes |
+| 5 | `receiver_deg_in_local` | Receiver in-degree within subgraph | `local_degree` | yes |
+| 6 | `deg_sum_out_local` | `sender_deg_out_local + receiver_deg_out_local` | `local_degree` | yes |
+| 7 | `deg_sum_in_local` | `sender_deg_in_local + receiver_deg_in_local` | `local_degree` | yes |
+| 8 | `sender_clustering_local` | Undirected local clustering coeff. of sender in subgraph ([0, 1]) | `local_clustering` | no |
+| 9 | `receiver_clustering_local` | Same for receiver | `local_clustering` | no |
+| 10 | `mean_clustering_local` | Mean of sender and receiver local clustering | `local_clustering` | no |
+
+**Tier 0 — global** (9 cols; M1b+). Split-global node degrees precomputed per train/val/test day-split; **endpoint lift** to each seed edge. Lookup at train time — no leakage across splits.
+
+| Col block | Name | Definition | M2 group |
+|-----------|------|------------|----------|
+| per endpoint | `sender_deg_in`, `sender_deg_out`, `sender_deg_total` | In/out/total degree on **full split graph** | `global_degree` |
+| per endpoint | `receiver_deg_in`, `receiver_deg_out`, `receiver_deg_total` | Same for receiver | `global_degree` |
+| edge sums | `deg_sum_out_global`, `deg_sum_in_global`, `deg_sum_total_global` | Sums of sender + receiver endpoint degrees | `global_degree` |
+
+Precompute: `scripts/precompute_morphology_tier0.py` → `morphology_cache/{data}/{split}_node_morphology.csv`. M2 bins require `--morph_contrast_scope local+global`.
+
+**Edge-native** (4 cols; default on). Forward `edge_attr` gathered per seed (column 0 = synthetic `EdgeID`, excluded): timestamp, amount sent, sent currency, payment format. Disable with `--no_morph_edge_native`. M2 group: `edge_native`.
+
+**Tier 2 — betweenness centrality** (M3; offline precompute). Sampled Brandes BC per node on each split graph; endpoint lift to seed edges. `--morph_tier2_lift full` (4 cols) or `max` (1 col):
+
+| Name | Definition |
+|------|------------|
+| `sender_bc`, `receiver_bc` | BC of sender / receiver on split graph |
+| `bc_sum_global` | `sender_bc + receiver_bc` |
+| `bc_max_global` | `max(sender_bc, receiver_bc)` — only column when `lift=max` |
+
+Precompute: `scripts/precompute_morphology_tier2.py` → `{split}_node_tier2.csv` (column `bc`).
+
+**M2 contrast feature groups** (`--morph_contrast_features`, comma-separated). Bins are train-split quantile buckets per dimension (`--morph_contrast_bins`, default 5). Default: `local_ego,local_degree`. Disjoint contrast vs expert sets (Papagei) are **not implemented** — default overlaps expert on ego/degree.
+
+| Group | Columns binned |
+|-------|----------------|
+| `local_ego` | Tier 1 cols 0–1 |
+| `local_degree` | Tier 1 cols 2–7 |
+| `local_clustering` | Tier 1 cols 8–10 (opt-in) |
+| `global_degree` | Tier 0 lift block (needs `local+global` scope) |
+| `edge_native` | Edge-native block |
+
+Code: [`morphology/tier1_local.py`](morphology/tier1_local.py), [`morphology/tier0_global.py`](morphology/tier0_global.py), [`morphology/tier2_global.py`](morphology/tier2_global.py), [`morphology/contrast.py`](morphology/contrast.py).
+
 **Example — M2 pretrain (M1b expert + morphology contrast, Small-HI):**
 
 ```bash
@@ -180,7 +248,7 @@ python main.py \
   --tqdm --testing
 ```
 
-Use `--morph_contrast_scope local+global` and add `global_degree` to `--morph_contrast_features` to include Tier 0 bins. Add **`local_clustering`** to bin on sender/receiver/mean clustering (see Tier-1 table below). Diagnostic: `--morph_contrast` without `--morph_expert` (contrast-only).
+Use `--morph_contrast_scope local+global` and add `global_degree` to `--morph_contrast_features` to include Tier 0 bins. Add **`local_clustering`** to bin on sender/receiver/mean clustering (see [metrics reference](#morphology-metrics-reference)). Diagnostic: `--morph_contrast` without `--morph_expert` (contrast-only).
 
 **Example — M2 with local clustering bins (M1b expert + triadic soft positives):**
 
@@ -203,16 +271,6 @@ python main.py \
   --morph_val_every 2 --morph_val_max_batches 10 \
   --tqdm --testing
 ```
-
-**Tier-1 local features** (always included when `--morph_expert` is on; computed on **view1** subgraph):
-
-| Index | Name | M2 group | log1p in expert? |
-|-------|------|----------|------------------|
-| 0–1 | `n_edges_sub`, `n_nodes_sub` | `local_ego` | yes |
-| 2–7 | sender/receiver degrees, degree sums | `local_degree` | yes |
-| 8–10 | `sender_clustering_local`, `receiver_clustering_local`, `mean_clustering_local` | `local_clustering` | no (in [0, 1]) |
-
-`local_ego` is the M2 binning group for subgraph **edge and node counts** in the current batch (batch-local scale, not a precomputed fixed-hop ego network). Clustering uses **undirected** local clustering on the batch subgraph: closed triangles → 1.0, chains → 0.0. No extra CLI flag — it is part of `LOCAL_FEATURE_NAMES` in [`morphology/tier1_local.py`](morphology/tier1_local.py).
 
 **Example — M1b pretrain (recommended morph expert config; includes clustering since Jun 2026):**
 
@@ -278,7 +336,7 @@ Then run **extract → probe** as in the primary workflow (same `--unique_name`)
 - **Morphology expert path:** **M1b** @ 20 ep (8 local dims) — best morph-only config (0.920 AUROC). **MAE expert loss** (`--morph_expert_loss mae`) did not improve AUROC vs MSE (0.898 vs 0.903 on same 11-dim targets).
 - **Morphology negatives:** stacking BC on M1b hurts; M5a grouped heads did not fix interference (0.887 AUROC). See [`notes/morphology-metrics-plan.md`](notes/morphology-metrics-plan.md).
 
-Results: `embeddings/{unique_name}/probe_results.json`. Metric definitions: [Key concepts & metrics](#key-concepts-and-metrics). Design detail, metric tiers, and phased roadmap: [`notes/morphology-metrics-plan.md`](notes/morphology-metrics-plan.md).
+Results: `embeddings/{unique_name}/probe_results.json`. Morphology metric definitions: [Morphology metrics reference](#morphology-metrics-reference). Training/eval concepts: [Key concepts & metrics](#key-concepts-and-metrics). Phased roadmap: [`notes/morphology-metrics-plan.md`](notes/morphology-metrics-plan.md).
 
 ### Supervised baseline (original Multi-GNN)
 
@@ -569,7 +627,7 @@ Contrastive pretrain never uses AML labels in the loss loop. Downstream evaluati
 
 | Concept | What it does |
 |---------|--------------|
-| **`local_ego`** | M2 binning group for Tier-1 cols 0–1: `n_edges_sub`, `n_nodes_sub` — size of the **sampled subgraph** around each seed in the current batch (batch-local “ego” scale) |
+| **`local_ego`** | M2 group for cols 0–1 (`n_edges_sub`, `n_nodes_sub`): **batch subgraph** edge/node counts — **one value per batch**, shared by all seeds. See [Morphology metrics reference](#morphology-metrics-reference) |
 | **`log1p` targets** | Before expert MSE/MAE, count-like morphology columns (ego, degrees, BC) get `log1p(x)`; clustering coeffs stay in **[0, 1]**. Not a separate loss — a target transform in `transform_morph_targets()` |
 | **Disjoint contrast vs expert** | Papagei uses different morphology signals for contrast bins vs expert regression. **Not implemented here** — default `--morph_contrast_features local_ego,local_degree` overlaps the expert’s ego/degree targets |
 | **Morph val throttling** | `--morph_val_every N` skips full morph val on most epochs; `--morph_val_max_batches K` caps val batches per pass. Always runs on the final epoch. Feeds `--checkpoint_policy best` |

@@ -11,6 +11,8 @@ This document owns **morphology metric selection**, **computation strategy** (in
 
 The contrastive plan continues to own objective routing, homo/hetero training, extraction, and AML linear probe evaluation.
 
+**Metric definitions (concise):** see README § [Morphology metrics reference](../README.md#morphology-metrics-reference) — all Tier 0/1/2 columns, edge-native fields, M2 groups, expert target dims, and the `log1p` rule in one place. This document adds compute strategy, phased implementation, and benchmark results.
+
 ---
 
 ## Project status (Jun 2026)
@@ -293,6 +295,8 @@ Production contrastive runs use **large seed batches** (e.g. `--batch_size 32768
 
 ## Metric tiers
 
+> **Glossary:** column-by-column definitions → [README § Morphology metrics reference](../README.md#morphology-metrics-reference).
+
 **Legend:** ✅ implemented in code · 🔌 wired into M1 expert loss · ⏳ planned · — not started
 
 | Tier | In M1 expert loss today | Library / plumbing only |
@@ -334,8 +338,8 @@ Computed on **forward edges and nodes present in the current seed batch subgraph
 
 | Status | Metric | Level | Code name(s) | Notes |
 |--------|--------|-------|--------------|-------|
-| ✅ 🔌 | Subgraph edge count | Edge / local | `n_edges_sub` | Ego scale proxy; log1p in M1 |
-| ✅ 🔌 | Subgraph node count | Edge / local | `n_nodes_sub` | Ego scale proxy; log1p in M1 |
+| ✅ 🔌 | Subgraph edge count | Edge / local | `n_edges_sub` | **Batch-level:** total edges in view1 subgraph; **same value for every seed in the batch** (M2 group `local_ego`); log1p in expert |
+| ✅ 🔌 | Subgraph node count | Edge / local | `n_nodes_sub` | **Batch-level:** unique nodes in that subgraph; not per-seed k-hop ego; log1p in expert |
 | ✅ 🔌 | Sender out/in degree *within subgraph* | Node | `sender_deg_out_local`, `sender_deg_in_local` | **`morph_local`** — differs from global degree |
 | ✅ 🔌 | Receiver out/in degree *within subgraph* | Node | `receiver_deg_out_local`, `receiver_deg_in_local` | Same |
 | ✅ 🔌 | Out/in degree **sum** on subgraph endpoints | Edge | `deg_sum_out_local`, `deg_sum_in_local` | **`deg_sum_local`** — do not confuse with Tier 0 global sum |
