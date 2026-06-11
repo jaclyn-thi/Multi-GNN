@@ -178,6 +178,18 @@ Label-free structural features attached to each **seed transaction** during cont
 
 **`log1p` rule:** count-like columns (ego, degrees, global lift, BC) are transformed with `log1p` before expert loss. Clustering coefficients stay in **[0, 1]**. Edge-native attributes are used as-is.
 
+**Tier 0 — global** (9 cols; M1b+). Split-global node degrees precomputed per train/val/test day-split; **endpoint lift** to each seed edge. Lookup at train time — no leakage across splits.
+
+| Col block | Name | Definition | M2 group |
+|-----------|------|------------|----------|
+| per endpoint | `sender_deg_in`, `sender_deg_out`, `sender_deg_total` | In/out/total degree on **full split graph** | `global_degree` |
+| per endpoint | `receiver_deg_in`, `receiver_deg_out`, `receiver_deg_total` | Same for receiver | `global_degree` |
+| edge sums | `deg_sum_out_global`, `deg_sum_in_global`, `deg_sum_total_global` | Sums of sender + receiver endpoint degrees | `global_degree` |
+
+Precompute: `scripts/precompute_morphology_tier0.py` → `morphology_cache/{data}/{split}_node_morphology.csv`. M2 bins require `--morph_contrast_scope local+global`.
+
+**Edge-native** (4 cols; default on). Forward `edge_attr` gathered per seed (column 0 = synthetic `EdgeID`, excluded): timestamp, amount sent, sent currency, payment format. Disable with `--no_morph_edge_native`. M2 group: `edge_native`.
+
 **Tier 1 — local** (11 cols; always on when `--morph_expert` is set). Stats on the **batch subgraph** from `LinkNeighborLoader` — what message passing actually sees, not the full split graph.
 
 | Col | Name | Definition | M2 group | log1p? |
@@ -193,18 +205,6 @@ Label-free structural features attached to each **seed transaction** during cont
 | 8 | `sender_clustering_local` | Undirected local clustering coeff. of sender in subgraph ([0, 1]) | `local_clustering` | no |
 | 9 | `receiver_clustering_local` | Same for receiver | `local_clustering` | no |
 | 10 | `mean_clustering_local` | Mean of sender and receiver local clustering | `local_clustering` | no |
-
-**Tier 0 — global** (9 cols; M1b+). Split-global node degrees precomputed per train/val/test day-split; **endpoint lift** to each seed edge. Lookup at train time — no leakage across splits.
-
-| Col block | Name | Definition | M2 group |
-|-----------|------|------------|----------|
-| per endpoint | `sender_deg_in`, `sender_deg_out`, `sender_deg_total` | In/out/total degree on **full split graph** | `global_degree` |
-| per endpoint | `receiver_deg_in`, `receiver_deg_out`, `receiver_deg_total` | Same for receiver | `global_degree` |
-| edge sums | `deg_sum_out_global`, `deg_sum_in_global`, `deg_sum_total_global` | Sums of sender + receiver endpoint degrees | `global_degree` |
-
-Precompute: `scripts/precompute_morphology_tier0.py` → `morphology_cache/{data}/{split}_node_morphology.csv`. M2 bins require `--morph_contrast_scope local+global`.
-
-**Edge-native** (4 cols; default on). Forward `edge_attr` gathered per seed (column 0 = synthetic `EdgeID`, excluded): timestamp, amount sent, sent currency, payment format. Disable with `--no_morph_edge_native`. M2 group: `edge_native`.
 
 **Tier 2 — betweenness centrality** (M3; offline precompute). Sampled Brandes BC per node on each split graph; endpoint lift to seed edges. `--morph_tier2_lift full` (4 cols) or `max` (1 col):
 
