@@ -1,4 +1,6 @@
-# Literature review — development index
+# Literature review — development index (local / not linked from README)
+
+> **Internal reference only.** Local PDF paths under `lit review/` are not in the public repo. For citations, use README § References; for implementation mapping, use [`morphology-metrics-plan.md`](morphology-metrics-plan.md) and [`contrastive-learning-plan.md`](contrastive-learning-plan.md).
 
 Companion to [`contrastive-learning-plan.md`](contrastive-learning-plan.md) and [`morphology-metrics-plan.md`](morphology-metrics-plan.md).
 

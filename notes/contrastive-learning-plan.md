@@ -138,7 +138,7 @@ The six phases below are preserved from the original implementation plan, but ea
 4. **Contrastive projection head (Jun 2026)**
    - Optional GraphCL-style MLP (`--contrast_projection_head`) applied to seed embeddings **before InfoNCE only**
    - Morphology expert and frozen extraction use encoder `z` without the projector
-   - Large gain on Small-HI: plain contrastive probe AUROC 0.839 → **0.927** with projection (see [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md))
+   - Large gain on Small-HI: plain contrastive probe AUROC 0.839 → **0.927** with projection; M1b + clustering + projection reaches **0.929** (see morphology plan Project status)
 
 #### Important divergences from the original plan
 - The original plan described this as a future change; it is now already part of the current codebase
@@ -411,7 +411,7 @@ Writes `embeddings/{unique_name}/{train,val,test}.npz` and `meta.json`.
 - **Script:** `scripts/label_efficiency_probe.py` (reuses `linear_probe.py` fit/eval helpers)
 - **Defaults:** train fractions `0.1, 0.25, 0.5, 1.0` (stratified subsample); val threshold tuning unchanged
 - **Batch:** `--unique_names` loops multiple embedding dirs; writes per-run JSON + `embeddings/label_efficiency_summary.json`
-- **Slurm:** `run_label_efficiency.sh` (`--mem=128G`, `--probe_n_jobs 1`)
+- **Cluster:** label-efficiency needs ~128G RAM, `--probe_n_jobs 1` (see README)
 - **Not a replacement** for Phase 5b full-label `probe_results.json`; run both when comparing M1b vs M2 under label scarcity
 
 **Results (Jun 2026, nine encoders):** **Contrastive + projection** beats plain M1b at all train fractions (test AUROC: 0.906–0.928 vs 0.896–0.919). **M1b + projection** is best at **10%** labels (0.918). Plain M1b still beats plain contrastive at all fractions (+0.056 to +0.078). M2 does not outperform M1b or projection encoders under scarcity. See [`morphology-metrics-plan.md`](morphology-metrics-plan.md) § Label-efficiency results.
@@ -464,7 +464,7 @@ Writes `embeddings/{unique_name}/{train,val,test}.npz` and `meta.json`.
 
 3. **Documentation update**
    - `README.md` — GFM workflow, CLI reference, Small-HI benchmarks, Slurm scripts, label-efficiency
-   - `notes/morphology-metrics-plan.md`, `notes/lit-review-index.md`, `notes/projection-head-ablation-jun2026.md`
+   - `notes/morphology-metrics-plan.md`, `README.md` (Key concepts & metrics)
    - this plan (phase status and Jun 2026 results)
 
 #### Important divergences from the original plan
@@ -475,7 +475,7 @@ Writes `embeddings/{unique_name}/{train,val,test}.npz` and `meta.json`.
 #### Remaining work in this phase
 1. ~~explicit `--objective` and graph form via `--reverse_mp`~~ (done in Phase 4a)
 2. ~~update README with GFM framing and Slurm invocations~~ (done Jun 2026)
-3. ~~document recommended comparison workflow~~ (in `README.md` and lit-review index)
+3. ~~document recommended comparison workflow~~ (in `README.md` and morphology plan)
 4. **Keep benchmarks current** after new ablations (clustering+proj LE pending)
 5. document practical run guidance (also in `README.md` Slurm section):
    - AMP may be unstable at high fanout
@@ -586,7 +586,7 @@ Summary of that plan:
 | **Phases** | M0 plumbing → M1 local expert head → M2 local morph contrast → M3 Tier 2 globals |
 | **VRAM @ large B** | No dense `(B,B)` morphology masks; bin-grouped pairing — see morphology plan § **GPU memory & batch scale** |
 
-Contrastive plan still owns: homo/hetero contrastive routing, extraction, linear probe, **no AML F1 in pretrain**, **contrastive projection head**. Morphology plan owns metric definitions and loss integration. Projection ablation: [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md).
+Contrastive plan still owns: homo/hetero contrastive routing, extraction, linear probe, **no AML F1 in pretrain**, **contrastive projection head**. Morphology plan owns metric definitions, phased implementation (M0–M5), and loss integration. Benchmark numbers: morphology plan Project status + README benchmark table.
 
 **Prerequisite:** stable contrastive + probe baseline — met (May–Jun 2026 Small-HI). Plain contrastive ~0.84; **contrastive+projection ~0.93**; supervised ~0.97 test AUROC at 20 ep. Morphology ablations (M1–M5) and projection ablation complete on Small-HI. **Tier-1 local clustering** (11-dim expert, optional `local_clustering` M2 group) implemented Jun 2026 — see morphology plan Phase M1c.
 
@@ -599,6 +599,6 @@ Contrastive plan still owns: homo/hetero contrastive routing, extraction, linear
 - The most important architectural win was making the loss scale with shared seed edges rather than full sampled subgraph edges.
 - **`return_embeddings=True`** is the extraction hook; extraction and sklearn probe are the primary downstream path (Phases 5a/5b).
 - **Jun 2026 status:** Small-HI benchmark matrix largely complete. **Full-label SSL leader:** M1b+clustering+projection (**0.929** AUROC). MAE expert ablation done (0.898, below MSE).
-- **Best SSL recipe:** **Full labels:** M1b + clustering + projection (`hi_morphology_global_clustering_proj_20ep_bestckpt`). **Label-efficiency @ 25–100%:** contrastive+proj (pending re-check after clustering+proj LE). **@ 10%:** M1b+proj (0.918). See [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md).
+- **Best SSL recipe:** **Full labels:** M1b + clustering + projection (`hi_morphology_global_clustering_proj_20ep_bestckpt`). **Label-efficiency @ 25–100%:** contrastive+proj (pending re-check after clustering+proj LE). **@ 10%:** M1b+proj (0.918). See README benchmark table and morphology plan § Label-efficiency.
 - **Pretrain checkpoint selection:** eventually contrastive val / morphology—not AML probe val.
 - **Declined:** per-epoch AML probe during contrastive; using AML val to pick encoder weights during pretrain; treating end-to-end `--finetune` CE as the definition of GFM downstream success.

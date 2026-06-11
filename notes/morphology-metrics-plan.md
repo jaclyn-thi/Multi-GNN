@@ -34,8 +34,8 @@ The contrastive plan continues to own objective routing, homo/hetero training, e
 | M3 M1b + bc_max | `hi_morphology_global_bc_max_20ep_bestckpt` | 20 | 0.902 | 0.889 | 0.086 | stack still hurts; 1 BC col ≠ fix |
 | M5a grouped BC (`w_tier2=0`) | `hi_morph_grouped_bc_w0_20ep_bestckpt` | 19 | 0.914 | 0.885 | 0.043 | 4 heads ≠ M1b sanity; below M1b |
 | M5a grouped BC (`w_tier2=1`) | `hi_morph_grouped_bc_w1.0_20ep_bestckpt` | 20 | 0.919 | 0.887 | 0.028 | worse than shared M3 stack (0.896) |
-| Contrastive + proj head | `hi_contrastive_proj_20ep_bestckpt` | 20 | **0.941** | **0.927** | **0.144** | no morph expert; see [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md) |
-| M1b + proj head | `hi_morphology_global_proj_20ep_bestckpt` | **15** | 0.934 | 0.924 | 0.096 | AUROC ↑ vs M1b, F1 ↓; same note |
+| Contrastive + proj head | `hi_contrastive_proj_20ep_bestckpt` | 20 | **0.941** | **0.927** | **0.144** | no morph expert |
+| M1b + proj head | `hi_morphology_global_proj_20ep_bestckpt` | **15** | 0.934 | 0.924 | 0.096 | AUROC ↑ vs M1b, F1 ↓ at val-tuned threshold |
 | M1b + clustering expert | `hi_morphology_global_clustering_20ep` | 20 | 0.917 | 0.903 | 0.117 | 11 local dims; AUROC ↓ vs M1b, F1 ↑ |
 | M1b + clustering + proj | `hi_morphology_global_clustering_proj_20ep_bestckpt` | 20 | **0.930** | **0.929** | **0.156** | **best full-label SSL**; clustering hurts alone, wins with projection |
 | M1b + MAE expert | `hi_morphology_global_mae_20ep_bestckpt` | 20 | 0.910 | 0.898 | 0.145 | MAE ↓ vs MSE clustering run (0.903); F1 ↑ |
@@ -43,7 +43,7 @@ The contrastive plan continues to own objective routing, homo/hetero training, e
 **Takeaways (Jun 2026):**
 
 - **Best full-label SSL:** **M1b + clustering + projection** — test AUROC **0.929** / F1 **0.156** (`hi_morphology_global_clustering_proj_20ep_bestckpt`). Clustering expert alone regressed (0.903); with projection it beats contrastive+proj (0.927). Interaction effect, not monotonic morphology stacking.
-- **Contrast projection head (Jun 4):** contrastive-only + proj **0.927** / **0.144** F1; M1b+proj **0.924** / **0.096** F1. Details: [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md).
+- **Contrast projection head (Jun 4):** contrastive-only + proj **0.927** / **0.144** F1; M1b+proj **0.924** / **0.096** F1. Clustering+proj later reached **0.929** AUROC (table above).
 - **Default SSL recipe (full-label):** clustering + projection. **Label-efficiency @ 25–100%:** contrastive+proj (0.918–0.928); **@ 10%:** M1b+proj (0.918). Clustering+proj LE **pending**.
 - **M1b expert-only (8 local dims)** remains best **morph-only** full-label config (0.920 AUROC); plain M1b still beats plain contrastive under label scarcity but trails all projection encoders.
 - **M4** helps expert+M2 vs last-epoch saves but does **not** beat M1b on AUROC.
@@ -70,7 +70,7 @@ The contrastive plan continues to own objective routing, homo/hetero training, e
 3. Tune classification threshold on the **full val** split (same as `linear_probe.py`).
 4. Report **val/test AUROC** (primary) and F1 at the val-tuned threshold.
 
-**Implementation:** [`scripts/label_efficiency_probe.py`](../scripts/label_efficiency_probe.py) · batch Slurm: [`run_label_efficiency.sh`](../run_label_efficiency.sh) (`#SBATCH --mem=128G`, `--probe_n_jobs 1` — full `train.npz` is ~3.2M×128 floats; multiprocessing sklearn can OOM).
+**Implementation:** [`scripts/label_efficiency_probe.py`](../scripts/label_efficiency_probe.py). On cluster: request **~128G RAM**, CPU-only, `--probe_n_jobs 1` (full `train.npz` is ~3.2M×128 floats; multiprocessing sklearn can OOM).
 
 **Outputs:**
 
@@ -131,8 +131,6 @@ The contrastive plan continues to own objective routing, homo/hetero training, e
 **Reproduce:**
 
 ```bash
-sbatch run_label_efficiency.sh
-# or locally:
 python scripts/label_efficiency_probe.py \
   --unique_names hi_morphology_global_20ep hi_contrastive_20ep \
   --class_weight model --model gin --testing
@@ -269,7 +267,7 @@ You do **not** precompute morphology for every possible subgraph sample (stochas
 
 ## GPU memory & batch scale (mandatory for implementers)
 
-Production contrastive runs use **large seed batches** (e.g. `--batch_size 32768` in [`smoketest.sh`](../smoketest.sh)) so steps amortize subgraph sampling. Morphology code must stay compatible with that scale.
+Production contrastive runs use **large seed batches** (e.g. `--batch_size 32768`) so steps amortize subgraph sampling. Morphology code must stay compatible with that scale.
 
 **Do not materialize dense seed–seed structures** whose memory grows as **O(B²)** in the number of shared seed edges `B` per step, unless there is an explicit, documented cap and a sparse fallback. Examples to avoid on the training hot path:
 
@@ -489,6 +487,23 @@ Morphology should not block the core pipeline, but implementation starts after:
 
 ## Implementation plan
 
+Phases are listed in dependency order below. The README morphology table (M1 / M1b / M2 / …) is a short summary; this section is the full write-up.
+
+| Phase | Topic | Status |
+|-------|-------|--------|
+| **M0** | Spec & plumbing (no new loss) | ✅ |
+| **M1** | Expert head, Tier-1 local targets | ✅ |
+| **M1b** | Tier-0 global endpoint lift in expert | ✅ |
+| **M1c** | Tier-1 local clustering in expert (+ optional M2 group) | ✅ |
+| **M2** | Morphology-aware contrast (soft positives) | ✅ |
+| **M3** | Tier-2 BC precompute + expert wiring | ✅ Phase 0–1 |
+| **M4** | Checkpoint policy (`--checkpoint_policy best`) | ✅ |
+| **M5** | Expert head layout (grouped / per-metric) | M5a ✅ · M5b proposed |
+
+**Not implemented (Papagei-inspired):** disjoint morphology feature sets for contrast bins vs expert targets (default overlap: `local_ego`, `local_degree`).
+
+---
+
 ### Phase M0 — specification & plumbing (no new loss) ✅
 
 - [x] Document `from_id` / `to_id` / `EdgeID` join → [`morphology/IDS.md`](../morphology/IDS.md).
@@ -584,12 +599,12 @@ Expert target dim with defaults: local **11** + global **9** + edge-native **4**
 
 **Benchmark:**
 
-| Run | Script | `unique_name` | Result vs baseline |
-|-----|--------|---------------|-------------------|
-| M1b + clustering expert | [`ablation_m1b_clustering_20ep.sh`](../ablation_m1b_clustering_20ep.sh) | `hi_morphology_global_clustering_20ep` | ✅ full-label **0.903** / **0.117** F1; LE **0.877–0.908** AUROC — below M1b at all fractions |
-| M1b + clustering + projection | [`ablation_m1b_clustering_projection_20ep.sh`](../ablation_m1b_clustering_projection_20ep.sh) | `hi_morphology_global_clustering_proj_20ep_bestckpt` | ✅ **0.929** / **0.156** — best SSL; LE pending |
-| M1b + MAE expert loss | [`ablation_m1b_mae_20ep.sh`](../ablation_m1b_mae_20ep.sh) | `hi_morphology_global_mae_20ep_bestckpt` | ✅ **0.898** / **0.145** — below MSE 0.903 |
-| M1b + M2 + clustering bins | [`ablation_m1b_clustering_m2_10ep.sh`](../ablation_m1b_clustering_m2_10ep.sh) | `hi_morph_global_clustering_m2_10ep_bestckpt` | ⏳ pending (low priority) |
+| Run | `unique_name` | Result vs baseline |
+|-----|---------------|-------------------|
+| M1b + clustering expert | `hi_morphology_global_clustering_20ep` | ✅ full-label **0.903** / **0.117** F1; LE **0.877–0.908** AUROC — below M1b at all fractions |
+| M1b + clustering + projection | `hi_morphology_global_clustering_proj_20ep_bestckpt` | ✅ **0.929** / **0.156** — best SSL; LE pending |
+| M1b + MAE expert loss | `hi_morphology_global_mae_20ep_bestckpt` | ✅ **0.898** / **0.145** — below MSE 0.903 |
+| M1b + M2 + clustering bins | `hi_morph_global_clustering_m2_10ep_bestckpt` | ⏳ pending (low priority) |
 
 **Example — M1b with clustering (expert only):**
 
@@ -649,14 +664,14 @@ Contrast-only confirms the expert head carries representation quality; soft posi
 
 **Phase 0 (implemented):** BC precompute + endpoint lift plumbing.
 
-- [x] Offline approximate betweenness per split (`scripts/precompute_morphology_tier2.py`, `run_precompute_morphology_tier2.sh`).
+- [x] Offline approximate betweenness per split ([`scripts/precompute_morphology_tier2.py`](../scripts/precompute_morphology_tier2.py); run on ~128G RAM — login node can OOM on Small-HI).
 - [x] Endpoint lift in `morphology/tier2_global.py`; tests `tests/test_morphology_tier2.py`.
 
 **Phase 1 (implemented + benchmarked):** BC in morphology expert head.
 
 - [x] `--morph_targets local+global+tier2` (M1b + BC) and `local+tier2` (BC-only global ablation).
 - [x] `--morph_tier2_cache`, `--morph_tier2_lift {full,max}` (`full` = 4 cols; `max` = `bc_max_global` only).
-- [x] Slurm: `run_m3_phase1_bc_expert.sh` (extract/probe only), `ablation_morph_bc_only_20ep.sh`, `ablation_morph_bc_max_global_20ep.sh`.
+- [x] Ablations benchmarked: `hi_morphology_bc_only_20ep_bestckpt`, `hi_morphology_global_bc_max_20ep_bestckpt` (see Project status).
 
 **Small-HI M3 findings (Jun 2026):**
 
@@ -669,9 +684,23 @@ Contrast-only confirms the expert head carries representation quality; soft posi
 **Interpretation:** split-global BC **did not improve** the AML linear probe when stacked on global degree lift. Global degrees may already capture most useful hub/broker signal on Small-HI; extra BC dims + shared MSE may add noise. **BC-only** and **bc_max-only** ablations still pending.
 
 - [ ] **Phase 2:** Optional coarse morph contrast on BC quantile bins (defer — M2 local bins underperform M1b).
-- [x] Precompute on Slurm (`run_precompute_morphology_tier2.sh`, 128G); login node OOM on graph load.
+- [x] Precompute on cluster (~128G RAM); login node OOM on Small-HI graph load.
 
 **Success criterion (Phase 1):** probe gain over M1b — **not met** for stacked BC.
+
+---
+
+### Phase M4 — features & checkpoint policy (optional → **recommended**) ✅
+
+- [ ] Option B: concat Tier-0 to `edge_attr` (ablation vs heads-only).
+- [x] **Save best checkpoint** by composite morph val (`morph/expert_val` + `morph/contrast_val`) or `loss/train`; `--checkpoint_policy best` (recommended for morph and projection runs).
+- [ ] (Future) hetero-safe `gradient_checkpointing` for larger contrastive batches.
+
+**CLI:** `--checkpoint_policy {last,best}` with `--save_model`. **Best** writes the lowest SSL val score to `checkpoint_{unique_name}.tar` (used by extraction) and the final epoch to `checkpoint_{unique_name}_last.tar`. Score = sum of available `morph/expert_val` and `morph/contrast_val` on morph-val epochs; plain contrastive uses `loss/train` every epoch.
+
+**Morph val throttling:** `--morph_val_every N` and `--morph_val_max_batches K` reduce the cost of morph val passes that feed M4 selection (see Phase M2).
+
+**Outcome (Jun 2026):** Last-epoch `hi_morph_global_contrast_20ep` had test AUROC **0.864**; with M4 best (morph val picked epoch 20) → **0.891** AUROC, **0.107** F1. Ten-epoch M4 best (epoch **9**) → **0.906** AUROC. Morph val score still favored later epochs on the 20 ep run — future work: probe-aware selection or early stopping, not only morph val sum.
 
 ---
 
@@ -742,13 +771,13 @@ Each head: Linear(128, h) → ReLU → Linear(h, 1)   [or small 2-layer MLP per 
 
 - Reuse `build_morph_targets()` slice indices (local / global / tier2 / edge-native order unchanged).
 - Checkpoint: `morph_expert_state_dict` → dict of block state dicts or prefixed keys.
-- **When to build M5a:** ~~after bc_only / bc_max~~ **done** — run `ablation_morph_grouped_wtier2_20ep.sh` (`WTIER2=0|0.5|1`).
+- **When to build M5a:** ~~after bc_only / bc_max~~ **done** — see `hi_morph_grouped_bc_w0_20ep_bestckpt` / `w1.0` in Project status.
 - **When to build M5b:** if M5a still shows BC/tier2 hurting easy metrics, or if per-metric logging shows one scalar dominating val loss.
 - **Not in scope for v1:** gating networks (full MoE routing), AML-aware checkpoint selection.
 
 **Success criterion:** new layout ≥ shared on M1b AUROC at matched epochs, **or** enables BC/tier2 with isolated weights without hurting degree/local metrics (diagnostic for M3 negative result).
 
-**Expert loss (MSE vs MAE):** Default `mse`; `mae` uses `F.l1_loss` on same log1p targets. **`ablation_m1b_mae_20ep.sh` done:** test AUROC **0.898** (below MSE 0.903); F1 **0.145**. MAE did not improve separability on Small-HI.
+**Expert loss (MSE vs MAE):** Default `mse`; `mae` uses `F.l1_loss` on same log1p targets. **`hi_morphology_global_mae_20ep_bestckpt`:** test AUROC **0.898** (below MSE 0.903); F1 **0.145**. MAE did not improve separability on Small-HI.
 
 **Contrastive projection head (implemented Jun 2026):** GraphCL-style MLP (`--contrast_projection_head`) maps encoder `z` before InfoNCE only; morphology expert and extraction still use raw **`embedding_head` output** `z ∈ R^128` (see `models.py`, `edge_identity_infonce_loss`). Checkpoint stores `contrast_projection_state_dict` for resume.
 
@@ -761,19 +790,7 @@ Each head: Linear(128, h) → ReLU → Linear(h, 1)   [or small 2-layer MLP per 
 | M1b + proj (`hi_morphology_global_proj_20ep_bestckpt`) | 0.924 | 0.096 | AUROC ↑ vs M1b; F1 ↓ at val-tuned threshold |
 | M1b (no proj) | 0.920 | 0.108 | morph-only baseline |
 
-Details: [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md). Slurm: `ablation_m1b_clustering_projection_20ep.sh`, `ablation_contrastive_projection_20ep .sh`, `ablation_m1b_projection_20ep.sh`.
-
----
-
-### Phase M4 — features & checkpoint policy (optional → **recommended**)
-
-- [ ] Option B: concat Tier-0 to `edge_attr` (ablation vs heads-only).
-- [x] **Save best checkpoint** by composite morph val (`morph/expert_val` + `morph/contrast_val`) or `loss/train`; `--checkpoint_policy best` (default for morph runs in `smoketest.sh`).
-- [ ] (Future) hetero-safe `gradient_checkpointing` for larger contrastive batches.
-
-**CLI:** `--checkpoint_policy {last,best}` with `--save_model`. **Best** writes the lowest SSL val score to `checkpoint_{unique_name}.tar` (used by extraction) and the final epoch to `checkpoint_{unique_name}_last.tar`. Score = sum of available `morph/expert_val` and `morph/contrast_val` on morph-val epochs; plain contrastive uses `loss/train` every epoch.
-
-**Outcome (Jun 2026):** Last-epoch `hi_morph_global_contrast_20ep` had test AUROC **0.864**; with M4 best (morph val picked epoch 20) → **0.891** AUROC, **0.107** F1. Ten-epoch M4 best (epoch **9**) → **0.906** AUROC. Morph val score still favored later epochs on the 20 ep run — future work: probe-aware selection or early stopping, not only morph val sum.
+See **Project status** table for full projection ablation numbers.
 
 ---
 
@@ -797,7 +814,7 @@ Details: [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun202
 | M1b + M2 + clustering bins | + `local_clustering` in contrast | ⏳ `hi_morph_global_clustering_m2_10ep_bestckpt` |
 | Supervised ref | CE | ✅ ~0.972 / ~0.493 |
 
-Match: data split, `num_neighs`, embedding dim, extract settings. Morph pretrain: `--checkpoint_policy best` in [`smoketest.sh`](../smoketest.sh).
+Match: data split, `num_neighs`, embedding dim, extract settings. Morph pretrain: `--checkpoint_policy best`.
 
 ---
 
@@ -829,17 +846,15 @@ Cross-reference: contrastive plan § “Related Future Direction: Morphology Met
 ## References in repo
 
 - **Morphology M0–M2:** `morphology/`, `morphology/IDS.md`, `scripts/precompute_morphology_tier0.py`, `tests/test_morphology_metrics.py`, `tests/test_morphology_contrast.py`, `tests/test_morph_val_schedule.py`
-- **M3 Phase 0–1:** `morphology/tier2_global.py`, `scripts/precompute_morphology_tier2.py`, `run_precompute_morphology_tier2.sh`, `run_m3_phase1_bc_expert.sh`, `tests/test_morphology_tier2.py`, `tests/test_morphology_expert_tier2.py`
-- **M3 ablations:** `ablation_morph_bc_only_20ep.sh`, `ablation_morph_bc_max_global_20ep.sh`
-- **Other ablations:** `ablation_morph_expert_weight_05_10ep.sh`
-- **Projection head:** `ablation_contrastive_projection_20ep .sh`, `ablation_m1b_projection_20ep.sh`, [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md)
-- **Tier-1 clustering / MAE:** `ablation_m1b_clustering_20ep.sh`, `ablation_m1b_clustering_projection_20ep.sh`, `ablation_m1b_mae_20ep.sh`, `ablation_m1b_clustering_m2_10ep.sh`, [`morphology/tier1_local.py`](../morphology/tier1_local.py)
+- **M3 Phase 0–1:** `morphology/tier2_global.py`, `scripts/precompute_morphology_tier2.py`, `tests/test_morphology_tier2.py`, `tests/test_morphology_expert_tier2.py`
+- **Projection head:** `models.py` (`--contrast_projection_head`), Project status table
+- **Tier-1 clustering / MAE:** [`morphology/tier1_local.py`](../morphology/tier1_local.py), `--morph_expert_loss {mse,mae}`
 - **M2 loss:** [`contrastive_loss.py`](../contrastive_loss.py) (`edge_identity_infonce_loss`, bin-grouped soft positives)
 - **M2 training glue:** [`morphology/contrastive_train.py`](../morphology/contrastive_train.py)
 - Edge readout (all models): `models.py` (`GINe`, `GATe`, PNA, `RGCN` — shared `embedding_head` on concat sender/receiver/edge)
 - Hetero contrastive: `training.py` (`train_hetero_contrastive`)
 - Seed edges: `train_util.py` (`get_hetero_seed_edge_ids`)
 - Probe eval: `linear_probe.py`, `embedding_extraction.py`
-- Label-efficiency: `scripts/label_efficiency_probe.py`, `run_label_efficiency.sh`, `tests/test_label_efficiency_probe.py`
+- Label-efficiency: `scripts/label_efficiency_probe.py`, `tests/test_label_efficiency_probe.py`
 - M4 checkpoint: `train_util.py` (`CheckpointTracker`, `--checkpoint_policy`), `tests/test_checkpoint_policy.py`
 - Results: `embeddings/*/probe_results.json`, `embeddings/*/label_efficiency_results.json`
