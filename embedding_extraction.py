@@ -150,6 +150,9 @@ def run_embedding_extraction(
             checkpoint_path(data_config, args.unique_name, finetuned=finetuned)
         ),
     }
+    dataset_spec = getattr(te_data, "dataset_spec_summary", None)
+    if dataset_spec is not None:
+        meta["dataset_spec"] = dataset_spec
     meta_path = out_dir / "meta.json"
     with meta_path.open("w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
