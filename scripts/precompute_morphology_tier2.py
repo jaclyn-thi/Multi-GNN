@@ -16,7 +16,7 @@ Example::
 
 Requires Tier 0 cache optional but recommended in same ``output_dir`` for joint metadata.
 
-**Memory:** Full Small-HI load with ``--reverse_mp --ego --ports`` needs ~128G RAM (same as training data prep). Use ``run_precompute_morphology_tier2.sh`` on Slurm; login nodes may OOM.
+**Memory:** Full Small-HI load with ``--reverse_mp --ego --ports`` needs ~128G RAM (same as training data prep). Use ``slurm/run_precompute_morphology_tier2.sh`` on Slurm; login nodes may OOM.
 """
 
 from __future__ import annotations

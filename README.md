@@ -19,6 +19,12 @@ Create and activate the conda environment:
 
 ```bash
 conda env create -f env.yml
+```
+
+On the cluster, load Miniforge before activating:
+
+```bash
+module load miniforge
 conda activate multignn
 ```
 
@@ -307,10 +313,17 @@ Then run **extract → probe** as in the primary workflow (same `--unique_name`)
 
 **Small-HI benchmark (linear probe, val-tuned threshold, GIN hetero):**
 
+> **Note:** This table is a **development sanity-check log** — quick runs to verify that flags, plumbing, and training recipes behave as expected while the system is still changing. Numbers here are useful for internal comparison but are **not** formal benchmark results. Once the stack stabilizes, we expect to run a smaller set of **recorded** experiments (fixed configs, seeds, and reporting) for papers and PI updates.
+
 | Run | Config | Epochs | Test AUROC | Test F1 |
 |-----|--------|--------|------------|---------|
-| **M1b + clustering + projection** | M1b + 11 local + `--contrast_projection_head` | 20 | **0.929** | **0.156** |
-| Contrastive + projection | `--contrast_projection_head` | 20 | 0.927 | 0.144 |
+| Contrastive + proj, **8192 negs** | asym; 8192 negs + queue; `bs=8192 accum=4` | 20 | **0.930** | 0.191 |
+| **M1b + clustering + projection** | M1b + 11 local + `--contrast_projection_head` | 20 | **0.929** | 0.156 |
+| M1b + sym + projection | M1b + 14 local + sym @ `bs=16384` | 20 | **0.930** | 0.134 |
+| M1b + clustering + triangles + proj | 14 local (`--morph_local_subset all`, default) | 20 | 0.912 | 0.145 |
+| Contrastive + proj, **symmetric** | sym InfoNCE + proj; `bs=16384 accum=2` | 20 | **0.929** | **0.222** |
+| Contrastive + proj, asym @ 16384 | confound control; 1024 negs; `bs=16384 accum=2` | 20 | 0.920 | 0.206 |
+| Contrastive + projection | asym InfoNCE + proj; `bs=32768` | 20 | 0.927 | 0.144 |
 | M1b + projection | M1b + projection head | 20 → **ep 15** | 0.924 | 0.096 |
 | M1b | `--morph_expert`, `local+global` (8 local dims) | 20 | 0.920 | 0.108 |
 | M1b + MAE expert | `--morph_expert_loss mae` | 20 | 0.898 | 0.145 |
@@ -329,11 +342,13 @@ Then run **extract → probe** as in the primary workflow (same `--unique_name`)
 | M2 contrast only | `--morph_contrast` (no expert) | 10 | 0.680 | 0.012 |
 | Supervised CE (in-GNN) | `--objective supervised` | — | ~0.972 | ~0.493 |
 
+> **Relax grid (Jun 11 2026):** [`notes/projection-head-ablation-jun2026.md`](notes/projection-head-ablation-jun2026.md). **Best contrastive+proj AUROC:** asym + 8192 negs (`hi_contrastive_proj_8192neg_20ep_bestckpt`, **0.930**). **Best contrastive+proj F1:** sym + 1024 @ `bs=16384` (**0.222**). Confound control: asym @ 16384 → F1 0.206 (batch size drives most F1 gain); sym adds +0.009 AUROC / +0.016 F1 vs asym at same batch.
+
 **Default SSL configs (Jun 2026):**
 
-- **Full-label frozen probe:** **M1b + clustering + projection** (`hi_morphology_global_clustering_proj_20ep_bestckpt`) — best test AUROC/F1 among SSL runs (**0.929 / 0.156**). Clustering expert alone regressed (0.903); stacking with projection beats contrastive+proj (0.927).
-- **Label-efficiency (10–100% train labels):** **contrastive + projection** leads at 25/50/100% (0.918–0.928 test AUROC); **M1b + projection** is best at **10%** labels (0.918). Label-efficiency on clustering+proj **pending**.
-- **Morphology expert path:** **M1b** @ 20 ep (8 local dims) — best morph-only config (0.920 AUROC). **MAE expert loss** (`--morph_expert_loss mae`) did not improve AUROC vs MSE (0.898 vs 0.903 on same 11-dim targets).
+- **Full-label frozen probe (AUROC):** **8192neg** or **M1b + sym + proj** (**0.930**); clustering+proj **0.929**. **Best F1 among SSL:** sym contrastive+proj only (**0.222**) — stacking morph on sym drops F1 to **0.134**.
+- **Label-efficiency (10–100% train labels):** **sym contrastive+proj** best @ **10%** (0.924 AUROC); **8192neg contrastive+proj** best @ **50–100%** (0.931); morphology clustering+proj still **0.916–0.930**. See label-efficiency table below.
+- **Morphology expert path:** **M1b** @ 20 ep (8 local dims) — best morph-only config (0.920 AUROC). **MAE expert loss** (`--morph_expert_loss mae`) did not improve AUROC vs MSE at full labels (0.898) or under label scarcity (0.872–0.898 LE).
 - **Morphology negatives:** stacking BC on M1b hurts; M5a grouped heads did not fix interference (0.887 AUROC). See [`notes/morphology-metrics-plan.md`](notes/morphology-metrics-plan.md).
 
 Results: `embeddings/{unique_name}/probe_results.json`. Morphology metric definitions: [Morphology metrics reference](#morphology-metrics-reference). Training/eval concepts: [Key concepts & metrics](#key-concepts-and-metrics). Phased roadmap: [`notes/morphology-metrics-plan.md`](notes/morphology-metrics-plan.md).
@@ -478,6 +493,7 @@ Requires `--objective contrastive` and `--morph_expert`. Adds `L_morph_expert` (
 | `--morph_expert_hidden` | `64` | Hidden size of each expert MLP (shared or per-block) |
 | `--morph_expert_layout` | `shared` | `shared` = one MLP; `grouped` = block heads + per-block MSE (M5a) |
 | `--morph_expert_group_weight_tier2` | `1.0` | Tier 2 block loss weight when `layout=grouped` (`0` disables BC gradients) |
+| `--morph_local_subset` | `all` | Tier-1 expert columns: `all` (14), `degree` (8), `clustering` (11, no triangles), `triangles` (11, no clustering) |
 | `--no_morph_edge_native` | off | Exclude forward `edge_attr` columns (timestamp, amount, currency, payment format) from morphology targets |
 
 ### Morphology-aware contrast (Phase M2)
@@ -518,7 +534,7 @@ Checkpoints with `--morph_expert` also store `morph_expert_state_dict`; with `--
 
 ### Label-efficiency probe (`scripts/label_efficiency_probe.py`)
 
-**Why:** Full-label probes favor **M1b + clustering + projection** (0.929 AUROC; LE pending), but AML teams often have only a **fraction** of train transactions labeled. GCPAL and Papagei evaluate SSL encoders under **label scarcity** — same frozen embeddings, less train supervision. This does **not** retrain the GNN. The Jun 2026 refresh (nine encoders) shows projection beats plain M1b at all fractions; **M1b + projection** still wins at **10%** labels.
+**Why:** Full-label probes favor **relax-grid contrastive+proj** (8192 negs **0.930** AUROC) or **M1b + clustering + projection** (**0.929**), but AML teams often have only a **fraction** of train transactions labeled. GCPAL and Papagei evaluate SSL encoders under **label scarcity** — same frozen embeddings, less train supervision. This does **not** retrain the GNN. Current LE summary (**15** encoders): **sym+proj @ 10%**; **8192neg @ 50–100%** AUROC.
 
 **How:** Stratified subsets of **train** labels (default 10/25/50/100%), logistic regression per fraction, threshold tuned on **full val**, metrics on val/test.
 
@@ -539,24 +555,29 @@ python scripts/label_efficiency_probe.py \
 
 **Outputs:** `embeddings/{unique_name}/label_efficiency_results.json`, `embeddings/label_efficiency_summary.json`.
 
-**Results (Jun 2026, test AUROC, ten encoders in summary):** Source: `embeddings/label_efficiency_summary.json`. Projection encoders lead vs plain M1b at every fraction; **M1b + projection** is strongest at **10%** labels.
+**Results (Jun 2026, test AUROC, 15 encoders in summary):** Source: `embeddings/label_efficiency_summary.json`. Same caveat as the benchmark table above — developmental comparisons, not a frozen evaluation protocol.
 
-| Train labels | M1b+proj | Contrastive+proj | M1b | M1b+clustering | Contrastive |
-|--------------|----------|------------------|-----|----------------|-------------|
-| 10% | **0.918** | 0.906 | 0.896 | 0.877 | 0.818 |
-| 25% | 0.922 | **0.918** | 0.910 | 0.892 | 0.849 |
-| 50% | 0.919 | **0.925** | 0.915 | 0.904 | 0.857 |
-| 100% | 0.922 | **0.928** | 0.919 | 0.908 | 0.863 |
+| Train labels | sym+proj | 8192neg+proj | clustering+proj | M1b+proj | Contrastive+proj (baseline) |
+|--------------|----------|--------------|-----------------|----------|----------------------------|
+| 10% | **0.924** | 0.917 | 0.916 | 0.918 | 0.906 |
+| 25% | **0.926** | 0.922 | **0.926** | 0.922 | 0.918 |
+| 50% | 0.929 | **0.931** | 0.930 | 0.919 | 0.925 |
+| 100% | 0.929 | **0.931** | 0.929 | 0.922 | 0.928 |
 
-**Pending label-efficiency:** `hi_morphology_global_clustering_proj_20ep_bestckpt`, `hi_morphology_global_mae_20ep_bestckpt`.
-
-Full tables and interpretation: [`notes/morphology-metrics-plan.md`](notes/morphology-metrics-plan.md) § Label-efficiency results. Source: `embeddings/label_efficiency_summary.json`.
+Full tables (incl. morph, M2, BC-only, asym@16384): [`notes/morphology-metrics-plan.md`](notes/morphology-metrics-plan.md) § Label-efficiency results.
 
 ---
 
 ## Slurm and cluster jobs
 
-Use the `python` commands in this README inside your own Slurm job scripts (`.sh` templates are local-only and not tracked in git).
+Slurm job scripts live in [`slurm/`](slurm/) (local-only, gitignored). Each script `cd`s to the repo root and runs the same `python` commands documented above. Submit from the repo root, e.g.:
+
+```bash
+sbatch slurm/ablation_contrastive_proj_sym_8192neg_20ep.sh
+bash slurm/submit_contrastive_relax_grid.sh sym8192   # one grid job at a time
+```
+
+`mit_normal_gpu` has a **6 h** cap — scripts use `#SBATCH -t 06:00:00`. Submit **one ablation at a time**. Symmetric / 8192-neg runs may still hit `TIME_LIMIT`; if so, edit the script to `mit_preemptable` and `-t 12:00:00` (preemption can kill the job — there is no mid-train resume; re-submit from scratch).
 
 **W&B on batch nodes:** `main.py` loads `.env` via `load_dotenv()`, but bare `wandb login` in a shell script does **not** read `.env` automatically. Either:
 

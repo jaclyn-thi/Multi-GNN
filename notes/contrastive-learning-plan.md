@@ -414,7 +414,7 @@ Writes `embeddings/{unique_name}/{train,val,test}.npz` and `meta.json`.
 - **Cluster:** label-efficiency needs ~128G RAM, `--probe_n_jobs 1` (see README)
 - **Not a replacement** for Phase 5b full-label `probe_results.json`; run both when comparing M1b vs M2 under label scarcity
 
-**Results (Jun 2026, nine encoders):** **Contrastive + projection** beats plain M1b at all train fractions (test AUROC: 0.906–0.928 vs 0.896–0.919). **M1b + projection** is best at **10%** labels (0.918). Plain M1b still beats plain contrastive at all fractions (+0.056 to +0.078). M2 does not outperform M1b or projection encoders under scarcity. See [`morphology-metrics-plan.md`](morphology-metrics-plan.md) § Label-efficiency results.
+**Results (Jun 2026, fifteen encoders):** Relax-grid **sym+proj** best @ **10%** (0.924); **8192neg+proj** best @ **50–100%** (0.931); morphology clustering+proj **0.916–0.930**. Developmental comparisons — see README sanity-check note. Full table: [`morphology-metrics-plan.md`](morphology-metrics-plan.md) § Relax-grid label-efficiency.
 
 #### What is implemented today (secondary path only)
 
@@ -428,11 +428,11 @@ Writes `embeddings/{unique_name}/{train,val,test}.npz` and `meta.json`.
 2. ~~**`linear_probe.py`**~~ (done)
 3. ~~**End-to-end benchmarks** on Small-HI (pretrain → extract → probe)~~ — done; contrastive+projection **0.927** test AUROC (Jun 2026)
 4. ~~**README / runbook**~~ — largely done (GFM workflow, CLI, Slurm, benchmarks in `README.md`)
-5. ~~**Label-efficiency refresh** with projection encoders~~ — done (nine encoders); contrastive+proj leads vs M1b at all fractions; M1b+proj best @ 10%
+5. ~~**Label-efficiency refresh** with projection encoders~~ — done (fifteen encoders); relax-grid sym @ 10%, 8192neg @ 50–100%
 6. **Optional:** encoder-only export in checkpoint for release
 7. **Optional:** `--freeze-encoder` + train only in-model linear layer (still not identical to sklearn probe unless head is a single `Linear`)
 8. ~~**Pretrain checkpoint policy** via contrastive val / morphology~~ → **done:** `--checkpoint_policy best` in `train_util.py` (see morphology plan M4)
-9. ~~**Label-efficiency benchmarks** (Phase 5c)~~ — ten encoders in summary; extend with clustering+proj and MAE when probed
+9. ~~**Label-efficiency benchmarks** (Phase 5c)~~ — twelve encoders in summary (incl. clustering+proj, MAE)
 10. **Not planned:** `--aml-eval` during contrastive; end-to-end `--finetune` as **primary** GFM metric
 
 ---
@@ -476,7 +476,7 @@ Writes `embeddings/{unique_name}/{train,val,test}.npz` and `meta.json`.
 1. ~~explicit `--objective` and graph form via `--reverse_mp`~~ (done in Phase 4a)
 2. ~~update README with GFM framing and Slurm invocations~~ (done Jun 2026)
 3. ~~document recommended comparison workflow~~ (in `README.md` and morphology plan)
-4. **Keep benchmarks current** after new ablations (clustering+proj LE pending)
+4. **Keep benchmarks current** after new ablations (development sanity-check table in README — formal recorded runs TBD)
 5. document practical run guidance (also in `README.md` Slurm section):
    - AMP may be unstable at high fanout
    - peak VRAM is dominated largely by sampled subgraph activations
@@ -514,7 +514,7 @@ Writes `embeddings/{unique_name}/{train,val,test}.npz` and `meta.json`.
    - ~~Decouple graph form / objective (4a)~~ · ~~Hetero contrastive (4b)~~ · ~~Phase 5a/5b/5c~~ · ~~projection head ablation~~
    - ~~**Label-efficiency with projection encoders**~~ — done: contrastive+proj beats M1b at all fractions; M1b+proj best @ 10%
    - Scale pretrain toward larger / less task-labeled finance graphs; keep AML labels for **probe/adapt** eval only
-   - **Tier-1 local clustering** — clustering+proj **0.929** full-label (best SSL); MAE expert **0.898** (no AUROC win); clustering+proj LE pending; M2 bins optional
+   - **Tier-1 local clustering** — clustering+proj **0.929** full-label (best SSL); LE **0.916–0.930**; MAE expert **0.898** / LE 0.872–0.898 (no win vs MSE); M2 bins optional
    - Optional: in-GNN `--finetune` as ablation only; encoder-only release artifact
 
 ---
@@ -551,6 +551,7 @@ Writes `embeddings/{unique_name}/{train,val,test}.npz` and `meta.json`.
      - morphology expert M1b vs M2 vs BC stacks (M1b best morph-only; projection beats all for full-label probe)
      - queue on vs off
      - `contrastive_num_neg_samples=512` vs `1024`
+     - **symmetric vs asymmetric InfoNCE** (relax grid): sym **0.929**/0.222 vs asym@16384 **0.920**/0.206 vs baseline asym **0.927**/0.144; **8192 negs** asym **0.930**/0.191 (Jun 11 — see projection ablation note)
      - batch size scaling
      - fanout scaling
      - AMP on vs off
@@ -598,7 +599,7 @@ Contrastive plan still owns: homo/hetero contrastive routing, extraction, linear
 - **May 2026 GFM decisions:** (1) no AML metrics during contrastive pretrain; (2) **primary** downstream = Papagei-style **frozen extract + sklearn linear probe**; (3) in-GNN `--finetune` supervised is **secondary**, not the main scientific claim.
 - The most important architectural win was making the loss scale with shared seed edges rather than full sampled subgraph edges.
 - **`return_embeddings=True`** is the extraction hook; extraction and sklearn probe are the primary downstream path (Phases 5a/5b).
-- **Jun 2026 status:** Small-HI benchmark matrix largely complete. **Full-label SSL leader:** M1b+clustering+projection (**0.929** AUROC). MAE expert ablation done (0.898, below MSE).
-- **Best SSL recipe:** **Full labels:** M1b + clustering + projection (`hi_morphology_global_clustering_proj_20ep_bestckpt`). **Label-efficiency @ 25–100%:** contrastive+proj (pending re-check after clustering+proj LE). **@ 10%:** M1b+proj (0.918). See README benchmark table and morphology plan § Label-efficiency.
+- **Jun 2026 status:** Small-HI benchmark matrix largely complete. **Relax grid (Jun 11):** asym+8192 negs **0.930** AUROC (best contrastive+proj); sym+1024 **0.929** AUROC / **0.222** F1 (best contrastive F1); asym@16384 confound shows batch size drives most F1 lift. See [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md). MAE expert ablation done (0.898, below MSE).
+- **Best SSL recipe (development):** **F1:** sym contrastive+proj (`hi_contrastive_proj_sym_20ep_bestckpt`, **0.222**). **AUROC:** 8192neg or M1b+sym+proj (**0.930**). **Morph (asym):** clustering+proj (**0.929** / 0.156). M1b+sym+proj does **not** beat sym F1 (0.134). README benchmark table is a sanity-check log, not formal recorded experiments.
 - **Pretrain checkpoint selection:** eventually contrastive val / morphology—not AML probe val.
 - **Declined:** per-epoch AML probe during contrastive; using AML val to pick encoder weights during pretrain; treating end-to-end `--finetune` CE as the definition of GFM downstream success.

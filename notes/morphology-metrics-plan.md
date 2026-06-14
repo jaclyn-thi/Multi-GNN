@@ -17,6 +17,8 @@ The contrastive plan continues to own objective routing, homo/hetero training, e
 
 ## Project status (Jun 2026)
 
+> **Benchmark numbers in this doc and in README** are **development sanity checks** (quick ablations while configs and code still change). They guide internal decisions but are not a formal, frozen evaluation suite. Recorded experiments for publication / PI milestones will use fixed recipes once the stack stabilizes.
+
 **Implemented:** M0 · M1 · M1b · **M1c Tier-1 local clustering** (Jun 2026) · M2 (+ `local_clustering` contrast group) · morphology val throttling · **M4 best checkpoint** · **label-efficiency probe** (incremental summary merge) · **M3 Phase 0–1** (BC precompute + expert wiring) · **contrastive projection head** (Jun 2026) · **`--morph_expert_loss {mse,mae}`** (Jun 2026).
 
 **Small-HI probe results (GIN, hetero, val-tuned F1, `linear_probe.py`):**
@@ -36,34 +38,42 @@ The contrastive plan continues to own objective routing, homo/hetero training, e
 | M3 M1b + bc_max | `hi_morphology_global_bc_max_20ep_bestckpt` | 20 | 0.902 | 0.889 | 0.086 | stack still hurts; 1 BC col ≠ fix |
 | M5a grouped BC (`w_tier2=0`) | `hi_morph_grouped_bc_w0_20ep_bestckpt` | 19 | 0.914 | 0.885 | 0.043 | 4 heads ≠ M1b sanity; below M1b |
 | M5a grouped BC (`w_tier2=1`) | `hi_morph_grouped_bc_w1.0_20ep_bestckpt` | 20 | 0.919 | 0.887 | 0.028 | worse than shared M3 stack (0.896) |
-| Contrastive + proj head | `hi_contrastive_proj_20ep_bestckpt` | 20 | **0.941** | **0.927** | **0.144** | no morph expert |
+| Contrastive + proj head | `hi_contrastive_proj_20ep_bestckpt` | 20 | **0.941** | **0.927** | **0.144** | asym InfoNCE; `bs=32768` |
+| Contrastive + proj, **8192 negs** | `hi_contrastive_proj_8192neg_20ep_bestckpt` | 20 | **0.953** | **0.930** | 0.191 | asym; `bs=8192 accum=4`; **best contrastive+proj AUROC** |
+| Contrastive + proj, **symmetric** | `hi_contrastive_proj_sym_20ep_bestckpt` | 20 | 0.939 | **0.929** | **0.222** | sym; `bs=16384 accum=2`; **best contrastive+proj F1** |
+| Contrastive + proj, asym @ 16384 | `hi_contrastive_proj_asym_16384_20ep_bestckpt` | 20 | 0.937 | 0.920 | 0.206 | confound control; asym; `bs=16384 accum=2` |
 | M1b + proj head | `hi_morphology_global_proj_20ep_bestckpt` | **15** | 0.934 | 0.924 | 0.096 | AUROC ↑ vs M1b, F1 ↓ at val-tuned threshold |
 | M1b + clustering expert | `hi_morphology_global_clustering_20ep` | 20 | 0.917 | 0.903 | 0.117 | 11 local dims; AUROC ↓ vs M1b, F1 ↑ |
 | M1b + clustering + proj | `hi_morphology_global_clustering_proj_20ep_bestckpt` | 20 | **0.930** | **0.929** | **0.156** | **best full-label SSL**; clustering hurts alone, wins with projection |
+| M1b + clustering + triangles + proj | `hi_morphology_global_triangles_proj_20ep_bestckpt` | 20 | 0.933 | **0.912** | 0.145 | 14 local dims; **regresses** vs clustering+proj (−0.017 AUROC); val→test gap −0.021 |
+| M1b + sym + proj | `hi_morphology_global_sym_proj_20ep_bestckpt` | 20 | 0.938 | **0.930** | 0.134 | M1b + 14 local + **sym** @ `bs=16384`; +0.001 AUROC vs sym-only; **−0.088 F1** vs sym (0.222) |
+| M1b + triangles-only + proj | `hi_morphology_global_triangles_only_proj_20ep_bestckpt` | 20 | 0.926 | 0.910 | 0.067 | 11 local (triangles); F1 collapse is **precision/threshold**, not pattern blind spots — see § Pattern typology |
 | M1b + MAE expert | `hi_morphology_global_mae_20ep_bestckpt` | 20 | 0.910 | 0.898 | 0.145 | MAE ↓ vs MSE clustering run (0.903); F1 ↑ |
 
 **Takeaways (Jun 2026):**
 
 - **Best full-label SSL:** **M1b + clustering + projection** — test AUROC **0.929** / F1 **0.156** (`hi_morphology_global_clustering_proj_20ep_bestckpt`). Clustering expert alone regressed (0.903); with projection it beats contrastive+proj (0.927). Interaction effect, not monotonic morphology stacking.
 - **Contrast projection head (Jun 4):** contrastive-only + proj **0.927** / **0.144** F1; M1b+proj **0.924** / **0.096** F1. Clustering+proj later reached **0.929** AUROC (table above).
-- **Default SSL recipe (full-label):** clustering + projection. **Label-efficiency @ 25–100%:** contrastive+proj (0.918–0.928); **@ 10%:** M1b+proj (0.918). Clustering+proj LE **pending**.
+- **Relax grid (Jun 11, contrastive+proj):** sym **0.929** AUROC / **0.222** F1; asym @ 16384 confound **0.920** / **0.206** (batch size drives ~80% of F1 lift vs baseline); asym + 8192 negs **0.930** AUROC / **0.191** F1 (best contrastive AUROC). See [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md).
+- **Default SSL recipe (full-label):** **F1** → sym contrastive+proj (**0.222**); **AUROC** → 8192neg or sym+morph (**0.930**). Morphology: clustering+proj (**0.929** / **0.156**). **Sym + morph expert does not combine wins** — `hi_morphology_global_sym_proj_20ep_bestckpt` ties AUROC (+0.001 vs sym) but F1 **0.134** (−0.088). **Label-efficiency:** sym @ 10% (0.924), 8192neg @ 50–100% (0.931). See § Relax-grid label-efficiency.
 - **M1b expert-only (8 local dims)** remains best **morph-only** full-label config (0.920 AUROC); plain M1b still beats plain contrastive under label scarcity but trails all projection encoders.
 - **M4** helps expert+M2 vs last-epoch saves but does **not** beat M1b on AUROC.
 - **Lowering `morph_expert_weight` to 0.5** hurt vs w=1.0 (0.876 vs 0.906 test AUROC).
 - **M3 BC stacked on M1b** hurt vs M1b (0.896 best / 0.861 last vs 0.920); **BC-only** (0.904) beats stacked — interference in shared MLP + unified MSE, not “BC is useless.”
 - **bc_max** (1 BC col on M1b) still **0.889** — fewer lift cols does not rescue the stack.
 - **M5a grouped heads** do **not** fix M3: `w_tier2=1` → 0.887 vs shared stack 0.896; **M5b per-metric deprioritized**.
-- **Label-efficiency (ten encoders in summary):** contrastive+proj beats M1b at all fractions (+0.010 @ 10%, +0.008 @ 25%, +0.010 @ 50%, +0.009 @ 100%). M1b+proj leads at **10%** only. M2 does **not** flip the ranking under scarcity.
-- **Tier-1 local clustering (M1c):** expert-only regressed (0.903 AUROC; LE 0.877–0.908). **With projection:** **0.929** AUROC — morphology value is conditional on training recipe.
+- **Label-efficiency (fifteen encoders in summary):** relax-grid **sym** best @ **10%** AUROC (0.924); **8192neg** best @ **50–100%** (0.931); **sym** best **F1** at all fractions (~0.20–0.22). Prior leaders: clustering+proj @ 25–100% (0.926–0.930), M1b+proj @ 10% (0.918). Baseline asym+proj (bs=32768) trails relax recipes by +0.003 to +0.018 AUROC.
+- **Tier-1 local clustering (M1c):** expert-only regressed (0.903 AUROC; LE 0.877–0.908). **With projection:** **0.929** AUROC — morphology value is conditional on training recipe (asym @ bs=32768; sym+morph does not recover sym F1).
 - **MAE vs MSE expert loss:** `--morph_expert_loss mae` → **0.898** test AUROC vs MSE baseline **0.903** (same 11-dim targets); no AUROC win; default MSE retained.
+- **Pattern typology (Jun 2026, six encoders):** **Projection unlocks FAN-OUT** — M1b worst type (5% recall) vs sym/8192neg best type (49–53%). **sym+proj** best overall flagger (F1 **0.222**, balanced typology). **8192neg+proj** best AUROC (**0.930**) and FAN-OUT ranking (0.970 one-vs-rest). **Clustering+proj** best gather/scatter AUROC (**0.971**). **triangles-only+proj** highest per-pattern recall at val-tuned thresholds on every type (48% known-meta) but worst F1 (0.067) — over-flags (~17.6K alerts, 3.6% precision), not pattern-blind; fixed @ 0.5: clustering wins F1 (**0.132** vs 0.075 tri-only). **tri+clust (14 local)** regresses vs clustering-only on AUROC and gather/scatter ranking. Full tables: [`downstream-eval-plan.md`](downstream-eval-plan.md) § pattern metadata · [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md) § Pattern typology cross-run.
 
-**Next:** label-efficiency on `hi_morphology_global_clustering_proj_20ep_bestckpt` · optional LE on MAE run.
+**Next:** fixed @ 0.5 typology on SSL leaders · tier-2 typology (baseline asym+proj, sym+morph) · optional sym+8192 (OOM) · external dataset spike (SAML-D or AMLSim).
 
 ---
 
 ## Label-efficiency evaluation (implemented)
 
-**Motivation:** Full-label linear probe (100% train AML labels) favors **contrastive + projection** (0.927 test AUROC, Jun 2026) over M1b (0.920) and expert+M2. In production AML, labeled illicit transactions are scarce — the relevant question (GCPAL, Papagei, RWTH) is: **with only 10–50% of train labels, which frozen encoder separates better?** The Jun 2026 refresh (nine encoders) shows projection beats plain M1b at all fractions; **M1b + projection** still wins at **10%** labels.
+**Motivation:** Full-label linear probe favors **relax-grid contrastive+proj** (8192 negs **0.930** AUROC) or **M1b + clustering + projection** (**0.929**). In production AML, labeled illicit transactions are scarce — the relevant question (GCPAL, Papagei, RWTH) is: **with only 10–50% of train labels, which frozen encoder separates better?** Current summary (**fifteen** encoders): **sym+proj @ 10%** AUROC; **8192neg @ 50–100%**; morphology clustering+proj still **0.916–0.930**.
 
 **Protocol (no encoder retraining):**
 
@@ -85,20 +95,31 @@ The contrastive plan continues to own objective routing, homo/hetero training, e
 
 ### Label-efficiency results (Jun 2026)
 
-**Source:** `embeddings/label_efficiency_summary.json` · **ten encoders** × four train fractions · `--class_weight model` · `--probe_max_iter 5000` · threshold tuned on **full val** (same protocol as full-label probe, but stratified train subsampling per fraction). Incremental runs merge into the summary (`scripts/label_efficiency_probe.py`).
+**Source:** `embeddings/label_efficiency_summary.json` · **fifteen encoders** × four train fractions · `--class_weight model` · `--probe_max_iter 5000` · threshold tuned on **full val** (same protocol as full-label probe, but stratified train subsampling per fraction). Incremental runs merge into the summary (`scripts/label_efficiency_probe.py`). Developmental comparisons only — see project-status note above.
 
 **Test AUROC by train label fraction (primary encoders):**
 
 | Encoder | `unique_name` | 10% | 25% | 50% | 100% |
 |---------|---------------|-----|-----|-----|------|
+| **M1b + clustering + projection** | `hi_morphology_global_clustering_proj_20ep_bestckpt` | 0.916 | **0.926** | **0.930** | **0.929** |
 | **M1b + projection** | `hi_morphology_global_proj_20ep_bestckpt` | **0.918** | 0.922 | 0.919 | 0.922 |
-| **Contrastive + projection** | `hi_contrastive_proj_20ep_bestckpt` | 0.906 | **0.918** | **0.925** | **0.928** |
+| **Contrastive + projection** | `hi_contrastive_proj_20ep_bestckpt` | 0.906 | 0.918 | 0.925 | 0.928 |
 | M1b (8 local dims) | `hi_morphology_global_20ep` | 0.896 | 0.910 | 0.915 | 0.919 |
-| M1b + clustering expert | `hi_morphology_global_clustering_20ep` | 0.877 | 0.892 | 0.904 | 0.908 |
+| M1b + clustering expert (MSE) | `hi_morphology_global_clustering_20ep` | 0.877 | 0.892 | 0.904 | 0.908 |
+| M1b + MAE expert | `hi_morphology_global_mae_20ep_bestckpt` | 0.872 | 0.885 | 0.894 | 0.898 |
 | M3 BC-only | `hi_morphology_bc_only_20ep_bestckpt` | 0.889 | 0.897 | 0.899 | 0.900 |
 | Contrastive baseline | `hi_contrastive_20ep` | 0.818 | 0.849 | 0.857 | 0.863 |
 | M2 expert + contrast (10 ep, M4 best) | `hi_morph_global_contrast_10ep_bestckpt` | 0.885 | 0.894 | 0.895 | 0.897 |
 | M2 expert + contrast (20 ep, M4 best) | `hi_morph_global_contrast_20ep_bestckpt` | 0.880 | 0.897 | 0.898 | 0.896 |
+
+**Clustering+proj minus contrastive+proj (test AUROC Δ):**
+
+| Train % | Δ AUROC | Interpretation |
+|---------|---------|----------------|
+| 10% | +0.010 | M1b+proj still best at 10% |
+| 25% | **+0.008** | Clustering+proj leads |
+| 50% | **+0.005** | |
+| 100% | **+0.001** | Near tie |
 
 **Contrastive+proj minus M1b (test AUROC Δ):**
 
@@ -121,14 +142,31 @@ The contrastive plan continues to own objective routing, homo/hetero training, e
 **Conclusions:**
 
 1. **Projection is the main label-efficiency win.** Contrastive+proj beats plain M1b at **every** fraction (+0.008 to +0.010 AUROC). This flips the first batch (six encoders, pre-projection) where M1b led at all fractions vs plain contrastive.
-2. **M1b + projection is best at 10% labels** (0.918 vs 0.906 contrastive+proj). Morphology still adds signal under extreme scarcity when stacked with projection; it does not beat projection-only at 50–100%.
-3. **Plain M1b vs plain contrastive:** M1b still wins at all fractions (+0.056 to +0.078 AUROC) — morphology expert helps without projection, but projection encoders dominate both.
-4. **M2 does not rescue expert+M2 under label scarcity.** M4-best M2 trails M1b and all projection encoders at every fraction.
-5. **F1 at low fractions is noisy** (~253 train positives at 10%). **AUROC is the primary metric** for this analysis.
-6. **Clustering expert hurts label-efficiency too.** `hi_morphology_global_clustering_20ep` trails M1b by **−0.019 @ 10%**, **−0.018 @ 25%**, **−0.011 @ 50/100%** test AUROC. Still above plain contrastive at all fractions, but below M1b and all projection encoders.
-7. **Clustering + projection (full-label):** **0.929** test AUROC — projection rescues and surpasses contrastive+proj; label-efficiency pending.
+2. **M1b + projection is best at 10% labels** (0.918 vs 0.916 clustering+proj vs 0.906 contrastive+proj). Morphology + projection helps under extreme scarcity; clustering+proj adds a small gain at 25%+.
+3. **Clustering + projection leads at 25–100%** (0.926 / 0.930 / 0.929) — extends the full-label SSL win under most label budgets.
+4. **Plain M1b vs plain contrastive:** M1b still wins at all fractions (+0.056 to +0.078 AUROC) — morphology expert helps without projection, but projection encoders dominate both.
+5. **M2 does not rescue expert+M2 under label scarcity.** M4-best M2 trails M1b and all projection encoders at every fraction.
+6. **F1 at low fractions is noisy** (~253 train positives at 10%). **AUROC is the primary metric** for this analysis.
+7. **Clustering expert alone hurts LE** (`hi_morphology_global_clustering_20ep` 0.877–0.908); **with projection** it becomes the LE leader at 25%+.
+8. **MAE expert loss** (`hi_morphology_global_mae_20ep_bestckpt`) underperforms MSE clustering expert at every fraction (0.872–0.898 vs 0.877–0.908).
 
 **Historical note:** First batch (six encoders, pre-projection) had M1b winning all fractions vs plain contrastive; largest gap at 10% (+0.078). That story holds for **plain** encoders only — projection changes the ranking.
+
+### Relax-grid label-efficiency (Jun 12, 2026)
+
+**Batch:** `slurm/run_contrastive_relax_label_efficiency.sh` — sym, 8192neg, asym@16384 vs existing summary encoders.
+
+**Test AUROC** (`hi_contrastive_proj_*` relax grid vs baseline asym+proj @ bs=32768):
+
+| Encoder | 10% | 25% | 50% | 100% |
+|---------|-----|-----|-----|------|
+| **sym + proj** (`bs=16384`) | **0.924** | **0.926** | 0.929 | 0.929 |
+| **8192 negs + proj** | 0.917 | 0.922 | **0.931** | **0.931** |
+| asym @ 16384 + proj | 0.915 | 0.922 | 0.922 | 0.922 |
+| Baseline asym + proj | 0.906 | 0.918 | 0.925 | 0.928 |
+| M1b + clustering + proj | 0.916 | 0.926 | 0.930 | 0.929 |
+
+**Takeaways:** (1) Relax recipes beat baseline asym+proj at **every** fraction (+0.003 to +0.018 AUROC). (2) **8192neg** edges morphology/clustering+proj at **50–100%** (+0.001–0.002 AUROC). (3) **sym** wins **10%** AUROC (0.924 vs M1b+proj 0.918) and **F1** at all fractions (~0.20–0.22 vs baseline 0.10–0.15). (4) 8192neg is weak at 10% labels (0.917 AUROC, 0.137 F1) despite best full-label ranking.
 
 **Reproduce:**
 
@@ -413,7 +451,7 @@ Computed **offline on train-only directed graph** (val/test graphs separately fo
 | Lower | Triangle / wedge counts | 1 | Overlaps local clustering. |
 | Defer | Tier 2 (BC, PageRank, k-core) | 2 | After M2 benchmarked. |
 
-**Suggested experiment order:** ~~clustering+projection full-label~~ (0.929) → **label-efficiency on clustering+proj** → decide default recipe under scarcity → scale / KNN view before more Tier-1 stacks.
+**Suggested experiment order:** ~~clustering+projection full-label~~ (0.929) → ~~label-efficiency on clustering+proj~~ (0.916–0.930) → ~~relax grid core~~ (sym 0.929/0.222; 8192neg 0.930/0.191; asym@16384 confound) → optional sym+8192 / no-queue → label-efficiency on winners → new Tier-0/1 metrics → external dataset before more Tier-1 stacks.
 
 ---
 
@@ -606,9 +644,37 @@ Expert target dim with defaults: local **11** + global **9** + edge-native **4**
 | Run | `unique_name` | Result vs baseline |
 |-----|---------------|-------------------|
 | M1b + clustering expert | `hi_morphology_global_clustering_20ep` | ✅ full-label **0.903** / **0.117** F1; LE **0.877–0.908** AUROC — below M1b at all fractions |
-| M1b + clustering + projection | `hi_morphology_global_clustering_proj_20ep_bestckpt` | ✅ **0.929** / **0.156** — best SSL; LE pending |
+| M1b + clustering + projection | `hi_morphology_global_clustering_proj_20ep_bestckpt` | ✅ **0.929** / **0.156** — best SSL; LE **0.916–0.930** |
 | M1b + MAE expert loss | `hi_morphology_global_mae_20ep_bestckpt` | ✅ **0.898** / **0.145** — below MSE 0.903 |
 | M1b + M2 + clustering bins | `hi_morph_global_clustering_m2_10ep_bestckpt` | ⏳ pending (low priority) |
+
+### Phase M1d — Tier-1 local triangle counts (Jun 2026) ✅ code · ablation done
+
+- [x] Undirected triangle counts at seed endpoints on view1 subgraph (`sender_triangles_local`, `receiver_triangles_local`, `mean_triangles_local`).
+- [x] M2 opt-in group `local_triangles` in [`morphology/contrast.py`](../morphology/contrast.py).
+- [x] `--morph_local_subset {all,degree,clustering,triangles}` to ablate expert columns without recomputing metrics.
+
+**Ablation — stacked clustering + triangles + projection** (`hi_morphology_global_triangles_proj_20ep_bestckpt`, default `all` = 14 local dims):
+
+| Metric | Triangles+proj (14 local) | Clustering+proj (11 local) | Δ |
+|--------|---------------------------|----------------------------|---|
+| Val AUROC | 0.933 | 0.930 | +0.003 |
+| **Test AUROC** | **0.912** | **0.929** | **−0.017** |
+| Test F1 | 0.145 | 0.156 | −0.011 |
+
+**Conclusion:** Triangle counts **do not help** when stacked with clustering; large val→test AUROC gap suggests redundant/noisy targets. **Do not adopt** as default. **Triangles-only** expert (`--morph_local_subset triangles`, 11 dims) ablation pending.
+
+### M1b + symmetric contrastive + projection (Jun 2026) ✅
+
+**Run:** `hi_morphology_global_sym_proj_20ep_bestckpt` · `slurm/ablation_m1b_sym_projection_20ep.sh` — M1b (14 local) + sym InfoNCE + projection @ `bs=16384 accum=2`.
+
+| Metric | sym + morph + proj | sym + proj (no morph) | clustering + proj |
+|--------|-------------------|----------------------|-------------------|
+| Val AUROC | 0.938 | 0.939 | 0.930 |
+| **Test AUROC** | **0.930** | 0.929 | 0.929 |
+| **Test F1** | **0.134** | **0.222** | 0.156 |
+
+**Conclusion:** Morphology expert on the relax-grid sym recipe gives **+0.001** test AUROC vs plain sym but **−0.088** test F1. No “best of both worlds.” **Keep sym contrastive+proj for F1**; do not stack M1b expert on sym by default.
 
 **Example — M1b with clustering (expert only):**
 
@@ -631,7 +697,7 @@ python main.py --data Small-HI --model gin --objective contrastive \
   --morph_contrast_scope local
 ```
 
-**Success criterion:** test AUROC or label-efficiency ≥ prior M1b / expert+M2 at matched epochs. **Expert-only:** not met (0.903). **With projection:** met — **0.929** test AUROC (vs contrastive+proj 0.927). Label-efficiency TBD.
+**Success criterion:** test AUROC or label-efficiency ≥ prior M1b / expert+M2 at matched epochs. **Expert-only:** not met (0.903). **With projection:** met — **0.929** full-label; LE **0.926–0.930** @ 25–100%.
 
 ---
 
@@ -789,7 +855,10 @@ Each head: Linear(128, h) → ReLU → Linear(h, 1)   [or small 2-layer MLP per 
 
 | Run | Test AUROC | Test F1 | Notes |
 |-----|------------|---------|-------|
-| M1b + clustering + proj (`hi_morphology_global_clustering_proj_20ep_bestckpt`) | **0.929** | **0.156** | **best full-label SSL** |
+| Sym contrastive + proj (`hi_contrastive_proj_sym_20ep_bestckpt`) | 0.929 | **0.222** | **best SSL F1**; relax grid |
+| 8192neg + proj (`hi_contrastive_proj_8192neg_20ep_bestckpt`) | **0.930** | 0.191 | best contrastive AUROC |
+| M1b + sym + proj (`hi_morphology_global_sym_proj_20ep_bestckpt`) | **0.930** | 0.134 | morph on sym: +0.001 AUROC, −0.088 F1 vs sym-only |
+| M1b + clustering + proj (`hi_morphology_global_clustering_proj_20ep_bestckpt`) | 0.929 | 0.156 | best morph stack |
 | Contrastive + proj (`hi_contrastive_proj_20ep_bestckpt`) | 0.927 | 0.144 | +0.088 vs plain contrastive (0.839) |
 | M1b + proj (`hi_morphology_global_proj_20ep_bestckpt`) | 0.924 | 0.096 | AUROC ↑ vs M1b; F1 ↓ at val-tuned threshold |
 | M1b (no proj) | 0.920 | 0.108 | morph-only baseline |
@@ -810,7 +879,9 @@ See **Project status** table for full projection ablation numbers.
 | M3 BC-only | `local+tier2` | ✅ 0.904 / 0.093 — substitute OK, stack bad |
 | M3 bc_max | M1b + `morph_tier2_lift max` | ✅ 0.889 / 0.086 |
 | M5a grouped | `--morph_expert_layout grouped` | ✅ w0 → 0.885 / 0.043; w1.0 → 0.887 / 0.028 (below M1b & shared M3 stack) |
-| M1b + clustering + projection | M1b + proj + 11 local | ✅ **0.929 / 0.156** — best full-label SSL |
+| M1b + clustering + projection | M1b + proj + 11 local | ✅ **0.929 / 0.156** — best morph SSL |
+| M1b + sym + projection | M1b + sym @ `bs=16384` | ✅ **0.930 / 0.134** — morph hurts sym F1 |
+| Sym contrastive + proj | relax grid | ✅ 0.929 / **0.222** — best SSL F1 |
 | Contrastive + proj | `--contrast_projection_head` | ✅ 0.927 / 0.144 |
 | M1b + proj | M1b + projection head | ✅ 0.924 / 0.096 |
 | M1b + clustering expert (MSE) | M1b, 11 local dims | ✅ 0.903 / 0.117; LE 0.877–0.908 |

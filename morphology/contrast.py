@@ -27,6 +27,7 @@ from morphology.tier1_local import (
     LOCAL_CLUSTERING_INDICES,
     LOCAL_DEGREE_INDICES,
     LOCAL_FEATURE_NAMES,
+    LOCAL_TRIANGLES_INDICES,
 )
 
 # Feature groups for binning (toggle via CLI).
@@ -34,6 +35,7 @@ MORPH_CONTRAST_FEATURE_GROUPS = (
     "local_ego",
     "local_degree",
     "local_clustering",
+    "local_triangles",
     "global_degree",
     "edge_native",
 )
@@ -165,6 +167,8 @@ def _column_indices_for_groups(cfg: MorphContrastConfig, edge_native_dim: int = 
         cols.extend(offset + i for i in LOCAL_DEGREE_INDICES)
     if "local_clustering" in cfg.feature_groups:
         cols.extend(offset + i for i in LOCAL_CLUSTERING_INDICES)
+    if "local_triangles" in cfg.feature_groups:
+        cols.extend(offset + i for i in LOCAL_TRIANGLES_INDICES)
     offset += n_local
 
     if cfg.include_global and "global_degree" in cfg.feature_groups:

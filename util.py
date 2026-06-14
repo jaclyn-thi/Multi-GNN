@@ -45,7 +45,26 @@ def create_parser():
     #Misc
     parser.add_argument("--seed", default=1, type=int, help="Select the random seed for reproducability")
     parser.add_argument("--tqdm", action='store_true', help="Use tqdm logging (when running interactively in terminal)")
-    parser.add_argument("--data", default=None, type=str, help="Select the AML dataset. Needs to be either small or medium.", required=True)
+    parser.add_argument(
+        "--data",
+        default=None,
+        type=str,
+        help="Dataset folder under aml-data/ (e.g. Small-HI, PaySim). "
+        "Registered adapters: PaySim; others use AMLWorld loading conventions.",
+        required=True,
+    )
+    parser.add_argument(
+        "--load_pattern_metadata",
+        action="store_true",
+        help="Load laundering_attempt_metadata.csv for edge-level pattern metadata (auxiliary only). "
+        "Also auto-loads when aml-data/{data}/laundering_attempt_metadata.csv exists.",
+    )
+    parser.add_argument(
+        "--pattern_metadata",
+        type=str,
+        default=None,
+        help="Override path to laundering_attempt_metadata.csv (implies load when set).",
+    )
     parser.add_argument("--model", default=None, type=str, help="Select the model architecture. Needs to be one of [gin, gat, rgcn, pna]", required=True)
     parser.add_argument("--testing", action='store_true', help="Disable wandb logging while running the script in 'testing' mode.")
     parser.add_argument("--save_model", action='store_true', help="Save training checkpoints to saved-models/.")
@@ -193,6 +212,14 @@ def create_parser():
         type=float,
         default=1.0,
         help="Tier 2 block MSE weight when --morph_expert_layout grouped (0 disables BC gradients).",
+    )
+    parser.add_argument(
+        "--morph_local_subset",
+        type=str,
+        default="all",
+        choices=["all", "degree", "clustering", "triangles"],
+        help="Tier-1 columns in the morphology expert: all (14), degree (8), "
+        "clustering (11, no triangles), triangles (11, no clustering).",
     )
     parser.add_argument(
         "--no_morph_edge_native",

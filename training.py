@@ -515,6 +515,9 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                 edge_id2,
                 seed_edge_ids,
             )
+            if not contrastive_symmetric:
+                z2_seed = z2_seed.detach().clone()
+                del out2, z2, view2
             if epoch == 0 and step == 0:
                 logging.info(
                     "Hetero contrastive seed-edge filtering: requested_seed_edges=%s shared_seed_edges=%s queue_size=%s",

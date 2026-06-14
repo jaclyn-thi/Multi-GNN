@@ -5,8 +5,8 @@ These metrics are computed on the **view1** subgraph visible in the current
 may have low *local* degree if the sampled neighborhood is small.
 
 Used by:
-- M1 expert targets (``build_morph_targets``) — 11 local dims including clustering
-- M2 contrast binning (``build_morph_features_for_contrast``) — optional ``local_clustering`` group
+- M1 expert targets (``build_morph_targets``) — 14 local dims (degree/ego + clustering + triangles)
+- M2 contrast binning (``build_morph_features_for_contrast``) — optional ``local_clustering`` / ``local_triangles`` groups
 """
 
 from __future__ import annotations
@@ -16,8 +16,9 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 import numpy as np
 import torch
 
-# Ego + degree block (first 8); clustering block (next 3) appended in Jun 2026 Tier-1 extension.
+# Ego + degree block (first 8); clustering (3); triangle counts (3) — Jun 2026 Tier-1 extensions.
 LOCAL_DEGREE_FEATURE_END = 8
+LOCAL_CLUSTERING_FEATURE_END = 11
 
 LOCAL_FEATURE_NAMES: List[str] = [
     "n_edges_sub",
@@ -31,6 +32,9 @@ LOCAL_FEATURE_NAMES: List[str] = [
     "sender_clustering_local",
     "receiver_clustering_local",
     "mean_clustering_local",
+    "sender_triangles_local",
+    "receiver_triangles_local",
+    "mean_triangles_local",
 ]
 
 LOCAL_CLUSTERING_FEATURE_NAMES: Tuple[str, ...] = (
@@ -39,14 +43,73 @@ LOCAL_CLUSTERING_FEATURE_NAMES: Tuple[str, ...] = (
     "mean_clustering_local",
 )
 
+LOCAL_TRIANGLES_FEATURE_NAMES: Tuple[str, ...] = (
+    "sender_triangles_local",
+    "receiver_triangles_local",
+    "mean_triangles_local",
+)
+
 # Indices within LOCAL_FEATURE_NAMES that are count-like (apply log1p before MSE).
-LOCAL_COUNT_FEATURE_INDICES: Tuple[int, ...] = tuple(range(LOCAL_DEGREE_FEATURE_END))
+LOCAL_COUNT_FEATURE_INDICES: Tuple[int, ...] = tuple(range(LOCAL_DEGREE_FEATURE_END)) + tuple(
+    range(LOCAL_CLUSTERING_FEATURE_END, len(LOCAL_FEATURE_NAMES))
+)
 
 # M2 contrast groups slice into these index ranges (degree block excludes ego cols 0–1).
 LOCAL_DEGREE_INDICES: Tuple[int, ...] = tuple(range(2, LOCAL_DEGREE_FEATURE_END))
 LOCAL_CLUSTERING_INDICES: Tuple[int, ...] = tuple(
-    range(LOCAL_DEGREE_FEATURE_END, len(LOCAL_FEATURE_NAMES))
+    range(LOCAL_DEGREE_FEATURE_END, LOCAL_CLUSTERING_FEATURE_END)
 )
+LOCAL_TRIANGLES_INDICES: Tuple[int, ...] = tuple(
+    range(LOCAL_CLUSTERING_FEATURE_END, len(LOCAL_FEATURE_NAMES))
+)
+
+VALID_MORPH_LOCAL_SUBSETS = frozenset({"all", "degree", "clustering", "triangles"})
+
+
+def local_feature_indices_for_subset(subset: str) -> Tuple[int, ...]:
+    """
+    Column indices into the full ``LOCAL_FEATURE_NAMES`` vector for an expert subset.
+
+    ``degree`` = ego + local degrees (8). ``clustering`` / ``triangles`` add 3 cols each
+    on top of degree (11 total). ``all`` = full 14-dim vector.
+    """
+    key = str(subset).lower()
+    if key not in VALID_MORPH_LOCAL_SUBSETS:
+        raise ValueError(
+            f"morph local subset {subset!r} invalid; use one of {sorted(VALID_MORPH_LOCAL_SUBSETS)}."
+        )
+    if key == "degree":
+        return tuple(range(LOCAL_DEGREE_FEATURE_END))
+    if key == "clustering":
+        return tuple(range(LOCAL_DEGREE_FEATURE_END)) + LOCAL_CLUSTERING_INDICES
+    if key == "triangles":
+        return tuple(range(LOCAL_DEGREE_FEATURE_END)) + LOCAL_TRIANGLES_INDICES
+    return tuple(range(len(LOCAL_FEATURE_NAMES)))
+
+
+def local_feature_dim_for_subset(subset: str) -> int:
+    return len(local_feature_indices_for_subset(subset))
+
+
+def local_feature_names_for_subset(subset: str) -> List[str]:
+    idx = local_feature_indices_for_subset(subset)
+    return [LOCAL_FEATURE_NAMES[i] for i in idx]
+
+
+def slice_local_morph_features(local_feats: torch.Tensor, subset: str) -> torch.Tensor:
+    """Select expert local columns from the full Tier-1 computation."""
+    idx = local_feature_indices_for_subset(subset)
+    return local_feats[:, idx]
+
+
+def local_count_indices_in_subset(subset: str) -> Tuple[int, ...]:
+    """Indices within a subset-sliced local tensor that receive ``log1p`` before expert loss."""
+    full_idx = local_feature_indices_for_subset(subset)
+    return tuple(
+        out_i
+        for out_i, full_i in enumerate(full_idx)
+        if full_i in LOCAL_COUNT_FEATURE_INDICES
+    )
 
 
 def _degree_vectors(
@@ -78,6 +141,27 @@ def _build_undirected_adjacency(edge_index: torch.Tensor) -> Dict[int, Set[int]]
     return adj
 
 
+def _count_undirected_neighbor_links(adj: Dict[int, Set[int]], node: int) -> int:
+    """
+    Undirected edges between distinct neighbor pairs of ``node``.
+
+    Each triangle through ``node`` contributes exactly one such link; this count
+    equals the local triangle count at ``node``.
+    """
+    nbrs = adj.get(node)
+    if not nbrs or len(nbrs) < 2:
+        return 0
+    nbr_list = list(nbrs)
+    k = len(nbr_list)
+    links = 0
+    for i in range(k):
+        nbr_i_set = adj[nbr_list[i]]
+        for j in range(i + 1, k):
+            if nbr_list[j] in nbr_i_set:
+                links += 1
+    return links
+
+
 def _undirected_clustering_coefficient(adj: Dict[int, Set[int]], node: int) -> float:
     """
     Local clustering on the induced undirected subgraph.
@@ -88,15 +172,14 @@ def _undirected_clustering_coefficient(adj: Dict[int, Set[int]], node: int) -> f
     nbrs = adj.get(node)
     if not nbrs or len(nbrs) < 2:
         return 0.0
-    nbr_list = list(nbrs)
-    k = len(nbr_list)
-    links = 0
-    for i in range(k):
-        nbr_i_set = adj[nbr_list[i]]
-        for j in range(i + 1, k):
-            if nbr_list[j] in nbr_i_set:
-                links += 1
+    k = len(nbrs)
+    links = _count_undirected_neighbor_links(adj, node)
     return float((2.0 * links) / (k * (k - 1)))
+
+
+def _undirected_triangle_count(adj: Dict[int, Set[int]], node: int) -> float:
+    """Number of undirected triangles incident on ``node`` in the batch subgraph."""
+    return float(_count_undirected_neighbor_links(adj, node))
 
 
 def _local_clustering_map(edge_index: torch.Tensor) -> Dict[int, float]:
@@ -106,6 +189,15 @@ def _local_clustering_map(edge_index: torch.Tensor) -> Dict[int, float]:
         return {}
     active = edge_index.unique().cpu().tolist()
     return {int(n): _undirected_clustering_coefficient(adj, int(n)) for n in active}
+
+
+def _local_triangle_map(edge_index: torch.Tensor) -> Dict[int, float]:
+    """Triangle count for every node incident on ``edge_index``."""
+    adj = _build_undirected_adjacency(edge_index)
+    if not adj:
+        return {}
+    active = edge_index.unique().cpu().tolist()
+    return {int(n): _undirected_triangle_count(adj, int(n)) for n in active}
 
 
 def _lookup_clustering(
@@ -128,6 +220,19 @@ def _clustering_triplet_for_endpoints(
     r_clust = _lookup_clustering(clust_map, receivers, device)
     mean_clust = 0.5 * (s_clust + r_clust)
     return s_clust, r_clust, mean_clust
+
+
+def _triangle_triplet_for_endpoints(
+    edge_index: torch.Tensor,
+    senders: torch.Tensor,
+    receivers: torch.Tensor,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    tri_map = _local_triangle_map(edge_index)
+    s_tri = _lookup_clustering(tri_map, senders, device)
+    r_tri = _lookup_clustering(tri_map, receivers, device)
+    mean_tri = 0.5 * (s_tri + r_tri)
+    return s_tri, r_tri, mean_tri
 
 
 def _seed_positions_in_subgraph(
@@ -208,6 +313,9 @@ def compute_local_morphology_torch(
     s_clust, r_clust, mean_clust = _clustering_triplet_for_endpoints(
         edge_index, senders, receivers, device
     )
+    s_tri, r_tri, mean_tri = _triangle_triplet_for_endpoints(
+        edge_index, senders, receivers, device
+    )
 
     n = pos.shape[0]
     feats = torch.stack(
@@ -223,6 +331,9 @@ def compute_local_morphology_torch(
             s_clust,
             r_clust,
             mean_clust,
+            s_tri,
+            r_tri,
+            mean_tri,
         ],
         dim=1,
     )
@@ -262,6 +373,7 @@ def transform_morph_targets(
     edge_native: Optional[torch.Tensor] = None,
     global_feats: Optional[torch.Tensor] = None,
     tier2_feats: Optional[torch.Tensor] = None,
+    local_count_indices: Optional[Sequence[int]] = None,
 ) -> torch.Tensor:
     """
     Concatenate local / global / tier2 / edge-native blocks into the expert target vector.
@@ -270,8 +382,13 @@ def transform_morph_targets(
     """
     from morphology.tier0_global import GLOBAL_COUNT_FEATURE_INDICES
 
+    count_idx = (
+        tuple(local_count_indices)
+        if local_count_indices is not None
+        else LOCAL_COUNT_FEATURE_INDICES
+    )
     out = local_feats.clone()
-    for idx in LOCAL_COUNT_FEATURE_INDICES:
+    for idx in count_idx:
         out[:, idx] = torch.log1p(out[:, idx].clamp(min=0))
     parts = [out]
     if global_feats is not None and global_feats.numel() > 0:
@@ -321,9 +438,15 @@ def compute_local_morphology(
     s_clust, r_clust, mean_clust = _clustering_triplet_for_endpoints(
         edge_index, senders_t, receivers_t, torch.device("cpu")
     )
+    s_tri, r_tri, mean_tri = _triangle_triplet_for_endpoints(
+        edge_index, senders_t, receivers_t, torch.device("cpu")
+    )
     s_clust_np = s_clust.numpy()
     r_clust_np = r_clust.numpy()
     mean_clust_np = mean_clust.numpy()
+    s_tri_np = s_tri.numpy()
+    r_tri_np = r_tri.numpy()
+    mean_tri_np = mean_tri.numpy()
 
     features = np.stack(
         [
@@ -338,6 +461,9 @@ def compute_local_morphology(
             s_clust_np,
             r_clust_np,
             mean_clust_np,
+            s_tri_np,
+            r_tri_np,
+            mean_tri_np,
         ],
         axis=1,
     )

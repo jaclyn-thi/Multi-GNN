@@ -3,7 +3,7 @@
 The expert head is a small MLP that predicts **detached** morphology target vectors
 from seed-edge embeddings ``z_seed``. Targets combine:
 
-- Tier 1 local subgraph stats (11 dims: degree/ego + undirected clustering on view1)
+- Tier 1 local subgraph stats (14 dims: degree/ego + clustering + triangle counts on view1)
 - Tier 0 global endpoint lift (M1b, ``--morph_targets local+global``)
 - Tier 2 betweenness centrality lift (M3: ``local+tier2`` or ``local+global+tier2``)
 - Forward edge-native attributes (default on; disable with ``--no_morph_edge_native``)
@@ -44,6 +44,9 @@ from morphology.tier1_local import (
     align_seed_embeddings_with_morph,
     compute_local_morphology_torch,
     gather_seed_forward_edge_attr,
+    local_count_indices_in_subset,
+    local_feature_dim_for_subset,
+    slice_local_morph_features,
     transform_morph_targets,
 )
 
@@ -77,6 +80,9 @@ class MorphExpertConfig:
         Forward edge_attr width (excl. EdgeID); used for block slicing when grouped.
     group_weight_tier2 :
         Per-block MSE scale for Tier 2 when ``layout=grouped`` (sweep for M1b+BC test).
+    local_subset :
+        Tier-1 expert columns: ``all`` (14), ``clustering`` (11, no triangles),
+        ``triangles`` (11, no clustering), or ``degree`` (8).
     """
 
     embedding_dim: int = 128
@@ -93,6 +99,7 @@ class MorphExpertConfig:
     group_weight_global: float = 1.0
     group_weight_tier2: float = 1.0
     group_weight_edge_native: float = 1.0
+    local_subset: str = "all"
 
 
 class MorphologyExpertHead(nn.Module):
@@ -149,7 +156,7 @@ def morph_target_blocks(cfg: MorphExpertConfig) -> List[Tuple[str, slice]]:
     """Return ``(block_name, column_slice)`` pairs in expert target column order."""
     start = 0
     blocks: List[Tuple[str, slice]] = []
-    n_local = len(LOCAL_FEATURE_NAMES)
+    n_local = local_feature_dim_for_subset(cfg.local_subset)
     blocks.append(("local", slice(start, start + n_local)))
     start += n_local
     if cfg.include_global:
@@ -274,13 +281,14 @@ def build_morph_targets(
         Float tensor ``(n_seeds, target_dim)`` with log1p applied to count-like
         columns via ``transform_morph_targets``.
     """
-    local = compute_local_morphology_torch(
+    local_full = compute_local_morphology_torch(
         edge_index,
         subgraph_edge_ids,
         seed_edge_ids,
         num_nodes,
         device=edge_index.device,
     )
+    local = slice_local_morph_features(local_full, cfg.local_subset)
     global_feats = None
     if cfg.include_global:
         if tier0_ctx is None:
@@ -303,6 +311,7 @@ def build_morph_targets(
         edge_native=edge_native,
         global_feats=global_feats,
         tier2_feats=tier2_feats,
+        local_count_indices=local_count_indices_in_subset(cfg.local_subset),
     ).detach()
 
 
@@ -358,7 +367,7 @@ def target_dim_for_config(
     edge_attr_dim: int,
     cfg: MorphExpertConfig,
 ) -> int:
-    n = len(LOCAL_FEATURE_NAMES)
+    n = local_feature_dim_for_subset(cfg.local_subset)
     if cfg.include_global:
         n += len(DEFAULT_LIFT_FEATURE_NAMES)
     if cfg.include_tier2:
@@ -369,7 +378,7 @@ def target_dim_for_config(
 
 
 def _block_dims_for_config(edge_attr_dim: int, cfg: MorphExpertConfig) -> Dict[str, int]:
-    blocks: Dict[str, int] = {"local": len(LOCAL_FEATURE_NAMES)}
+    blocks: Dict[str, int] = {"local": local_feature_dim_for_subset(cfg.local_subset)}
     if cfg.include_global:
         blocks["global"] = len(DEFAULT_LIFT_FEATURE_NAMES)
     if cfg.include_tier2:
@@ -452,6 +461,14 @@ def setup_morphology_expert(args, tr_data, device, is_hetero: bool):
         raise ValueError(
             f"--morph_expert_loss {loss_type!r} is invalid; use 'mse' or 'mae'."
         )
+    local_subset = str(getattr(args, "morph_local_subset", "all")).lower()
+    from morphology.tier1_local import VALID_MORPH_LOCAL_SUBSETS
+
+    if local_subset not in VALID_MORPH_LOCAL_SUBSETS:
+        raise ValueError(
+            f"--morph_local_subset {local_subset!r} invalid; "
+            f"use one of {sorted(VALID_MORPH_LOCAL_SUBSETS)}."
+        )
     cfg = MorphExpertConfig(
         embedding_dim=128,
         hidden_dim=int(getattr(args, "morph_expert_hidden", 64)),
@@ -463,6 +480,7 @@ def setup_morphology_expert(args, tr_data, device, is_hetero: bool):
         loss_type=loss_type,
         layout=layout,
         group_weight_tier2=float(getattr(args, "morph_expert_group_weight_tier2", 1.0)),
+        local_subset=local_subset,
     )
     head, cfg = create_morph_expert_bundle(edge_attr_dim, cfg, device)
     extra = ""
@@ -476,9 +494,10 @@ def setup_morphology_expert(args, tr_data, device, is_hetero: bool):
     if cfg.layout == "grouped":
         layout_extra = f" layout=grouped w_tier2={cfg.group_weight_tier2:g}"
     logging.info(
-        "Morphology expert head: target_dim=%d (local=%d%s) loss=%s weight=%.4f morph_targets=%s%s",
+        "Morphology expert head: target_dim=%d (local=%d subset=%s%s) loss=%s weight=%.4f morph_targets=%s%s",
         head.target_dim,
-        len(LOCAL_FEATURE_NAMES),
+        local_feature_dim_for_subset(cfg.local_subset),
+        cfg.local_subset,
         extra,
         cfg.loss_type,
         cfg.loss_weight,

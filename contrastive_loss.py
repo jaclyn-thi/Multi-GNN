@@ -363,6 +363,60 @@ def _sample_negative_indices_by_bin(
     return neg_idx
 
 
+def _infonce_row_chunk_for_neg_subsample(
+    row_chunk: int,
+    k_neg: int,
+    embed_dim: int,
+    *,
+    max_neg_tensor_bytes: int = 256 * 1024 * 1024,
+) -> int:
+    """Shrink row batches so ``neg_z`` stays under ~256 MiB (rows × k_neg × D × 4)."""
+    if k_neg <= 0 or embed_dim <= 0:
+        return row_chunk
+    bytes_per_row = k_neg * embed_dim * 4
+    max_rows = max(1, max_neg_tensor_bytes // bytes_per_row)
+    return min(row_chunk, max_rows)
+
+
+def _neg_k_chunk_for_subsample(
+    row_chunk: int,
+    embed_dim: int,
+    *,
+    max_neg_tensor_bytes: int = 32 * 1024 * 1024,
+) -> int:
+    """Chunk size along the negative axis (rows × k_chunk × D × 4 ≤ ~32 MiB)."""
+    if row_chunk <= 0 or embed_dim <= 0:
+        return 128
+    k_chunk = max_neg_tensor_bytes // (row_chunk * embed_dim * 4)
+    return max(1, int(k_chunk))
+
+
+def _neg_logsumexp_subsampled(
+    z_b: torch.Tensor,
+    candidate_z: torch.Tensor,
+    neg_idx: torch.Tensor,
+    valid: torch.Tensor,
+    temperature: float,
+    *,
+    k_chunk: int,
+) -> torch.Tensor:
+    """Logsumexp over subsampled negatives without materializing (rows, k_neg, D)."""
+    k_neg = int(neg_idx.shape[1])
+    log_neg = None
+    for k0 in range(0, k_neg, k_chunk):
+        k1 = min(k0 + k_chunk, k_neg)
+        idx_slice = neg_idx[:, k0:k1].clamp(min=0)
+        valid_slice = valid[:, k0:k1]
+        neg_z = candidate_z[idx_slice]
+        logits = (z_b.unsqueeze(1) * neg_z).sum(dim=-1) / temperature
+        logits = torch.where(valid_slice, logits, torch.full_like(logits, float("-inf")))
+        ls = logits.logsumexp(dim=1)
+        log_neg = ls if log_neg is None else torch.logaddexp(log_neg, ls)
+    if log_neg is None:
+        return z_b.new_full((z_b.shape[0],), float("-inf"))
+    return log_neg
+
+
 def _directional_aligned_infonce(
     z_anchor: torch.Tensor,
     z_other: torch.Tensor,
@@ -394,6 +448,13 @@ def _directional_aligned_infonce(
     losses = []
     use_neg_subsample = num_neg_samples is not None and int(num_neg_samples) > 0
     k_neg = int(num_neg_samples) if use_neg_subsample else 0
+    embed_dim = int(z_anchor.shape[1])
+    k_chunk = 1
+    if use_neg_subsample:
+        row_chunk = _infonce_row_chunk_for_neg_subsample(
+            row_chunk, k_neg, embed_dim
+        )
+        k_chunk = _neg_k_chunk_for_subsample(row_chunk, embed_dim)
 
     candidate_ids = edge_ids
     candidate_z = z_other
@@ -446,11 +507,14 @@ def _directional_aligned_infonce(
                 log_denom = log_num
             else:
                 valid = neg_idx >= 0
-                safe_idx = neg_idx.clamp(min=0)
-                neg_z = candidate_z[safe_idx]
-                neg_logits = (z_b.unsqueeze(1) * neg_z).sum(dim=-1) / temperature
-                neg_logits = torch.where(valid, neg_logits, torch.full_like(neg_logits, float("-inf")))
-                log_neg = neg_logits.logsumexp(dim=1)
+                log_neg = _neg_logsumexp_subsampled(
+                    z_b,
+                    candidate_z,
+                    neg_idx,
+                    valid,
+                    temperature,
+                    k_chunk=k_chunk,
+                )
                 log_denom = torch.where(
                     torch.isfinite(log_neg),
                     torch.logaddexp(log_num, log_neg),

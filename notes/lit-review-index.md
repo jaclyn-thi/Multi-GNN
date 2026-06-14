@@ -80,8 +80,11 @@ GIN, hetero, full-train linear probe, val max-F1 threshold. Full table in [`morp
 
 | Config | Ckpt | Test AUROC | Test F1 |
 |--------|------|------------|---------|
-| **M1b + clustering + projection** | 20 | **0.929** | **0.156** |
-| Contrastive + projection | 20 | 0.927 | 0.144 |
+| Sym contrastive + projection | 20 | 0.929 | **0.222** |
+| Contrastive + proj + 8192 negs | 20 | **0.930** | 0.191 |
+| **M1b + clustering + projection** | 20 | **0.929** | 0.156 |
+| M1b + sym + projection | 20 | **0.930** | 0.134 |
+| Contrastive + projection (asym) | 20 | 0.927 | 0.144 |
 | M1b + projection | 20 → ep 15 | 0.924 | 0.096 |
 | **M1b expert** (8 local dims) | 20 | 0.920 | 0.108 |
 | M1b + clustering (MSE) | 20 | 0.903 | 0.117 |
@@ -104,8 +107,8 @@ GIN, hetero, full-train linear probe, val max-F1 threshold. Full table in [`morp
 - **M4** (`--checkpoint_policy best`) recovers much of the 20 ep expert+M2 regression; **M1b** remains best **morph-only** config (0.920 AUROC).
 - **M3 BC** stacked on M1b **hurt** (0.896 best vs 0.920 M1b); **M5a grouped** did not fix interference (0.887).
 - **`morph_expert_weight=0.5`** hurt expert+M2 vs w=1.0.
-- **Full-label SSL leader:** M1b+clustering+projection **0.929** AUROC (clustering alone 0.903; projection rescues + surpasses contrastive+proj).
-- **Label-efficiency** (ten encoders): contrastive+proj @ 25–100%; M1b+proj @ 10%. Clustering+proj LE **pending**.
+- **Full-label SSL:** **F1** → sym contrastive+proj **0.222**; **AUROC** → 8192neg / M1b+sym+proj **0.930**. M1b+clustering+proj **0.929** / 0.156 (best morph stack). M1b+sym+proj does **not** combine sym F1 with morph (+0.001 AUROC, −0.088 F1).
+- **Label-efficiency** (fifteen encoders): sym @ 10%; 8192neg @ 50–100%; clustering+proj competitive.
 - **MAE expert loss:** 0.898 AUROC — no win vs MSE (0.903).
 
 ---
@@ -141,7 +144,7 @@ GIN, hetero, full-train linear probe, val max-F1 threshold. Full table in [`morp
 **High-value future work:**
 1. ~~**Label-efficiency probes**~~ — nine-encoder batch done: contrastive+proj leads vs M1b at all fractions; M1b+proj best @ 10% (0.918 AUROC).
 2. **KNN or similarity view** — mitigate link sparsity (GCPAL motivation); engineering cost non-trivial on edge/batch sampling path.
-3. ~~**Contrast projection head**~~ — done (Jun 4): contrastive+proj **0.927** test AUROC; M1b+proj 0.924 AUROC / 0.096 F1. See [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md).
+3. ~~**Contrast projection head**~~ — done (Jun 4): contrastive+proj **0.927** test AUROC; M1b+proj 0.924 AUROC / 0.096 F1. **Relax grid (Jun 11):** 8192 negs **0.930** AUROC; sym **0.929** / **0.222** F1; asym@16384 confound **0.920**/0.206. See [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md).
 
 ---
 
@@ -244,7 +247,7 @@ Ordered by impact vs effort for **this** codebase (updated after M2 @ 20 ep):
 |----------|------|---------------|--------|
 | 1 | ~~**M4:** save best checkpoint by morph val composite~~ | Papagei | ✅ `--checkpoint_policy best` |
 | 2 | ~~Re-run expert+M2 with `--checkpoint_policy best`~~ | This repo | Done — see morphology plan table |
-| 3 | ~~**Analyze label-efficiency** (`run_label_efficiency.sh`)~~ | GCPAL, Papagei, RWTH | ✅ nine encoders: contrastive+proj leads; M1b+proj @ 10% |
+| 3 | ~~**Analyze label-efficiency** (`slurm/run_label_efficiency.sh`)~~ | GCPAL, Papagei, RWTH | ✅ nine encoders: contrastive+proj leads; M1b+proj @ 10% |
 | 4 | **Tier-1 local clustering** benchmark | This repo | ✅ clustering+proj **0.929**; LE on clustering+proj pending |
 | 5 | **Disjoint morph features** (contrast vs expert ablation) | Papagei | Low — CLI/flags |
 | 6 | ~~**M3 BC ablations** (`bc_only`, `bc_max`)~~ | Gao & Ye | ✅ done; stack hurts, bc_only 0.904 |
