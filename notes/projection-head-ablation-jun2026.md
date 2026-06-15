@@ -1,6 +1,6 @@
 # Contrast projection head ablation (Jun 4, 2026)
 
-> **Superseded for navigation:** benchmark tables and takeaways live in [`README.md`](../README.md) and [`morphology-metrics-plan.md`](morphology-metrics-plan.md) Project status. This file is a dated run log only.
+> **Superseded for navigation:** benchmark tables and takeaways live in [`results.md`](results.md) and [`morphology-metrics-plan.md`](morphology-metrics-plan.md) Project status. This file is a dated run log only.
 
 Short write-up of the two evening runs probing frozen embeddings with `linear_probe.py` (GIN, Small-HI hetero, model class weights, threshold = max F1 on val).
 

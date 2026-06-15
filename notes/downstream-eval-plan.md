@@ -1,6 +1,8 @@
 # Downstream Finance Task Considerations
 
-This note summarizes current thinking around possible downstream tasks for evaluating our finance graph foundation model (GFM). The main goal is to understand whether pretraining on large synthetic transaction graphs produces reusable transaction/edge embeddings for finance tasks beyond the current AMLWorld binary edge-classification setup.
+This note summarizes downstream tasks for evaluating our finance graph foundation model (GFM). The main goal is reusable **transaction/edge embeddings** for finance tasks beyond binary AMLWorld classification.
+
+**See also:** [`datasets.md`](datasets.md) (data setup) · [`results.md`](results.md) (dev benchmarks) · [`../README.md`](../README.md) (quick start)
 
 ## Current model framing
 
@@ -184,13 +186,40 @@ Important caveat: avoid using leaky PaySim fields such as balance fields or `isF
 * `embedding_extraction.py` — `--random_init` baseline (skip checkpoint load); `--embeddings_dir`.
 * `scripts/validate_paysim_data.py` — format, stats, optional `get_data()` smoke test.
 * `tests/test_format_paysim.py` — formatter unit tests.
-* Slurm: `run_paysim_load_smoke.sh`, `run_paysim_extract_probe.sh`, `submit_paysim_transfer.sh`.
+* Slurm: `run_paysim_load_smoke.sh`, `run_paysim_extract_probe.sh`, `submit_paysim_transfer.sh`, `run_paysim_linear_probe.sh`, `submit_paysim_probe_variants.sh`.
 
 **Dev runs (not frozen benchmark protocol)**
 
-* Load smoke test passed (~6.36M edges, 743 hourly buckets).
-* First transfer: `hi_contrastive_proj_sym_20ep_bestckpt` → PaySim probe — test **AUROC 0.866**, F1 0.089 @ val-tuned / 0.127 @ 0.5.
-* Random-init baseline: queued (`random_init_gin`, `--random_init`).
+* Load smoke test passed (job 16032715; ~6.36M edges, 743 hourly buckets, 0.129% fraud overall).
+* Extract + probe (job 16036046): `hi_contrastive_proj_sym_20ep_bestckpt` → PaySim.
+* Random-init extract + probe (job 16043535): `random_init_gin` (`--random_init`).
+* Probe-only variants (jobs 16043589–91, 16043595–97): `class_weight` × `threshold_tuning` sweeps on existing embeddings.
+
+#### PaySim transfer results (Jun 2026)
+
+Test split: **1.29M** edges, **0.33%** fraud (train **0.08%**). Protocol: frozen GIN extract (`--reverse_mp --ego --ports`, batch 4096) + sklearn logistic regression. Canonical probe matches extract scripts: `--class_weight model` (GIN CE weights), default val F1 threshold tuning.
+
+| Encoder | Class weight | Threshold | Test AUROC | Test F1 | Prec | Recall | Job(s) |
+| ------- | ------------ | --------- | ---------- | ------- | ---- | ------ | ------ |
+| `hi_contrastive_proj_sym_20ep_bestckpt` | model | val-tuned (0.76) | **0.866** | 0.089 | 0.67 | 0.05 | 16036046 |
+| `hi_contrastive_proj_sym_20ep_bestckpt` | model | fixed 0.5 | **0.864** | **0.127** | 0.43 | 0.07 | 16043595 |
+| `random_init_gin` | model | val-tuned (0.46) | 0.730 | 0.143 | 0.46 | 0.08 | 16043535 |
+| `random_init_gin` | model | fixed 0.5 | 0.730 | 0.135 | 0.49 | 0.08 | 16043589 |
+| `hi_contrastive_proj_sym_20ep_bestckpt` | balanced | val-tuned (0.96) | 0.834 | 0.145 | 0.10 | 0.29 | 16043596 |
+| `hi_contrastive_proj_sym_20ep_bestckpt` | balanced | fixed 0.5 | 0.834 | 0.039 | 0.02 | 0.55 | 16043597 |
+| `random_init_gin` | balanced | val-tuned (0.98) | 0.833 | 0.169 | 0.23 | 0.13 | 16043590 |
+| `random_init_gin` | balanced | fixed 0.5 | 0.833 | 0.025 | 0.01 | 0.56 | 16043591 |
+
+**In-domain reference (same encoder, Small-HI):** test AUROC **0.929**, F1 **0.222** @ val-tuned (threshold 0.36).
+
+**Takeaways**
+
+1. **Pretraining helps ranking:** ~**13 pp** test AUROC lift (0.866 vs 0.730) under `class_weight=model`.
+2. **Partial transfer:** PaySim AUROC is ~6–10 pp below in-domain Small-HI on the same checkpoint.
+3. **F1 is unstable:** val-tuned thresholds are extreme (0.76–0.98) because val fraud rate is ~0.06%; random init can look better on F1 with `balanced + max_f1_val` while AUROC is worse.
+4. **`class_weight` matters:** `balanced` collapses encoder gap (~0.833 AUROC for both); use `model` for apples-to-apples with supervised GIN.
+
+Outputs: `embeddings/paysim/<unique_name>/probe_results*.json` · logs: `logs/paysim_probe_<job>.out`, `logs/paysim_linear_probe_<job>.out`.
 
 **Not started / deferred**
 
@@ -311,7 +340,7 @@ This is likely the best next step because it is:
 
 ### First external transfer experiment
 
-~~Add PaySim as a non-AML edge-level fraud dataset.~~ **In progress (Jun 2026):** infrastructure + first transfer run complete (see [PaySim status](#paysim--status-jun-2026)). Random-init baseline queued.
+~~Add PaySim as a non-AML edge-level fraud dataset.~~ **Done (dev, Jun 2026):** infrastructure + first transfer runs complete — pretrained sym+proj test AUROC **0.866** vs random-init **0.730** (see [PaySim status](#paysim--status-jun-2026)).
 
 This gives a clean first test of cross-domain transfer:
 

@@ -11,13 +11,13 @@ This document owns **morphology metric selection**, **computation strategy** (in
 
 The contrastive plan continues to own objective routing, homo/hetero training, extraction, and AML linear probe evaluation.
 
-**Metric definitions (concise):** see README § [Morphology metrics reference](../README.md#morphology-metrics-reference) — all Tier 0/1/2 columns, edge-native fields, M2 groups, expert target dims, and the `log1p` rule in one place. This document adds compute strategy, phased implementation, and benchmark results.
+**Metric definitions (concise):** [`morphology-reference.md`](morphology-reference.md) — Tier 0/1/2 columns, edge-native fields, M2 groups, expert target dims, and the `log1p` rule. This document adds compute strategy, phased implementation, and benchmark results.
 
 ---
 
 ## Project status (Jun 2026)
 
-> **Benchmark numbers in this doc and in README** are **development sanity checks** (quick ablations while configs and code still change). They guide internal decisions but are not a formal, frozen evaluation suite. Recorded experiments for publication / PI milestones will use fixed recipes once the stack stabilizes.
+> **Benchmark numbers in this doc and in [`results.md`](results.md)** are **development sanity checks** (quick ablations while configs and code still change). They guide internal decisions but are not a formal, frozen evaluation suite. Recorded experiments for publication / PI milestones will use fixed recipes once the stack stabilizes.
 
 **Implemented:** M0 · M1 · M1b · **M1c Tier-1 local clustering** (Jun 2026) · M2 (+ `local_clustering` contrast group) · morphology val throttling · **M4 best checkpoint** · **label-efficiency probe** (incremental summary merge) · **M3 Phase 0–1** (BC precompute + expert wiring) · **contrastive projection head** (Jun 2026) · **`--morph_expert_loss {mse,mae}`** (Jun 2026).
 
@@ -333,7 +333,7 @@ Production contrastive runs use **large seed batches** (e.g. `--batch_size 32768
 
 ## Metric tiers
 
-> **Glossary:** column-by-column definitions → [README § Morphology metrics reference](../README.md#morphology-metrics-reference).
+> **Glossary:** column-by-column definitions → [`morphology-reference.md`](morphology-reference.md).
 
 **Legend:** ✅ implemented in code · 🔌 wired into M1 expert loss · ⏳ planned · — not started
 
@@ -529,7 +529,7 @@ Morphology should not block the core pipeline, but implementation starts after:
 
 ## Implementation plan
 
-Phases are listed in dependency order below. The README morphology table (M1 / M1b / M2 / …) is a short summary; this section is the full write-up.
+Phases are listed in dependency order below. The phase summary in [`morphology-reference.md`](morphology-reference.md) is a short lookup; this section is the full write-up.
 
 | Phase | Topic | Status |
 |-------|-------|--------|

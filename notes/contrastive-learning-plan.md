@@ -414,7 +414,7 @@ Writes `embeddings/{unique_name}/{train,val,test}.npz` and `meta.json`.
 - **Cluster:** label-efficiency needs ~128G RAM, `--probe_n_jobs 1` (see README)
 - **Not a replacement** for Phase 5b full-label `probe_results.json`; run both when comparing M1b vs M2 under label scarcity
 
-**Results (Jun 2026, fifteen encoders):** Relax-grid **sym+proj** best @ **10%** (0.924); **8192neg+proj** best @ **50–100%** (0.931); morphology clustering+proj **0.916–0.930**. Developmental comparisons — see README sanity-check note. Full table: [`morphology-metrics-plan.md`](morphology-metrics-plan.md) § Relax-grid label-efficiency.
+**Results (Jun 2026, fifteen encoders):** Relax-grid **sym+proj** best @ **10%** (0.924); **8192neg+proj** best @ **50–100%** (0.931). Full table: [`results.md`](results.md) and [`morphology-metrics-plan.md`](morphology-metrics-plan.md) § Relax-grid label-efficiency.
 
 #### What is implemented today (secondary path only)
 

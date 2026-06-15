@@ -267,7 +267,7 @@ Ordered by impact vs effort for **this** codebase (updated after M2 @ 20 ep):
 Worth knowing for context; not indexed as local PDFs:
 
 - **LaundroGraph** (Cardoso et al. 2022) — self-supervised AML on bipartite account–transaction graph; cited by Egressy.
-- **IBM AML dataset** (Altman et al. NeurIPS 2023) — our Small-HI source; see README data section.
+- **IBM AML dataset** (Altman et al. NeurIPS 2023) — our Small-HI source; see [`datasets.md`](datasets.md).
 - **Weber et al.** — early GCN + graph features for Bitcoin AML; tree-based + GF baselines in Egressy.
 
 Add PDFs to `lit review/` and extend this table if those become relevant.
@@ -281,7 +281,7 @@ Add PDFs to `lit review/` and extend this table if those become relevant.
 | Contrastive workflow & Phase history | [`contrastive-learning-plan.md`](contrastive-learning-plan.md) |
 | Morphology phases M0–M5 | [`morphology-metrics-plan.md`](morphology-metrics-plan.md) |
 | Projection head ablation (Jun 2026) | [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md) |
-| CLI & benchmarks | [`README.md`](../README.md) |
+| CLI & benchmarks | [`cli-reference.md`](cli-reference.md) · [`results.md`](results.md) · [`../README.md`](../README.md) |
 | Augmentations | [`graph_augmentations.py`](../graph_augmentations.py) |
 | InfoNCE + M2 soft positives | [`contrastive_loss.py`](../contrastive_loss.py) |
 | Morphology training glue | [`morphology/contrastive_train.py`](../morphology/contrastive_train.py) |
