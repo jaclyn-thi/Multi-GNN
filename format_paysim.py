@@ -39,20 +39,6 @@ import pandas as pd
 from dataset_specs import FORMATTED_TRANSACTION_COLUMNS
 
 
-def _encode_type(type_name: str, type_vocab: dict[str, int]) -> int:
-    key = str(type_name).strip()
-    if key not in type_vocab:
-        type_vocab[key] = len(type_vocab)
-    return type_vocab[key]
-
-
-def _encode_account(name: str, account_vocab: dict[str, int]) -> int:
-    key = str(name).strip()
-    if key not in account_vocab:
-        account_vocab[key] = len(account_vocab)
-    return account_vocab[key]
-
-
 def format_paysim_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Map raw PaySim rows to the shared formatted transaction schema."""
     required = {
@@ -67,37 +53,32 @@ def format_paysim_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"PaySim input missing columns: {sorted(missing)}")
 
-    type_vocab: dict[str, int] = {}
-    account_vocab: dict[str, int] = {}
+    n = len(df)
+    type_codes, _ = pd.factorize(df["type"].astype(str).str.strip())
 
-    rows = []
-    for i, row in df.iterrows():
-        type_code = _encode_type(row["type"], type_vocab)
-        from_id = _encode_account(row["nameOrig"], account_vocab)
-        to_id = _encode_account(row["nameDest"], account_vocab)
-        step = int(row["step"])
-        amount = float(row["amount"])
-        is_fraud = int(row["isFraud"])
+    from_names = df["nameOrig"].astype(str).str.strip()
+    to_names = df["nameDest"].astype(str).str.strip()
+    account_codes, _ = pd.factorize(pd.concat([from_names, to_names], ignore_index=True))
+    from_id = account_codes[:n].astype(np.int64)
+    to_id = account_codes[n:].astype(np.int64)
 
-        rows.append(
-            {
-                "EdgeID": int(i),
-                "from_id": from_id,
-                "to_id": to_id,
-                "Timestamp": step * 3600,
-                "Amount Sent": amount,
-                "Sent Currency": type_code,
-                "Amount Received": amount,
-                "Received Currency": type_code,
-                "Payment Format": type_code,
-                "Is Laundering": is_fraud,
-            }
-        )
-
-    out = pd.DataFrame(rows, columns=list(FORMATTED_TRANSACTION_COLUMNS))
+    out = pd.DataFrame(
+        {
+            "EdgeID": np.arange(n, dtype=np.int64),
+            "from_id": from_id,
+            "to_id": to_id,
+            "Timestamp": df["step"].to_numpy(dtype=np.int64) * 3600,
+            "Amount Sent": df["amount"].to_numpy(dtype=np.float64),
+            "Sent Currency": type_codes.astype(np.int64),
+            "Amount Received": df["amount"].to_numpy(dtype=np.float64),
+            "Received Currency": type_codes.astype(np.int64),
+            "Payment Format": type_codes.astype(np.int64),
+            "Is Laundering": df["isFraud"].to_numpy(dtype=np.int64),
+        }
+    )
     out = out.sort_values("Timestamp", kind="mergesort").reset_index(drop=True)
     out["EdgeID"] = np.arange(len(out), dtype=np.int64)
-    return out
+    return out[list(FORMATTED_TRANSACTION_COLUMNS)]
 
 
 def format_paysim_file(in_path: Path, out_path: Path | None = None) -> Path:

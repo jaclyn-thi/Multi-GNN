@@ -52,7 +52,7 @@ Training logs to `logs/logs.log`. [Weights & Biases](https://wandb.ai/) logging 
 
 ## Data preparation
 
-**Currently supported:** the [IBM synthetic AML transaction datasets](https://www.kaggle.com/datasets/ealtman2019/ibm-transactions-for-anti-money-laundering-aml/data) on Kaggle (from Egressy et al., NeurIPS 2023). All training and evaluation commands in this README assume data prepared in that format. Additional datasets may be supported later; this section will be updated when they are.
+**Currently supported:** the [IBM synthetic AML transaction datasets](https://www.kaggle.com/datasets/ealtman2019/ibm-transactions-for-anti-money-laundering-aml/data) on Kaggle (from Egressy et al., NeurIPS 2023) for pretraining and in-domain AML evaluation. **PaySim** is wired as an external downstream fraud-transfer benchmark (see below). **SAML-D** has a formatter and formatted data under `aml-data/SAML-D/`; use `--data SAML-D` with the same AML edge objective as Small-HI (supervised eval protocol still under review — see [`notes/downstream-eval-plan.md`](notes/downstream-eval-plan.md)).
 
 ### Download and clean (IBM / Kaggle)
 
@@ -77,6 +77,73 @@ aml-data/
 ```
 
 The Kaggle release uses several dataset sizes and illicitness levels; treat each as a separate folder and preprocessing run. Naming is up to you as long as it is consistent with `--data`.
+
+### PaySim (downstream fraud transfer)
+
+PaySim is used as an **external edge-level fraud benchmark** (AML-pretrained encoder → PaySim linear probe). It is not the default pretraining corpus.
+
+1. Place the raw Kaggle CSV under `aml-data/PaySim/` (e.g. `PS_20174392719_149120730945s.csv`).
+2. Format and validate:
+
+```bash
+python scripts/validate_paysim_data.py --format-raw
+python scripts/validate_paysim_data.py              # quick stats
+python scripts/validate_paysim_data.py --load-graph --testing   # full loader smoke test (slow)
+```
+
+Or format directly:
+
+```bash
+python format_paysim.py aml-data/PaySim/PS_*.csv -o aml-data/PaySim/formatted_transactions.csv
+```
+
+3. Extract + probe with an AML checkpoint (separate embeddings dir so AMLWorld results are not overwritten):
+
+```bash
+python embedding_extraction.py \
+  --data PaySim --model gin \
+  --unique_name hi_contrastive_proj_sym_20ep_bestckpt \
+  --embeddings_dir embeddings/paysim \
+  --reverse_mp --ego --ports --testing
+
+python linear_probe.py \
+  --unique_name hi_contrastive_proj_sym_20ep_bestckpt \
+  --embeddings_dir embeddings/paysim \
+  --model gin --class_weight model --testing
+```
+
+Random-init transfer baseline: add `--random_init` to extraction and use any `--unique_name` label (e.g. `random_init_gin`); no checkpoint is loaded.
+
+**Slurm (cluster):**
+
+```bash
+sbatch slurm/run_paysim_load_smoke.sh          # get_data() smoke test (CPU)
+UNIQUE_NAME=hi_contrastive_proj_sym_20ep_bestckpt sbatch slurm/run_paysim_extract_probe.sh
+UNIQUE_NAME=random_init_gin RANDOM_INIT=1 sbatch slurm/run_paysim_extract_probe.sh
+bash slurm/submit_paysim_transfer.sh           # core encoders + random init
+```
+
+PaySim uses **hourly step** temporal splits (~60/20/20). Balance fields and `isFlaggedFraud` are excluded at format time. Fraud is concentrated in later steps (test positive rate ~0.33% vs train ~0.08%), so val-tuned thresholds can look conservative on test — report **AUROC** as the primary metric.
+
+**Dev results (Jun 2026, not a frozen benchmark):** `hi_contrastive_proj_sym_20ep_bestckpt` → PaySim linear probe — test **AUROC 0.866**, F1 0.089 @ val-tuned / 0.127 @ 0.5 (in-domain Small-HI probe on same encoder: AUROC 0.929, F1 0.222). Random-init baseline queued/in progress. See [`notes/downstream-eval-plan.md`](notes/downstream-eval-plan.md).
+
+**Infrastructure:** `format_paysim.py`, `dataset_specs.py` (`PaySim` adapter), `dataset_splits.py` (`hourly_step`), `scripts/validate_paysim_data.py`, `embedding_extraction.py --random_init`, `tests/test_format_paysim.py`.
+
+### SAML-D (in-domain AML; eval under review)
+
+SAML-D uses the **same edge-level AML objective** as Small-HI (`--data SAML-D`, `calendar_day` splits, `Is Laundering` label). Format raw CSV with `format_saml_d_files.py` → `aml-data/SAML-D/formatted_transactions.csv`.
+
+```bash
+python format_saml_d_files.py /path/to/SAML-D.csv
+# copy formatted_transactions.csv to aml-data/SAML-D/ if needed
+
+python main.py --data SAML-D --model gin --objective supervised \
+  --reverse_mp --ego --ports --testing
+```
+
+**Slurm smoke:** `sbatch slurm/run_saml_d_supervised_smoke.sh` (1 epoch). Control: `sbatch slurm/run_small_hi_supervised_smoke.sh`.
+
+**Caveat (Jun 2026):** 1-epoch supervised smoke on SAML-D reported test F1 ~0.90 vs ~0.00 on Small-HI under identical flags — splits look sane, so treat SAML-D supervised numbers as **suspect** until transductive eval leakage is ruled out. See downstream eval notes.
 
 ### Formatted schema and splits
 
@@ -575,6 +642,11 @@ Slurm job scripts live in [`slurm/`](slurm/) (local-only, gitignored). Each scri
 ```bash
 sbatch slurm/ablation_contrastive_proj_sym_8192neg_20ep.sh
 bash slurm/submit_contrastive_relax_grid.sh sym8192   # one grid job at a time
+
+# PaySim transfer + SAML-D smoke
+sbatch slurm/run_paysim_load_smoke.sh
+UNIQUE_NAME=hi_contrastive_proj_sym_20ep_bestckpt sbatch slurm/run_paysim_extract_probe.sh
+sbatch slurm/run_saml_d_supervised_smoke.sh
 ```
 
 `mit_normal_gpu` has a **6 h** cap — scripts use `#SBATCH -t 06:00:00`. Submit **one ablation at a time**. Symmetric / 8192-neg runs may still hit `TIME_LIMIT`; if so, edit the script to `mit_preemptable` and `-t 12:00:00` (preemption can kill the job — there is no mid-train resume; re-submit from scratch).
@@ -749,7 +821,12 @@ python -m pytest tests/test_morphology_metrics.py tests/test_morphology_contrast
 | `embedding_extraction.py` | Frozen seed-edge embeddings → `.npz` |
 | `linear_probe.py` | Sklearn logistic regression on frozen embeddings |
 | `data_loading.py` | CSV → PyG graph objects and temporal splits |
+| `dataset_specs.py` | Per-dataset loading specs (`PaySim`, AMLWorld default) |
+| `dataset_splits.py` | Temporal train/val/test split helpers |
 | `format_kaggle_files.py` | Kaggle CSV → formatted transactions |
+| `format_paysim.py` | PaySim CSV → formatted transactions |
+| `format_saml_d_files.py` | SAML-D CSV → formatted transactions |
+| `scripts/validate_paysim_data.py` | PaySim format/validate/load smoke test |
 | `model_settings.json` | Per-architecture hyperparameters |
 | `notes/` | Design documents (contrastive plan, morphology metrics plan) |
 

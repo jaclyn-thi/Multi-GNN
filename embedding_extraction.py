@@ -93,10 +93,25 @@ def run_embedding_extraction(
         model = to_hetero(model, te_data.metadata(), aggr="mean")
 
     finetuned = bool(getattr(args, "finetune", False))
-    ckpt_epoch = load_checkpoint_weights(model, device, args, data_config)
+    random_init = bool(getattr(args, "random_init", False))
+    if random_init and finetuned:
+        raise ValueError("--random_init cannot be combined with --finetune.")
+
+    if random_init:
+        model.to(device)
+        ckpt_epoch = None
+        ckpt_path = None
+        logging.info(
+            "Random-init extraction: skipping checkpoint load (--unique_name=%s labels output only).",
+            args.unique_name,
+        )
+    else:
+        ckpt_epoch = load_checkpoint_weights(model, device, args, data_config)
+        ckpt_path = checkpoint_path(data_config, args.unique_name, finetuned=finetuned)
+        ckpt_label = f"checkpoint_{args.unique_name}{'_finetuned' if finetuned else ''}.tar"
+        logging.info("Loaded %s (epoch=%s)", ckpt_label, ckpt_epoch)
+
     model.eval()
-    ckpt_label = f"checkpoint_{args.unique_name}{'_finetuned' if finetuned else ''}.tar"
-    logging.info("Loaded %s (epoch=%s)", ckpt_label, ckpt_epoch)
 
     embed_name = f"{args.unique_name}_finetuned" if finetuned else args.unique_name
     out_dir = Path(args.embeddings_dir) / embed_name
@@ -135,6 +150,7 @@ def run_embedding_extraction(
         "unique_name": embed_name,
         "source_unique_name": args.unique_name,
         "finetuned": finetuned,
+        "random_init": random_init,
         "checkpoint_epoch": ckpt_epoch,
         "data": args.data,
         "model": args.model,
@@ -146,9 +162,7 @@ def run_embedding_extraction(
         "tds": bool(args.tds),
         "ego": bool(args.ego),
         "emlps": bool(args.emlps),
-        "checkpoint_path": str(
-            checkpoint_path(data_config, args.unique_name, finetuned=finetuned)
-        ),
+        "checkpoint_path": str(ckpt_path) if ckpt_path is not None else None,
     }
     dataset_spec = getattr(te_data, "dataset_spec_summary", None)
     if dataset_spec is not None:
@@ -167,6 +181,12 @@ def main() -> None:
         type=str,
         default="embeddings",
         help="Root directory for extracted embedding .npz files (subfolder per --unique_name).",
+    )
+    parser.add_argument(
+        "--random_init",
+        action="store_true",
+        help="Skip checkpoint load; extract with randomly initialized encoder weights "
+        "(transfer baseline). --unique_name names the output folder only.",
     )
     args = parser.parse_args()
 

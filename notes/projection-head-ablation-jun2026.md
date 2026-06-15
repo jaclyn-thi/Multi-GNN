@@ -227,21 +227,27 @@ At fixed threshold 0.5, test F1: triangles-only **0.075**; clustering+proj **0.1
 
 **FAN-OUT:** M1b near-zero recall (5%) despite moderate one-vs-rest AUROC on some fan-out variants — scores rank but threshold misses. Projection + triadic experts (clustering or triangles) lift FAN-OUT AUROC to ~0.96; triangles-only catches **68%** of fan-out edges at its low threshold (e.g. Max 16-degree Fan-Out: 100% vs clustering 0% vs M1b 0%) at the cost of global precision.
 
-**Fair comparison (fixed @ 0.5, done):** Per-pattern recall at val-tuned thresholds is **not apples-to-apples** across runs. Fixed @ 0.5 results (`results/diagnostics/<run>_thr0.5/`):
+**Fair comparison (fixed @ 0.5, done — nine-way):** Per-pattern recall at val-tuned thresholds is **not apples-to-apples** across runs. Fixed @ 0.5 results (`results/diagnostics/<run>_thr0.5/`):
 
-| Run | F1 | Known-meta recall | FAN-OUT recall |
-|-----|-----|-------------------|----------------|
-| clustering + proj | **0.132** | 13% | 8% |
-| M1b | 0.080 | 6% | 1% |
-| triangles-only + proj | 0.075 | 21% | **29%** |
+| Run | F1 | Prec | Known-meta recall | FAN-OUT recall |
+|-----|-----|------|-------------------|----------------|
+| **asym @ 16384 + proj** | **0.220** | **0.246** | 26% | 29% |
+| sym + proj | 0.211 | 0.225 | 25% | 34% |
+| 8192neg + proj | 0.196 | 0.181 | **27%** | **45%** |
+| asym + proj (baseline) | 0.137 | 0.125 | 19% | 32% |
+| sym + morph + proj | 0.133 | 0.104 | 23% | 35% |
+| clustering + proj | 0.132 | 0.182 | 13% | 8% |
+| M1b + proj | 0.092 | 0.073 | 16% | 7% |
+| M1b | 0.080 | 0.177 | 6% | 1% |
+| triangles-only + proj | 0.075 | 0.049 | 21% | 29% |
 
-Triangles-only's val-tuned recall advantage shrinks at shared threshold; clustering+proj wins F1. Triangles-only still leads FAN-OUT @ 0.5 — genuinely lifts fan-out scores, but not operationally usable (3.6% precision @ val-tuned).
+**asym@16384 best F1 @ 0.5** (0.220) — beats sym (0.211). 8192neg best FAN-OUT (45%). asym@16384 **improves** @ 0.5 vs val-tuned (0.206 → 0.220); baseline asym and M1b+proj known-meta recall halve @ 0.5.
 
-Artifacts: `results/diagnostics/hi_morphology_global_20ep/` · `.../hi_morphology_global_clustering_proj_20ep_bestckpt/` · `.../hi_morphology_global_triangles_only_proj_20ep_bestckpt/` (+ `_thr0.5/` variants).
+Artifacts: all ten encoders under `results/diagnostics/<unique_name>/` (+ `_thr0.5/`).
 
 ## Pattern typology cross-run (Jun 2026)
 
-**Source:** `scripts/evaluate_pattern_typology.py` · six encoders · val-tuned + fixed @ 0.5 (morph trio). See also [`downstream-eval-plan.md`](downstream-eval-plan.md) § pattern metadata for full tables.
+**Source:** `scripts/evaluate_pattern_typology.py` · **nineteen runs** (ten val-tuned + nine fixed @ 0.5). **Benchmark complete.** See [`downstream-eval-plan.md`](downstream-eval-plan.md) § pattern metadata for full tables.
 
 ### SSL leaders — typology explains F1 vs AUROC split
 
@@ -252,12 +258,29 @@ Artifacts: `results/diagnostics/hi_morphology_global_20ep/` · `.../hi_morpholog
 | clustering + proj | 0.156 | 19% | 0.962 | STACK (15%) |
 | M1b (no proj) | 0.108 | **5%** | 0.884 | **FAN-OUT** |
 
-**Takeaways:**
+@ fixed 0.5: **asym@16384 F1 0.220 (best)**; sym 0.211; 8192neg FAN-OUT **45%** (best).
 
-1. **Projection flips the FAN-OUT story** — M1b worst type → SSL best type. High-degree fan-out variants (e.g. Max 16-degree): M1b **0%** → sym **56%** → 8192neg **60%** → tri-only **100%** (val-tuned).
-2. **sym+proj = best balanced flagger** — highest F1/precision; strong SCATTER-GATHER (AUROC 0.964) and FAN-IN (0.968) ranking.
-3. **8192neg = best ranking on fan-out/bipartite** — AUROC 0.970 FAN-OUT; slightly lower precision than sym at val-tuned threshold.
-4. **Clustering expert value = gather/scatter ranking** — GATHER-SCATTER AUROC **0.971** (best across all runs); morphology without projection does not fix fan-out.
+### Tier 2 @ val-tuned (Jun 2026)
+
+| Run | Test F1 | Prec | FAN-OUT recall | Notes |
+|-----|---------|------|----------------|-------|
+| **asym @ 16384 + proj** | **0.206** | **0.161** | 44% | tier-2 F1 surprise; ~2.9K flags |
+| asym + proj (baseline) | 0.144 | 0.098 | **47%** | ~4.5K flags |
+| sym + morph + proj | 0.134 | 0.093 | 39% | morph hurts sym (−0.088 F1) |
+| M1b + proj | 0.096 | 0.058 | 32% | over-flags (~8K); no clustering expert |
+
+**Takeaways:** asym@16384 competitive with sym on typology (F1 0.206 vs 0.222) with better precision than baseline asym. sym+morph typology confirms probe regression. M1b+proj recall-heavy like triangles-only.
+
+### Tier 2 @ fixed 0.5 (Jun 2026)
+
+| Run | F1 @ 0.5 | Prec | FAN-OUT recall | vs val-tuned F1 |
+|-----|----------|------|----------------|-----------------|
+| **asym @ 16384 + proj** | **0.220** | **0.246** | 29% | **+0.014** (improves) |
+| asym + proj (baseline) | 0.137 | 0.125 | 32% | −0.007 |
+| sym + morph + proj | 0.133 | 0.104 | 35% | −0.001 |
+| M1b + proj | 0.092 | 0.073 | 7% | −0.004 |
+
+**Takeaway:** asym@16384 is the **fixed-threshold leader** across all nine encoders — not just a val-tuned surprise. Aligns with label-efficiency F1 (0.223 @ 100% labels).
 
 ### Triangle ablation — typology completes the picture
 
@@ -269,7 +292,7 @@ Artifacts: `results/diagnostics/hi_morphology_global_20ep/` · `.../hi_morpholog
 
 Stacking triangles on clustering inherits over-flagging without clustering's gather/scatter ranking advantage.
 
-**Batch scripts:** `slurm/submit_pattern_typology_remaining.sh` (tier 1/2/all) · `slurm/submit_pattern_typology_fixed_thr0.5.sh`.
+**Batch scripts:** `slurm/submit_pattern_typology_remaining.sh` (tier 1/2/all) · `slurm/submit_pattern_typology_tier2.sh` · `slurm/submit_pattern_typology_fixed_thr0.5.sh`.
 
 ## M1b + symmetric contrastive + projection (Jun 2026)
 
@@ -286,8 +309,8 @@ Stacking triangles on clustering inherits over-flagging without clustering's gat
 **Takeaways:**
 
 1. **Morph expert on sym does not combine strengths** — +0.001 test AUROC vs sym-only, **−0.088** test F1 (0.134 vs 0.222).
-2. **Sym contrastive+proj remains the F1 leader** among SSL runs; morphology stacking hurts threshold-tuned flagging (low precision 0.093).
-3. AUROC ~ties 8192neg (**0.930**); choose recipe by metric: **F1 → sym-only**; **AUROC ceiling → 8192neg or sym+morph** (marginal).
+2. **Sym contrastive+proj remains the val-tuned F1 leader** among SSL runs; **asym@16384 leads @ fixed 0.5** (typology F1 0.220 vs sym 0.211). Morphology stacking hurts threshold-tuned flagging (low precision 0.093).
+3. AUROC ~ties 8192neg (**0.930**); choose recipe by metric: **F1 @ val-tuned → sym**; **F1 @ fixed 0.5 → asym@16384**; **AUROC / FAN-OUT → 8192neg**.
 
 ## Relax grid — label-efficiency (Jun 12, 2026)
 
@@ -312,7 +335,8 @@ Stacking triangles on clustering inherits over-flagging without clustering's gat
 - ~~**M1b + sym + projection**~~ — done: 0.930 AUROC / 0.134 F1; morph hurts sym F1 (−0.088).
 - **Optional:** sym @ 8192 negs · no-queue @ 8192 (diminishing returns; see projection ablation note § grid summary).
 - ~~Label-efficiency on relax-grid encoders~~ — done (Jun 12): sym @ 10%, 8192neg @ 50–100% AUROC; sym F1 at all fractions.
-- ~~Triangles-only probe + pattern typology~~ — done (Jun 2026): F1 collapse = precision/over-flagging; fixed @ 0.5 confirms. **Cross-run typology (6 encoders):** sym+proj best F1; 8192neg best AUROC/FAN-OUT ranking; projection unlocks fan-out vs M1b; clustering+proj best gather/scatter AUROC. See § Pattern typology cross-run.
-- Fixed @ 0.5 typology on SSL leaders (sym, 8192neg) and tier-2 encoders.
+- ~~Triangles-only probe + pattern typology~~ — done (Jun 2026): **19 runs complete.** asym@16384 best F1 @ fixed 0.5 (0.220); sym best @ val-tuned (0.222); 8192neg best FAN-OUT @ 0.5 (45%). See § Pattern typology cross-run.
+- ~~Fixed @ 0.5 typology~~ — done: nine-way table complete.
+- ~~Tier-2 typology~~ — done (val-tuned + fixed @ 0.5).
 
 Artifacts: `embeddings/<unique_name>/probe_results.json`, `embeddings/<unique_name>/label_efficiency_results.json`.
