@@ -128,6 +128,48 @@ def create_parser():
         help="Optional detached queue of prior seed-edge embeddings used as extra negatives (0 disables the queue).",
     )
     parser.add_argument(
+        "--false_neg_filter_mode",
+        type=str,
+        default="none",
+        choices=["none", "same_sender", "same_receiver", "same_endpoint", "same_pair"],
+        help=(
+            "Optional exclusion-only false-negative filtering for contrastive negatives. "
+            "Filters candidates sharing sender, receiver, either endpoint, or ordered sender->receiver pair "
+            "with the anchor transaction. Default keeps existing behavior."
+        ),
+    )
+    parser.add_argument(
+        "--false_neg_filter_min_negatives",
+        type=int,
+        default=1,
+        help=(
+            "Minimum filtered negatives required per anchor row before falling back to the unfiltered "
+            "candidate set for that row (0 disables fallback)."
+        ),
+    )
+    parser.add_argument(
+        "--multi_positive_mode",
+        type=str,
+        default="none",
+        choices=["none", "same_sender", "same_receiver", "same_endpoint", "same_pair"],
+        help=(
+            "Optional endpoint-based weak positives for edge InfoNCE. Identity positives keep weight 1.0; "
+            "weak positives use --multi_positive_weight. Default keeps existing single-positive behavior."
+        ),
+    )
+    parser.add_argument(
+        "--multi_positive_weight",
+        type=float,
+        default=0.1,
+        help="Weight for weak positives when --multi_positive_mode is enabled (identity positives remain 1.0).",
+    )
+    parser.add_argument(
+        "--contrastive_temperature",
+        type=float,
+        default=0.5,
+        help="InfoNCE temperature for contrastive loss logits (default 0.5, matching prior behavior).",
+    )
+    parser.add_argument(
         "--contrast_projection_head",
         action="store_true",
         help="GraphCL-style MLP on seed embeddings before edge InfoNCE only; morphology expert and "
@@ -220,6 +262,14 @@ def create_parser():
         choices=["all", "degree", "clustering", "triangles"],
         help="Tier-1 columns in the morphology expert: all (14), degree (8), "
         "clustering (11, no triangles), triangles (11, no clustering).",
+    )
+    parser.add_argument(
+        "--morph_target_groups",
+        type=str,
+        default="all",
+        help="Semantic morphology target groups to keep for the shared expert head: "
+        "all (default) or comma-separated groups such as degree_fan,local_motif. "
+        "Uses the diagnostic target registry and leaves default behavior unchanged.",
     )
     parser.add_argument(
         "--no_morph_edge_native",

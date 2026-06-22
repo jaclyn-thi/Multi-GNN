@@ -16,7 +16,7 @@ expensive (similar cost to a train batch without backward).
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import torch
 from torch_geometric.data import Data, HeteroData
@@ -300,6 +300,7 @@ def morph_expert_loss_hetero_step(
     cfg: MorphExpertConfig,
     tier0_ctx: Optional[MorphTier0Context] = None,
     tier2_ctx: Optional[MorphTier2Context] = None,
+    diagnostics_accumulator: Optional[Dict[str, Any]] = None,
 ) -> torch.Tensor:
     """
     Single training-step morphology expert loss (hetero).
@@ -319,6 +320,7 @@ def morph_expert_loss_hetero_step(
         cfg,
         tier0_ctx=tier0_ctx,
         tier2_ctx=tier2_ctx,
+        diagnostics_accumulator=diagnostics_accumulator,
     )
     return loss
 
@@ -332,6 +334,7 @@ def morph_expert_loss_homo_step(
     cfg: MorphExpertConfig,
     tier0_ctx: Optional[MorphTier0Context] = None,
     tier2_ctx: Optional[MorphTier2Context] = None,
+    diagnostics_accumulator: Optional[Dict[str, Any]] = None,
 ) -> torch.Tensor:
     """Homogeneous-graph variant of ``morph_expert_loss_hetero_step``."""
     n_nodes = int(batch.num_nodes) if getattr(batch, "num_nodes", None) is not None else int(batch.x.shape[0])
@@ -346,6 +349,7 @@ def morph_expert_loss_homo_step(
         cfg,
         tier0_ctx=tier0_ctx,
         tier2_ctx=tier2_ctx,
+        diagnostics_accumulator=diagnostics_accumulator,
     )
     return loss
 

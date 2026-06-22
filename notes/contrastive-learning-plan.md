@@ -91,8 +91,22 @@ The six phases below are preserved from the original implementation plan, but ea
 
 4. **Optional memory queue**
    - Implemented as `EdgeMemoryQueue`
-   - Stores prior detached seed-edge embeddings and IDs
+   - Stores prior detached seed-edge embeddings, IDs, and optional `(sender, receiver)` endpoints
    - Provides extra negatives without making the current batch larger
+   - Jun 2026 ablation: for asym + projection + 8192 negatives, `queue=0` was best on Small-HI; larger queues reduced downstream AUROC/F1, likely from stale or semantically related negatives
+
+5. **Optional false-negative filtering (Jun 2026)**
+   - CLI: `--false_neg_filter_mode none|same_sender|same_receiver|same_endpoint|same_pair`
+   - Exclusion-only: removes likely related transactions from the negative pool but does **not** add them as positives
+   - Applies to sampled in-batch negatives and queue negatives when endpoint metadata is available
+   - Per-anchor fallback via `--false_neg_filter_min_negatives` keeps training stable when filtering leaves too few negatives
+   - First Small-HI no-queue result: `same_endpoint` improved F1/precision but lowered AUROC; replicate before changing defaults
+
+6. **Optional endpoint/pair multi-positive InfoNCE (Jun 2026)**
+   - CLI: `--multi_positive_mode none|same_sender|same_receiver|same_endpoint|same_pair`
+   - Same-edge positives remain weight `1.0`; endpoint/pair weak positives use `--multi_positive_weight` (e.g. `0.05–0.2`)
+   - Weak positives are added only when enabled, and are excluded from the sampled negative pool
+   - Current implementation supports endpoint/pair rules only; morphology-bin, motif, and KNN positives remain future extensions
 
 #### Important divergences from the original plan
 - We did **not** keep triplet loss and pairwise contrastive loss as near-term active alternatives
@@ -100,7 +114,8 @@ The six phases below are preserved from the original implementation plan, but ea
 - The original plan described negatives mostly as "all other samples in the batch"; the implemented path now uses:
   - sampled GPU negatives
   - optional queue negatives
-- The temperature is currently effectively fixed in the training call path rather than exposed through a broader contrastive-loss config system
+- Endpoint/pair weak positives are flag-controlled experiments, not the default training objective
+- The InfoNCE temperature is exposed as `--contrastive_temperature` (default `0.5`, matching prior behavior)
 
 #### Why the design changed
 - The original loss scaling caused OOM when trying to use larger `batch_size` or `contrastive_num_neg_samples=0`
@@ -110,7 +125,9 @@ The six phases below are preserved from the original implementation plan, but ea
 #### Remaining work in this phase
 - optionally expose more loss hyperparameters cleanly
 - optionally add richer contrastive diagnostics such as positive/negative similarity summaries
-- revisit structural positive tiers only if pretrain-native eval signals a need
+- replicate endpoint false-negative filtering across seeds before adding richer structural positive tiers
+- avoid spending more GPU on larger negative counts unless memory behavior is the research target; `10240` fit and `12288` fit only with smaller batch, but neither improved AUROC
+- future structural positives: morphology-bin, motif/typology metadata, or KNN positives
 
 ---
 
@@ -549,7 +566,12 @@ Writes `embeddings/{unique_name}/{train,val,test}.npz` and `meta.json`.
    - Status update: the ablations that became most important in practice are:
      - **contrastive projection head** on vs off (+0.088 test AUROC on Small-HI)
      - morphology expert M1b vs M2 vs BC stacks (M1b best morph-only; projection beats all for full-label probe)
-     - queue on vs off
+     - queue on vs off: latest asym + projection sweep found `queue=0` best (**0.951 AUROC**, **0.233 F1**) and larger queues worse
+     - high negatives: `10240` negatives fit with no queue; direct `12288` at `bs=8192 accum=4` OOMed; `12288` fit with `bs=4096 accum=8` but did not improve metrics
+     - false-negative filtering: `same_pair` is the leading replicated F1/recall candidate; `same_endpoint` and `same_receiver` were less stable
+     - filtered queues / higher negatives: adding `queue=32768` or raising to `10240` negatives with filtering did not improve metrics
+     - multi-positive InfoNCE: endpoint/pair weak positives underperformed exclusion-only filtering; lower `same_pair` weight `0.05` helped but still did not beat baselines
+     - temperature: configurable via `--contrastive_temperature`; lower values `0.05`, `0.10`, and `0.20` underperformed the `0.5` default
      - `contrastive_num_neg_samples=512` vs `1024`
      - **symmetric vs asymmetric InfoNCE** (relax grid): sym **0.929**/0.222 vs asym@16384 **0.920**/0.206 vs baseline asym **0.927**/0.144; **8192 negs** asym **0.930**/0.191 (Jun 11 — see projection ablation note)
      - batch size scaling
@@ -589,7 +611,7 @@ Summary of that plan:
 
 Contrastive plan still owns: homo/hetero contrastive routing, extraction, linear probe, **no AML F1 in pretrain**, **contrastive projection head**. Morphology plan owns metric definitions, phased implementation (M0–M5), and loss integration. Benchmark numbers: morphology plan Project status + README benchmark table.
 
-**Prerequisite:** stable contrastive + probe baseline — met (May–Jun 2026 Small-HI). Plain contrastive ~0.84; **contrastive+projection ~0.93**; supervised ~0.97 test AUROC at 20 ep. Morphology ablations (M1–M5) and projection ablation complete on Small-HI. **Tier-1 local clustering** (11-dim expert, optional `local_clustering` M2 group) implemented Jun 2026 — see morphology plan Phase M1c.
+**Prerequisite:** stable contrastive + probe baseline — met (May–Jun 2026 Small-HI). Plain contrastive ~0.84; **contrastive+projection reached 0.951 AUROC after disabling the queue**; supervised ~0.97 test AUROC at 20 ep. Morphology ablations (M1–M5) and projection ablation complete on Small-HI. **Tier-1 local clustering** (11-dim expert, optional `local_clustering` M2 group) implemented Jun 2026 — see morphology plan Phase M1c.
 
 ---
 
@@ -599,7 +621,7 @@ Contrastive plan still owns: homo/hetero contrastive routing, extraction, linear
 - **May 2026 GFM decisions:** (1) no AML metrics during contrastive pretrain; (2) **primary** downstream = Papagei-style **frozen extract + sklearn linear probe**; (3) in-GNN `--finetune` supervised is **secondary**, not the main scientific claim.
 - The most important architectural win was making the loss scale with shared seed edges rather than full sampled subgraph edges.
 - **`return_embeddings=True`** is the extraction hook; extraction and sklearn probe are the primary downstream path (Phases 5a/5b).
-- **Jun 2026 status:** Small-HI benchmark matrix largely complete. **Relax grid (Jun 11):** asym+8192 negs **0.930** AUROC (best contrastive+proj); sym+1024 **0.929** AUROC / **0.222** F1 (best contrastive F1); asym@16384 confound shows batch size drives most F1 lift. See [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md). MAE expert ablation done (0.898, below MSE).
-- **Best SSL recipe (development):** **F1:** sym contrastive+proj (`hi_contrastive_proj_sym_20ep_bestckpt`, **0.222**). **AUROC:** 8192neg or M1b+sym+proj (**0.930**). **Morph (asym):** clustering+proj (**0.929** / 0.156). M1b+sym+proj does **not** beat sym F1 (0.134). README benchmark table is a sanity-check log, not formal recorded experiments.
+- **Jun 2026 status:** Small-HI benchmark matrix largely complete. **Relax grid (Jun 11):** asym+8192 negs **0.930** AUROC; sym+1024 **0.929** AUROC / **0.222** F1; asym@16384 confound shows batch size drives most F1 lift. Queue sweep improves the asym + projection recipe by disabling the queue: **0.951 AUROC**, **0.233 F1**. Follow-up runs show larger negatives and filtered queues do not improve metrics; `same_pair` false-negative filtering is the leading replicated F1/recall candidate. Multi-positive InfoNCE has not beaten exclusion-only filtering. See [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md) and [`results.md`](results.md). MAE expert ablation done (0.898, below MSE).
+- **Best SSL recipe (development):** **Current AUROC recommendation:** contrastive+projection, 8192 negatives, `queue=0`, `bs=8192`, `accum=4` (**0.951** / **0.233**). **Current F1/recall candidate:** same recipe + `--false_neg_filter_mode same_pair` (mean **0.942** / **0.236** over three seeds). **Morph (asym):** clustering+proj (**0.929** / 0.156). M1b+sym+proj does **not** beat sym F1 (0.134). README benchmark table is a sanity-check log, not formal recorded experiments.
 - **Pretrain checkpoint selection:** eventually contrastive val / morphology—not AML probe val.
 - **Declined:** per-epoch AML probe during contrastive; using AML val to pick encoder weights during pretrain; treating end-to-end `--finetune` CE as the definition of GFM downstream success.

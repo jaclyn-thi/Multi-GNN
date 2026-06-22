@@ -54,9 +54,87 @@ from morphology.contrastive_train import (
     morph_expert_loss_hetero_step,
     morph_expert_loss_homo_step,
 )
-from morphology.expert import setup_morphology_expert, setup_morph_tier0_contexts
+from morphology.expert import (
+    finalize_morph_expert_diagnostics,
+    setup_morph_tier0_contexts,
+    setup_morphology_expert,
+)
 import wandb
 import logging
+
+
+def _edge_endpoints_for_ids(edge_index: torch.Tensor, edge_ids: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Return ``(src, dst)`` endpoints for split-local edge ids."""
+    if edge_ids.numel() == 0:
+        return torch.empty((0, 2), device=device, dtype=torch.long)
+    endpoints = edge_index[:, edge_ids.detach().long().cpu()].T.contiguous()
+    return endpoints.to(device=device, non_blocking=True).long()
+
+
+def _log_false_neg_filter_stats(prefix: str, stats: dict, mode: str) -> None:
+    before = float(stats.get("candidate_before", 0.0))
+    after = float(stats.get("candidate_after", 0.0))
+    if before <= 0:
+        return
+    removed = max(0.0, before - after)
+    frac = removed / before
+    fallback_rows = int(stats.get("fallback_rows", 0.0))
+    rows = int(stats.get("rows", 0.0))
+    logging.info(
+        "%s false-negative filter (%s): candidates before=%d after=%d removed=%d (%.4f), fallback_rows=%d/%d",
+        prefix,
+        mode,
+        int(before),
+        int(after),
+        int(removed),
+        frac,
+        fallback_rows,
+        rows,
+    )
+    if fallback_rows > 0:
+        logging.warning(
+            "%s false-negative filter (%s): fallback used for %d/%d anchor rows with too few negatives.",
+            prefix,
+            mode,
+            fallback_rows,
+            rows,
+        )
+
+
+def _log_multi_positive_stats(prefix: str, stats: dict, mode: str, weight: float) -> None:
+    anchors = float(stats.get("anchors", 0.0))
+    if mode == "none" or anchors <= 0:
+        return
+    identity = float(stats.get("identity_positives", 0.0))
+    weak = float(stats.get("weak_positives", 0.0))
+    total_pos = float(stats.get("total_positives", identity + weak))
+    anchors_without_weak = float(stats.get("anchors_without_weak", 0.0))
+    logging.info(
+        "%s multi-positive mode=%s weight=%.4f: identity_pos=%d weak_pos=%d avg_pos_per_anchor=%.4f anchors_without_weak=%.4f",
+        prefix,
+        mode,
+        float(weight),
+        int(identity),
+        int(weak),
+        total_pos / anchors,
+        anchors_without_weak / anchors,
+    )
+
+
+def _log_morphology_group_losses(prefix: str, metrics: dict) -> None:
+    """Print compact morphology group diagnostics for Slurm/stdout inspection."""
+    if not metrics:
+        return
+    parts = []
+    total = metrics.get("morphology/loss_total")
+    if total is not None:
+        parts.append(f"total={float(total):.4f}")
+    for key in sorted(metrics):
+        if key.startswith("morphology/loss_group/"):
+            group = key.rsplit("/", 1)[-1]
+            parts.append(f"{group}={float(metrics[key]):.4f}")
+    if parts:
+        logging.info("%s morphology losses: %s", prefix, " ".join(parts))
 
 
 def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, model, optimizer, loss_fn, args, config, device, val_data, te_data, data_config):
@@ -78,6 +156,15 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
     accum_steps = max(1, int(getattr(args, "contrastive_accum_steps", 1)))
     memory_bank_size = max(0, int(getattr(args, "contrastive_memory_bank_size", 0)))
     memory_queue = EdgeMemoryQueue(memory_bank_size, device=device) if memory_bank_size > 0 else None
+    false_neg_filter_mode = str(getattr(args, "false_neg_filter_mode", "none"))
+    false_neg_filter_min_negatives = max(0, int(getattr(args, "false_neg_filter_min_negatives", 1)))
+    multi_positive_mode = str(getattr(args, "multi_positive_mode", "none"))
+    multi_positive_weight = float(getattr(args, "multi_positive_weight", 0.1))
+    contrastive_temperature = float(getattr(args, "contrastive_temperature", 0.5))
+    if contrastive_temperature <= 0.0:
+        raise ValueError("--contrastive_temperature must be > 0.")
+    logging.info("Contrastive temperature: %.4f", contrastive_temperature)
+    train_edge_index = tr_loader.data.edge_index.detach().cpu()
     try:
         n_train_batches = len(tr_loader)
     except TypeError:
@@ -103,6 +190,9 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
         total_examples = 0
         loss_sum = torch.zeros((), device=device)
         morph_loss_sum = torch.zeros((), device=device)
+        morph_diag_accumulator = {} if morph_head is not None else None
+        false_neg_stats = dict()
+        multi_pos_stats = dict()
         optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(tqdm.tqdm(tr_loader, disable=not args.tqdm)):
             seed_edge_ids = get_homo_seed_edge_ids(batch, tr_loader.data)
@@ -177,17 +267,29 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
                 if max_soft <= 0:
                     max_soft = None
                 z1_con, z2_con = project_seed_pair(proj_head, z1_seed, z2_seed)
+                seed_endpoints = (
+                    _edge_endpoints_for_ids(train_edge_index, seed_id1, device)
+                    if false_neg_filter_mode != "none" or multi_positive_mode != "none"
+                    else None
+                )
                 loss_raw = edge_identity_infonce_loss(
                     z1_con,
                     z2_con,
                     seed_id1,
                     seed_id2,
-                    temperature=0.5,
+                    temperature=contrastive_temperature,
                     num_neg_samples=num_neg_samples,
                     symmetric=contrastive_symmetric,
                     memory_queue=memory_queue,
                     morph_bin_ids=morph_bins,
                     max_soft_positives=max_soft,
+                    edge_endpoints=seed_endpoints,
+                    false_neg_filter_mode=false_neg_filter_mode,
+                    false_neg_filter_min_negatives=false_neg_filter_min_negatives,
+                    false_neg_filter_stats=false_neg_stats,
+                    multi_positive_mode=multi_positive_mode,
+                    multi_positive_weight=multi_positive_weight,
+                    multi_positive_stats=multi_pos_stats,
                 )
                 # M1/M1b: predict detached morphology targets from z_seed (view1)
                 if morph_head is not None and morph_cfg is not None:
@@ -200,6 +302,7 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
                         morph_cfg,
                         tier0_ctx=getattr(args, "morph_tier0_train", None),
                         tier2_ctx=getattr(args, "morph_tier2_train", None),
+                        diagnostics_accumulator=morph_diag_accumulator,
                     )
                     loss_raw = loss_raw + morph_loss
                     morph_loss_sum = morph_loss_sum + morph_loss.detach()
@@ -224,7 +327,12 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
 
             if memory_queue is not None and seed_id2.numel() > 0:
                 z2_queue = project_seeds(proj_head, z2_seed)
-                memory_queue.enqueue(z2_queue, seed_id2)
+                queue_endpoints = (
+                    _edge_endpoints_for_ids(train_edge_index, seed_id2, device)
+                    if false_neg_filter_mode != "none" or multi_positive_mode != "none"
+                    else None
+                )
+                memory_queue.enqueue(z2_queue, seed_id2, queue_endpoints)
 
             loss_sum = loss_sum + loss_raw.detach()
             total_examples += 1
@@ -234,13 +342,19 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
         if morph_head is not None:
             avg_morph = float((morph_loss_sum / max(total_examples, 1)).cpu())
             log_payload["morph/expert_train"] = avg_morph
+            log_payload["morphology/loss_total"] = avg_morph
+            morph_diag_metrics = finalize_morph_expert_diagnostics(morph_diag_accumulator)
+            log_payload.update(morph_diag_metrics)
             if val_loader is not None and should_run_morph_val(epoch, config.epochs, args):
                 log_payload["morph/expert_val"] = eval_morph_expert_val_homo(
                     val_loader, model, morph_head, morph_cfg, device, args
                 )
             logging.info(f"Train Loss: {avg_loss:.4f} | morph/expert_train: {avg_morph:.4f}")
+            _log_morphology_group_losses("homo/train", log_payload)
         else:
             logging.info(f"Train Loss: {avg_loss:.4f}")
+        _log_false_neg_filter_stats("homo/train", false_neg_stats, false_neg_filter_mode)
+        _log_multi_positive_stats("homo/train", multi_pos_stats, multi_positive_mode, multi_positive_weight)
         if (
             morph_contrast_cfg is not None
             and val_loader is not None
@@ -430,6 +544,15 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
     accum_steps = max(1, int(getattr(args, "contrastive_accum_steps", 1)))
     memory_bank_size = max(0, int(getattr(args, "contrastive_memory_bank_size", 0)))
     memory_queue = EdgeMemoryQueue(memory_bank_size, device=device) if memory_bank_size > 0 else None
+    false_neg_filter_mode = str(getattr(args, "false_neg_filter_mode", "none"))
+    false_neg_filter_min_negatives = max(0, int(getattr(args, "false_neg_filter_min_negatives", 1)))
+    multi_positive_mode = str(getattr(args, "multi_positive_mode", "none"))
+    multi_positive_weight = float(getattr(args, "multi_positive_weight", 0.1))
+    contrastive_temperature = float(getattr(args, "contrastive_temperature", 0.5))
+    if contrastive_temperature <= 0.0:
+        raise ValueError("--contrastive_temperature must be > 0.")
+    logging.info("Contrastive temperature: %.4f", contrastive_temperature)
+    train_edge_index = tr_loader.data[FORWARD_EDGE_TYPE].edge_index.detach().cpu()
     try:
         n_train_batches = len(tr_loader)
     except TypeError:
@@ -455,6 +578,9 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
         total_examples = 0
         loss_sum = torch.zeros((), device=device)
         morph_loss_sum = torch.zeros((), device=device)
+        morph_diag_accumulator = {} if morph_head is not None else None
+        false_neg_stats = dict()
+        multi_pos_stats = dict()
         optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(tqdm.tqdm(tr_loader, disable=not args.tqdm)):
             seed_edge_ids = get_hetero_seed_edge_ids(batch, tr_loader.data)
@@ -546,17 +672,29 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                 if max_soft <= 0:
                     max_soft = None
                 z1_con, z2_con = project_seed_pair(proj_head, z1_seed, z2_seed)
+                seed_endpoints = (
+                    _edge_endpoints_for_ids(train_edge_index, seed_id1, device)
+                    if false_neg_filter_mode != "none" or multi_positive_mode != "none"
+                    else None
+                )
                 loss_raw = edge_identity_infonce_loss(
                     z1_con,
                     z2_con,
                     seed_id1,
                     seed_id2,
-                    temperature=0.5,
+                    temperature=contrastive_temperature,
                     num_neg_samples=num_neg_samples,
                     symmetric=contrastive_symmetric,
                     memory_queue=memory_queue,
                     morph_bin_ids=morph_bins,
                     max_soft_positives=max_soft,
+                    edge_endpoints=seed_endpoints,
+                    false_neg_filter_mode=false_neg_filter_mode,
+                    false_neg_filter_min_negatives=false_neg_filter_min_negatives,
+                    false_neg_filter_stats=false_neg_stats,
+                    multi_positive_mode=multi_positive_mode,
+                    multi_positive_weight=multi_positive_weight,
+                    multi_positive_stats=multi_pos_stats,
                 )
                 # M1/M1b: auxiliary morphology MSE on shared seed embeddings
                 if morph_head is not None and morph_cfg is not None:
@@ -569,6 +707,7 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                         morph_cfg,
                         tier0_ctx=getattr(args, "morph_tier0_train", None),
                         tier2_ctx=getattr(args, "morph_tier2_train", None),
+                        diagnostics_accumulator=morph_diag_accumulator,
                     )
                     loss_raw = loss_raw + morph_loss
                     morph_loss_sum = morph_loss_sum + morph_loss.detach()
@@ -593,7 +732,12 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
 
             if memory_queue is not None and seed_id2.numel() > 0:
                 z2_queue = project_seeds(proj_head, z2_seed)
-                memory_queue.enqueue(z2_queue, seed_id2)
+                queue_endpoints = (
+                    _edge_endpoints_for_ids(train_edge_index, seed_id2, device)
+                    if false_neg_filter_mode != "none" or multi_positive_mode != "none"
+                    else None
+                )
+                memory_queue.enqueue(z2_queue, seed_id2, queue_endpoints)
 
             loss_sum = loss_sum + loss_raw.detach()
             total_examples += 1
@@ -603,13 +747,19 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
         if morph_head is not None:
             avg_morph = float((morph_loss_sum / max(total_examples, 1)).cpu())
             log_payload["morph/expert_train"] = avg_morph
+            log_payload["morphology/loss_total"] = avg_morph
+            morph_diag_metrics = finalize_morph_expert_diagnostics(morph_diag_accumulator)
+            log_payload.update(morph_diag_metrics)
             if val_loader is not None and should_run_morph_val(epoch, config.epochs, args):
                 log_payload["morph/expert_val"] = eval_morph_expert_val_hetero(
                     val_loader, model, morph_head, morph_cfg, device, args
                 )
             logging.info(f"Train Loss: {avg_loss:.4f} | morph/expert_train: {avg_morph:.4f}")
+            _log_morphology_group_losses("hetero/train", log_payload)
         else:
             logging.info(f"Train Loss: {avg_loss:.4f}")
+        _log_false_neg_filter_stats("hetero/train", false_neg_stats, false_neg_filter_mode)
+        _log_multi_positive_stats("hetero/train", multi_pos_stats, multi_positive_mode, multi_positive_weight)
         if (
             morph_contrast_cfg is not None
             and val_loader is not None

@@ -65,14 +65,68 @@ Hyperparameters for each architecture come from [`model_settings.json`](../model
 | `--amp` | off | CUDA automatic mixed precision |
 | `--gradient_checkpointing` | off | Gradient checkpointing in GIN layers (GIN only) |
 | `--contrastive_num_neg_samples` | `8192` | InfoNCE negatives per anchor (`0` = all negatives, chunked) |
+| `--contrastive_temperature` | `0.5` | InfoNCE logit temperature; lower values sharpen positive/negative separation |
 | `--contrastive_asymmetric` | off | **Asymmetric InfoNCE:** loss = `L(z1→z2)` only; view2 under `no_grad`. Saves ~half backward VRAM vs symmetric |
 | `--contrastive_accum_steps` | `1` | Gradient accumulation steps before `optimizer.step` |
-| `--contrastive_memory_bank_size` | `0` | FIFO queue of past view2 embeddings as extra negatives (MoCo-style). `0` = disabled; morph runs often use `32768` |
+| `--contrastive_memory_bank_size` | `0` | FIFO queue of past view2 embeddings as extra negatives (MoCo-style). `0` = disabled and is currently recommended for asym + projection on Small-HI |
 | `--contrast_projection_head` | off | GraphCL-style MLP before InfoNCE only; extraction uses encoder `z` |
 | `--contrast_projection_hidden` | `128` | Hidden width when projection head enabled |
 | `--contrast_projection_dim` | `128` | Projection output dim (default matches embedding dim) |
 
 Hetero contrastive training (`--reverse_mp --objective contrastive`) uses the same augmentation and InfoNCE machinery on the heterogeneous graph path.
+
+Practical Small-HI guidance:
+
+- Current strongest asym + projection run: `--contrastive_num_neg_samples 8192 --contrastive_memory_bank_size 0 --batch_size 8192 --contrastive_accum_steps 4`.
+- Queue-size ablations found `queue=0` best; larger queues reduced downstream AUROC/F1 in this setup.
+- Temperature is configurable with `--contrastive_temperature`; the current recipe should keep the default `0.5`. Lower values `0.05`, `0.10`, and `0.20` underperformed in the first sweep.
+- `10240` negatives fits with `queue=0`, `batch_size=8192`, `accum=4`, but did not improve AUROC. Direct `12288` at that batch size OOMed; `12288` fits with `batch_size=4096`, `accum=8` but did not improve metrics.
+- Adding back `queue=32768` with false-negative filtering still hurt, so keep `queue=0` unless explicitly testing queues.
+
+### False-negative filtering and multi-positive InfoNCE
+
+These flags are optional experiments for the edge-level contrastive loss. Defaults preserve the current identity-only InfoNCE behavior.
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--false_neg_filter_mode` | `none` | Exclude likely false negatives from the negative pool. Modes: `same_sender`, `same_receiver`, `same_endpoint`, `same_pair` |
+| `--false_neg_filter_min_negatives` | `1` | Per-anchor fallback threshold. If fewer than this many candidates remain after filtering, that anchor uses the unfiltered candidate set |
+| `--multi_positive_mode` | `none` | Add endpoint/pair weak positives in the numerator. Modes: `same_sender`, `same_receiver`, `same_endpoint`, `same_pair` |
+| `--multi_positive_weight` | `0.1` | Weight for weak positives. Identity positives remain weight `1.0` |
+
+Mode semantics:
+
+| Mode | Relationship to anchor transaction `(sender, receiver)` |
+|------|--------------------------------------------------------|
+| `same_sender` | candidate has the same sender |
+| `same_receiver` | candidate has the same receiver |
+| `same_endpoint` | candidate shares either endpoint with the anchor |
+| `same_pair` | candidate has the same ordered sender→receiver pair |
+
+Implementation notes:
+
+- False-negative filtering is **exclusion-only**: filtered candidates are removed from the denominator, not added as positives.
+- Multi-positive mode adds weak endpoint/pair positives among the aligned current cross-view seed batch; queue entries matching the weak-positive rule are excluded as negatives but are not used as positives.
+- Both features use split-local edge endpoints from the forward `edge_index`; they are compatible with asymmetric/symmetric InfoNCE, projection head, sampled negatives, and the memory queue.
+- Logs include before/after candidate counts for filtering, fallback rows, identity positives, weak positives, average positives per anchor, and fraction of anchors without weak positives.
+- Small-HI follow-up: `--false_neg_filter_mode same_pair` is the leading F1/recall candidate across seeds. `same_endpoint` and `same_receiver` were less stable. Default remains `none`.
+- Multi-positive runs so far underperform exclusion-only filtering. Lower `same_pair` weight `0.05` helped relative to `0.1`, but still did not beat no-filter or `same_pair` false-negative filtering.
+
+Example:
+
+```bash
+python main.py \
+  --data Small-HI --model gin \
+  --objective contrastive \
+  --unique_name hi_contrastive_proj_same_endpoint_pos \
+  --reverse_mp --ego --ports \
+  --contrast_projection_head \
+  --contrastive_asymmetric \
+  --contrastive_num_neg_samples 8192 \
+  --contrastive_memory_bank_size 32768 \
+  --multi_positive_mode same_endpoint \
+  --multi_positive_weight 0.1
+```
 
 ---
 
@@ -93,7 +147,19 @@ Requires `--objective contrastive` and `--morph_expert`. Adds `L_morph_expert` (
 | `--morph_expert_layout` | `shared` | `shared` or `grouped` (M5a) |
 | `--morph_expert_group_weight_tier2` | `1.0` | Tier 2 block weight when `layout=grouped` |
 | `--morph_local_subset` | `all` | Tier-1 columns: `all` (14), `degree` (8), `clustering` (11), `triangles` (11) |
+| `--morph_target_groups` | `all` | Shared-head target filter by semantic group, e.g. `degree_fan`, `local_motif`, or `degree_fan,local_motif` |
 | `--no_morph_edge_native` | off | Exclude forward `edge_attr` from morphology targets |
+
+Expert diagnostics log the unchanged total loss as `morph/expert_train` and
+`morphology/loss_total`, plus per-group MSE keys such as
+`morphology/loss_group/degree_fan`, `local_motif`, `centrality`,
+`volume_activity`, `temporal`, and `other`. These logs are diagnostic only; they
+do not change the shared expert head or default loss. Group losses are also
+printed to stdout once per epoch for Slurm smoke-test inspection.
+
+Use `--morph_target_groups` for targeted diagnostics that keep the same shared
+expert head but predict only selected semantic target groups. Default `all`
+preserves the historical target vector and training behavior.
 
 ---
 

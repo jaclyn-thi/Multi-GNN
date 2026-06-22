@@ -14,11 +14,11 @@ How to format and load transaction graph data for Multi-GNN. Folder names under 
 
 Source: [IBM AML transaction datasets](https://www.kaggle.com/datasets/ealtman2019/ibm-transactions-for-anti-money-laundering-aml/data) (Egressy et al., NeurIPS 2023).
 
-1. Download CSV(s) from Kaggle (e.g. `HI-Ssmall_Trans.csv` for the small, high-illicitness split).
+1. Download CSV(s) from Kaggle (e.g. `HI-Small_Trans.csv` for the small, high-illicitness split).
 2. Format each file:
 
 ```bash
-python format_kaggle_files.py /path/to/HI-Ssmall_Trans.csv
+python format_kaggle_files.py /path/to/HI-Small_Trans.csv
 ```
 
 This writes `formatted_transactions.csv` next to the input.

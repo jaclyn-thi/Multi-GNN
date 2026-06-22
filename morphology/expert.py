@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from dataset_specs import DEFAULT_EDGE_FEATURE_COLS
+from morphology.target_registry import MORPH_TARGET_GROUPS, morph_target_group, safe_target_log_name
 from morphology.tier0_global import (
     DEFAULT_LIFT_FEATURE_NAMES,
     MorphTier0Context,
@@ -38,6 +40,7 @@ from morphology.tier2_global import (
     morph_targets_includes_tier2,
     setup_morph_tier2_contexts,
     tier2_bc_lift_dim,
+    tier2_bc_lift_feature_names,
 )
 from morphology.tier1_local import (
     LOCAL_FEATURE_NAMES,
@@ -46,6 +49,7 @@ from morphology.tier1_local import (
     gather_seed_forward_edge_attr,
     local_count_indices_in_subset,
     local_feature_dim_for_subset,
+    local_feature_names_for_subset,
     slice_local_morph_features,
     transform_morph_targets,
 )
@@ -83,6 +87,8 @@ class MorphExpertConfig:
     local_subset :
         Tier-1 expert columns: ``all`` (14), ``clustering`` (11, no triangles),
         ``triangles`` (11, no clustering), or ``degree`` (8).
+    target_groups :
+        Optional semantic target groups to keep. Empty means all groups.
     """
 
     embedding_dim: int = 128
@@ -100,6 +106,7 @@ class MorphExpertConfig:
     group_weight_tier2: float = 1.0
     group_weight_edge_native: float = 1.0
     local_subset: str = "all"
+    target_groups: Tuple[str, ...] = ()
 
 
 class MorphologyExpertHead(nn.Module):
@@ -173,6 +180,46 @@ def morph_target_blocks(cfg: MorphExpertConfig) -> List[Tuple[str, slice]]:
     return blocks
 
 
+def _edge_native_target_names(edge_attr_dim: int) -> List[str]:
+    base = list(DEFAULT_EDGE_FEATURE_COLS)
+    n = int(edge_attr_dim)
+    if n <= len(base):
+        return base[:n]
+    return base + [f"edge_native_{i}" for i in range(len(base), n)]
+
+
+def _all_morph_target_names(cfg: MorphExpertConfig) -> List[str]:
+    """Return unfiltered scalar morphology target names in target column order."""
+
+    names = list(local_feature_names_for_subset(cfg.local_subset))
+    if cfg.include_global:
+        names.extend(DEFAULT_LIFT_FEATURE_NAMES)
+    if cfg.include_tier2:
+        names.extend(tier2_bc_lift_feature_names(cfg.tier2_lift_mode))
+    if cfg.include_edge_native:
+        names.extend(_edge_native_target_names(cfg.edge_attr_dim))
+    return names
+
+
+def morph_target_indices(cfg: MorphExpertConfig) -> Tuple[int, ...]:
+    """Return selected target column indices after semantic group filtering."""
+
+    names = _all_morph_target_names(cfg)
+    groups = tuple(getattr(cfg, "target_groups", ()) or ())
+    if not groups:
+        return tuple(range(len(names)))
+    selected = set(groups)
+    return tuple(i for i, name in enumerate(names) if morph_target_group(name) in selected)
+
+
+def morph_target_names(cfg: MorphExpertConfig) -> List[str]:
+    """Return selected scalar morphology target names in expert target column order."""
+
+    names = _all_morph_target_names(cfg)
+    idx = morph_target_indices(cfg)
+    return [names[i] for i in idx]
+
+
 def _group_weight_for_block(block_name: str, cfg: MorphExpertConfig) -> float:
     return {
         "local": float(cfg.group_weight_local),
@@ -223,6 +270,130 @@ def morph_expert_regression_loss(
     if pred.numel() == 0:
         return pred.new_zeros(())
     return _morph_expert_elementwise_loss(pred, target, loss_type)
+
+
+def morph_expert_mse_diagnostics(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    cfg: MorphExpertConfig,
+) -> Dict[str, Any]:
+    """
+    Detached per-group and per-target MSE diagnostics.
+
+    This helper does not participate in gradient computation and does not change
+    the expert loss. Non-finite target/prediction cells are ignored. Empty groups
+    are omitted rather than logged as NaN.
+    """
+
+    out: Dict[str, Any] = {
+        "total_sum": pred.new_zeros(()).detach(),
+        "total_count": 0,
+        "groups": {},
+        "targets": {},
+    }
+    if pred.numel() == 0 or target.numel() == 0:
+        return out
+    if pred.shape != target.shape:
+        raise ValueError("pred and target must have matching shapes for morphology diagnostics")
+
+    names = morph_target_names(cfg)
+    if len(names) < pred.shape[1]:
+        names = names + [f"target_{i}" for i in range(len(names), pred.shape[1])]
+    elif len(names) > pred.shape[1]:
+        names = names[: pred.shape[1]]
+
+    with torch.no_grad():
+        finite = torch.isfinite(pred) & torch.isfinite(target)
+        sq_err = (pred.detach() - target.detach()).pow(2)
+        total_mask = finite
+        total_count = int(total_mask.sum().item())
+        if total_count > 0:
+            out["total_sum"] = sq_err[total_mask].sum().detach()
+            out["total_count"] = total_count
+
+        for col_idx, target_name in enumerate(names):
+            col_mask = finite[:, col_idx]
+            count = int(col_mask.sum().item())
+            if count == 0:
+                continue
+            loss_sum = sq_err[:, col_idx][col_mask].sum().detach()
+            safe_name = safe_target_log_name(target_name)
+            out["targets"][safe_name] = {
+                "sum": loss_sum,
+                "count": count,
+                "raw_name": target_name,
+            }
+            group_name = morph_target_group(target_name)
+            group_entry = out["groups"].setdefault(
+                group_name,
+                {"sum": pred.new_zeros(()).detach(), "count": 0},
+            )
+            group_entry["sum"] = group_entry["sum"] + loss_sum
+            group_entry["count"] += count
+    return out
+
+
+def update_morph_expert_diagnostics_accumulator(
+    accumulator: Dict[str, Any],
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    cfg: MorphExpertConfig,
+) -> None:
+    """Accumulate detached morphology MSE diagnostics into ``accumulator``."""
+
+    diag = morph_expert_mse_diagnostics(pred, target, cfg)
+    accumulator["total_sum"] = accumulator.get("total_sum", pred.new_zeros(()).detach()) + diag["total_sum"]
+    accumulator["total_count"] = int(accumulator.get("total_count", 0)) + int(diag["total_count"])
+    groups = accumulator.setdefault("groups", {})
+    for group_name, values in diag["groups"].items():
+        entry = groups.setdefault(
+            group_name,
+            {"sum": pred.new_zeros(()).detach(), "count": 0},
+        )
+        entry["sum"] = entry["sum"] + values["sum"]
+        entry["count"] += int(values["count"])
+    targets = accumulator.setdefault("targets", {})
+    for target_name, values in diag["targets"].items():
+        entry = targets.setdefault(
+            target_name,
+            {
+                "sum": pred.new_zeros(()).detach(),
+                "count": 0,
+                "raw_name": values.get("raw_name", target_name),
+            },
+        )
+        entry["sum"] = entry["sum"] + values["sum"]
+        entry["count"] += int(values["count"])
+
+
+def finalize_morph_expert_diagnostics(
+    accumulator: Optional[Dict[str, Any]],
+) -> Dict[str, float]:
+    """Convert accumulated diagnostics into W&B/log-payload metric keys."""
+
+    if not accumulator:
+        return {}
+    metrics: Dict[str, float] = {}
+    total_count = int(accumulator.get("total_count", 0))
+    if total_count > 0:
+        metrics["morphology/loss_mse_total"] = float(
+            (accumulator["total_sum"] / total_count).detach().cpu()
+        )
+    for group_name, values in sorted(accumulator.get("groups", {}).items()):
+        count = int(values.get("count", 0))
+        if count <= 0:
+            continue
+        metrics[f"morphology/loss_group/{group_name}"] = float(
+            (values["sum"] / count).detach().cpu()
+        )
+    for target_name, values in sorted(accumulator.get("targets", {}).items()):
+        count = int(values.get("count", 0))
+        if count <= 0:
+            continue
+        metrics[f"morphology/loss_target/{target_name}"] = float(
+            (values["sum"] / count).detach().cpu()
+        )
+    return metrics
 
 
 def morph_expert_grouped_mse_loss(
@@ -306,13 +477,22 @@ def build_morph_targets(
         edge_native = gather_seed_forward_edge_attr(
             seed_edge_attr, subgraph_edge_ids, seed_edge_ids
         )
-    return transform_morph_targets(
+    targets = transform_morph_targets(
         local,
         edge_native=edge_native,
         global_feats=global_feats,
         tier2_feats=tier2_feats,
         local_count_indices=local_count_indices_in_subset(cfg.local_subset),
     ).detach()
+    idx = morph_target_indices(cfg)
+    if len(idx) == targets.shape[1]:
+        return targets
+    if not idx:
+        raise ValueError(
+            "morphology target group filter selected zero columns; "
+            f"requested groups={getattr(cfg, 'target_groups', ())!r}"
+        )
+    return targets[:, list(idx)]
 
 
 def morphology_expert_step(
@@ -326,6 +506,7 @@ def morphology_expert_step(
     cfg: MorphExpertConfig,
     tier0_ctx: Optional[MorphTier0Context] = None,
     tier2_ctx: Optional[MorphTier2Context] = None,
+    diagnostics_accumulator: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Compute morphology expert loss for one batch of shared seeds.
@@ -354,6 +535,13 @@ def morphology_expert_step(
         targets = targets[:min_n]
 
     pred = expert_head(z_use)
+    if diagnostics_accumulator is not None:
+        update_morph_expert_diagnostics_accumulator(
+            diagnostics_accumulator,
+            pred,
+            targets,
+            cfg,
+        )
     loss_type = str(cfg.loss_type).lower()
     if cfg.layout == "grouped":
         loss = morph_expert_grouped_regression_loss(pred, targets, cfg, loss_type)
@@ -367,14 +555,8 @@ def target_dim_for_config(
     edge_attr_dim: int,
     cfg: MorphExpertConfig,
 ) -> int:
-    n = local_feature_dim_for_subset(cfg.local_subset)
-    if cfg.include_global:
-        n += len(DEFAULT_LIFT_FEATURE_NAMES)
-    if cfg.include_tier2:
-        n += tier2_bc_lift_dim(cfg.tier2_lift_mode)
-    if cfg.include_edge_native:
-        n += int(edge_attr_dim)
-    return n
+    cfg.edge_attr_dim = int(edge_attr_dim)
+    return len(morph_target_names(cfg))
 
 
 def _block_dims_for_config(edge_attr_dim: int, cfg: MorphExpertConfig) -> Dict[str, int]:
@@ -411,6 +593,20 @@ def _morph_targets_mode(args) -> str:
 
 
 VALID_MORPH_TARGETS = frozenset({"local", "local+global", "local+tier2", "local+global+tier2"})
+
+
+def _parse_morph_target_groups(raw: str) -> Tuple[str, ...]:
+    value = str(raw or "all").strip().lower()
+    if value in ("", "all"):
+        return ()
+    groups = tuple(part.strip() for part in value.split(",") if part.strip())
+    invalid = sorted(set(groups) - set(MORPH_TARGET_GROUPS))
+    if invalid:
+        raise ValueError(
+            f"--morph_target_groups contains invalid groups {invalid}; "
+            f"use 'all' or a comma-separated subset of {list(MORPH_TARGET_GROUPS)}."
+        )
+    return groups
 
 
 def setup_morphology_expert(args, tr_data, device, is_hetero: bool):
@@ -456,6 +652,12 @@ def setup_morphology_expert(args, tr_data, device, is_hetero: bool):
         raise ValueError(
             f"--morph_expert_layout {layout!r} is invalid; use 'shared' or 'grouped'."
         )
+    target_groups = _parse_morph_target_groups(getattr(args, "morph_target_groups", "all"))
+    if target_groups and layout == "grouped":
+        raise ValueError(
+            "--morph_target_groups currently supports the shared expert head only; "
+            "use --morph_expert_layout shared."
+        )
     loss_type = str(getattr(args, "morph_expert_loss", "mse")).lower()
     if loss_type not in VALID_MORPH_EXPERT_LOSS_TYPES:
         raise ValueError(
@@ -481,6 +683,7 @@ def setup_morphology_expert(args, tr_data, device, is_hetero: bool):
         layout=layout,
         group_weight_tier2=float(getattr(args, "morph_expert_group_weight_tier2", 1.0)),
         local_subset=local_subset,
+        target_groups=target_groups,
     )
     head, cfg = create_morph_expert_bundle(edge_attr_dim, cfg, device)
     extra = ""
@@ -493,8 +696,11 @@ def setup_morphology_expert(args, tr_data, device, is_hetero: bool):
     layout_extra = ""
     if cfg.layout == "grouped":
         layout_extra = f" layout=grouped w_tier2={cfg.group_weight_tier2:g}"
+    group_extra = ""
+    if cfg.target_groups:
+        group_extra = f" target_groups={','.join(cfg.target_groups)}"
     logging.info(
-        "Morphology expert head: target_dim=%d (local=%d subset=%s%s) loss=%s weight=%.4f morph_targets=%s%s",
+        "Morphology expert head: target_dim=%d (local=%d subset=%s%s) loss=%s weight=%.4f morph_targets=%s%s%s",
         head.target_dim,
         local_feature_dim_for_subset(cfg.local_subset),
         cfg.local_subset,
@@ -503,6 +709,7 @@ def setup_morphology_expert(args, tr_data, device, is_hetero: bool):
         cfg.loss_weight,
         targets,
         layout_extra,
+        group_extra,
     )
     return head, cfg
 
@@ -515,16 +722,20 @@ __all__ = [
     "MorphologyGroupedExpertHead",
     "build_morph_targets",
     "create_morph_expert_bundle",
+    "finalize_morph_expert_diagnostics",
     "morph_expert_grouped_mae_loss",
     "morph_expert_grouped_mse_loss",
     "morph_expert_grouped_regression_loss",
     "morph_expert_mae_loss",
+    "morph_expert_mse_diagnostics",
     "morph_expert_mse_loss",
     "morph_expert_regression_loss",
     "morph_target_blocks",
+    "morph_target_names",
     "morphology_expert_step",
     "setup_morphology_expert",
     "setup_morph_tier0_contexts",
     "setup_morph_tier2_contexts",
     "target_dim_for_config",
+    "update_morph_expert_diagnostics_accumulator",
 ]

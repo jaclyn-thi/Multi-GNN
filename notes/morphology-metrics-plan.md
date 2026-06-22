@@ -566,11 +566,12 @@ Phases are listed in dependency order below. The phase summary in [`morphology-r
 
 ### Phase M1 — expert head only (v0, local targets) ✅
 
-- [x] Online Tier-1 on view1 subgraph: `compute_local_morphology_torch` + `transform_morph_targets` (+ optional edge-native). **11** local dims since M1c (was 8 before clustering).
+- [x] Online Tier-1 on view1 subgraph: `compute_local_morphology_torch` + `transform_morph_targets` (+ optional edge-native). **14** local dims since M1c (8 degree/ego + 3 clustering + 3 triangle).
 - [x] `MorphologyExpertHead` in [`morphology/expert.py`](../morphology/expert.py).
 - [x] `L_morph_expert` (MSE, weighted by `--morph_expert_weight`).
 - [x] Wired into `train_hetero_contrastive` and `train_homo_contrastive` via `--morph_expert`.
 - [x] Logs `morph/expert_train`, `morph/expert_val` (val loader pass, no AML).
+- [x] Diagnostic per-group train MSE logging: `morphology/loss_group/{degree_fan,local_motif,centrality,flow_balance,volume_activity,temporal,other}` plus optional per-target keys. This does **not** change the shared expert head or total expert loss.
 - [x] Eval: **frozen extract + linear probe** vs contrastive baseline → `embeddings/hi_morphology_20ep/` vs `embeddings/hi_contrastive_20ep/` (Jun 2026: test AUROC 0.910 vs 0.839).
 
 **CLI flags** (`util.py`): `--morph_expert`, `--morph_targets local`, `--morph_expert_weight`, `--morph_expert_hidden`, `--no_morph_edge_native`.

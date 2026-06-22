@@ -28,12 +28,38 @@ Label-free structural features on each **seed transaction**. Uses:
 
 | `--morph_targets` | Blocks included | Default expert dims |
 |-------------------|-----------------|---------------------|
-| `local` (M1) | Tier 1 + edge-native | **15** (11 + 4) |
-| `local+global` (M1b) | Tier 1 + Tier 0 lift + edge-native | **24** (11 + 9 + 4) |
-| `local+tier2` | Tier 1 + BC lift + edge-native | **19** (11 + 4 + 4) |
-| `local+global+tier2` (M3) | all blocks | **28** (11 + 9 + 4 + 4) |
+| `local` (M1) | Tier 1 + edge-native | **18** (14 + 4) |
+| `local+global` (M1b) | Tier 1 + Tier 0 lift + edge-native | **27** (14 + 9 + 4) |
+| `local+tier2` | Tier 1 + BC lift + edge-native | **22** (14 + 4 + 4) |
+| `local+global+tier2` (M3) | all blocks | **31** (14 + 9 + 4 + 4) |
 
 **`log1p` rule:** count-like columns (ego, degrees, global lift, BC) get `log1p` before expert loss. Clustering coefficients stay in **[0, 1]**. Edge-native attributes used as-is.
+
+### Diagnostic target groups
+
+The shared expert head and total expert loss are unchanged by default. During
+expert training, scalar targets are also grouped for diagnostic MSE logging:
+
+| Group | Typical targets |
+|-------|-----------------|
+| `degree_fan` | local/global degree, in/out degree, fan-in/fan-out features |
+| `local_motif` | ego size, local clustering, triangles, motif-like structure |
+| `centrality` | betweenness centrality and related centrality lifts |
+| `flow_balance` | future in/out/net balance-style features |
+| `volume_activity` | amount, volume, count, activity features |
+| `temporal` | timestamp, burst, interarrival, temporal features |
+| `other` | unrecognized or categorical targets, e.g. currency/payment format |
+
+Logged keys include `morphology/loss_total`,
+`morphology/loss_group/{group}`, and
+`morphology/loss_target/{target}`. These are diagnostics only; future
+experiments may add separate expert heads or group-weighted losses.
+
+Targeted expert diagnostics can use `--morph_target_groups` to keep only selected
+semantic groups with the same shared expert head. Examples:
+`--morph_target_groups degree_fan`, `--morph_target_groups local_motif`, or
+`--morph_target_groups degree_fan,local_motif`. The default `all` preserves the
+full historical target vector.
 
 ### Tier 0 — global (9 cols; M1b+)
 
@@ -48,9 +74,9 @@ Precompute: `scripts/precompute_morphology_tier0.py` → `morphology_cache/{data
 
 ### Edge-native (4 cols)
 
-Forward `edge_attr` per seed (excl. `EdgeID`): timestamp, amount sent, sent currency, payment format. Disable: `--no_morph_edge_native`. M2 group: `edge_native`.
+Forward `edge_attr` per seed (excl. `EdgeID`): timestamp, amount received, received currency, payment format. Disable: `--no_morph_edge_native`. M2 group: `edge_native`.
 
-### Tier 1 — local (11 cols)
+### Tier 1 — local (14 cols)
 
 Stats on the **batch subgraph** from `LinkNeighborLoader`.
 
@@ -59,6 +85,7 @@ Stats on the **batch subgraph** from `LinkNeighborLoader`.
 | 0–1 | `n_edges_sub`, `n_nodes_sub` | `local_ego` | yes |
 | 2–7 | sender/receiver local degrees, degree sums | `local_degree` | yes |
 | 8–10 | `sender/receiver/mean_clustering_local` | `local_clustering` | no |
+| 11–13 | `sender/receiver/mean_triangles_local` | `local_triangles` | yes |
 
 ### Tier 2 — betweenness centrality (M3)
 
@@ -110,10 +137,13 @@ More examples (M2, clustering bins, Tier 2): [`morphology-metrics-plan.md`](morp
 | Goal | Flags |
 |------|-------|
 | Baseline contrastive | *(none)* |
-| Contrastive + projection | `--contrast_projection_head --contrast_projection_hidden 128 --contrast_projection_dim 128` |
+| Contrastive + projection | `--contrast_projection_head --contrast_projection_hidden 128 --contrast_projection_dim 128 --contrastive_memory_bank_size 0` |
+| Endpoint false-negative filtering | `--false_neg_filter_mode same_pair` |
+| Endpoint weak positives | `--multi_positive_mode same_endpoint --multi_positive_weight 0.1` |
 | M1b + projection | M1b expert + projection flags |
 | M1 local expert | `--morph_expert --morph_targets local` |
 | M1b global expert | `--morph_expert --morph_targets local+global --morph_tier0_cache morphology_cache/Small-HI` |
+| Targeted group expert | add `--morph_target_groups degree_fan` or `local_motif` |
 | M1b + BC (M3) | `--morph_targets local+global+tier2 --morph_tier2_cache morphology_cache/Small-HI` |
 | M2 soft positives | `--morph_contrast --morph_contrast_features local_ego,local_degree` |
 | M2 + clustering bins | add `local_clustering` to `--morph_contrast_features` |
@@ -128,8 +158,10 @@ More examples (M2, clustering bins, Tier 2): [`morphology-metrics-plan.md`](morp
 | Concept | What it does |
 |---------|--------------|
 | **Asymmetric InfoNCE** | Only `L(z1→z2)`; view2 under `no_grad`. ~half backward VRAM vs symmetric |
-| **Contrastive queue** | FIFO of past view2 embeddings as extra negatives; same `edge_id` filtered |
+| **Contrastive queue** | FIFO of past view2 embeddings as extra negatives; same `edge_id` filtered. Latest asym + projection queue sweep favors `queue=0` on Small-HI |
 | **Projection head** | MLP before InfoNCE only; extract uses raw encoder `z` (128-d) |
+| **False-negative filtering** | Optional endpoint/pair exclusion from negatives (`same_sender`, `same_receiver`, `same_endpoint`, `same_pair`); `same_pair` is the leading replicated F1/recall ablation, not the default |
+| **Endpoint weak positives** | Optional multi-positive InfoNCE with weighted endpoint/pair positives; distinct from M2 morphology-bin positives |
 
 ### Morphology
 

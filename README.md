@@ -76,7 +76,7 @@ python linear_probe.py --unique_name my_pretrain --testing
 
 Writes `embeddings/{unique_name}/probe_results.json`. Report **AUROC** (primary) and F1 (secondary). AML labels are not used for SSL checkpoint selection; use `--checkpoint_policy best` for morph/projection runs.
 
-**Recommended pure-SSL add-on:** `--contrast_projection_head` (see [Workflows](#workflows)). Best dev Small-HI probe: test AUROC **0.930** ([`notes/results.md`](notes/results.md)).
+**Recommended pure-SSL add-on:** `--contrast_projection_head` (see [Workflows](#workflows)). Current best dev Small-HI asym AUROC recipe uses 8192 negatives with the queue disabled: test AUROC **0.951**, F1 **0.233**. Across seeds, `same_pair` false-negative filtering is the leading F1/recall variant ([`notes/results.md`](notes/results.md)).
 
 ---
 
@@ -90,19 +90,50 @@ GraphCL-style projection MLP **only during InfoNCE**; extraction uses encoder `z
 python main.py \
   --data Small-HI --model gin \
   --objective contrastive \
-  --unique_name hi_contrastive_proj_20ep_bestckpt \
+  --unique_name hi_contrastive_proj_asym_8192neg_noqueue_20ep_bestckpt \
   --save_model --n_epochs 20 \
   --reverse_mp --ego --ports \
-  --batch_size 32768 --num_neighs 100 100 \
+  --batch_size 8192 --num_neighs 100 100 \
   --contrast_projection_head \
   --contrast_projection_hidden 128 --contrast_projection_dim 128 \
-  --contrastive_asymmetric --contrastive_num_neg_samples 1024 \
-  --contrastive_memory_bank_size 32768 \
+  --contrastive_asymmetric --contrastive_num_neg_samples 8192 \
+  --contrastive_temperature 0.5 \
+  --contrastive_accum_steps 4 \
+  --contrastive_memory_bank_size 0 \
   --checkpoint_policy best \
   --tqdm --testing
 ```
 
-Then extract → probe as above.
+Then extract → probe as above. For the current asym + projection recipe, queue ablations found `--contrastive_memory_bank_size 0` strongest on Small-HI; larger queues reduced downstream AUROC/F1 despite adding more negatives. `--contrastive_temperature` controls the InfoNCE logit temperature; default `0.5` preserves prior runs. See [`notes/results.md`](notes/results.md#queue-and-negative-ablations-small-hi).
+
+Optional false-negative filtering can exclude likely related transactions from
+the contrastive negative pool without adding new positives:
+
+```bash
+--false_neg_filter_mode same_pair \
+--false_neg_filter_min_negatives 1
+```
+
+Supported modes are `none` (default), `same_sender`, `same_receiver`,
+`same_endpoint`, and `same_pair`. Filtering applies to sampled in-batch
+negatives and memory-queue negatives; sparse rows fall back to the unfiltered
+candidate set when fewer than `--false_neg_filter_min_negatives` negatives
+remain. In Small-HI seed replications, `same_pair` gave the cleanest F1/recall
+lift with a small AUROC tradeoff; keep `none` as the default unless explicitly
+running the ablation.
+
+Optional multi-positive InfoNCE can treat endpoint-related transactions as weak
+positives while preserving same-edge positives at weight `1.0`:
+
+```bash
+--multi_positive_mode same_endpoint \
+--multi_positive_weight 0.1
+```
+
+Supported modes mirror the false-negative filter: `none` (default),
+`same_sender`, `same_receiver`, `same_endpoint`, and `same_pair`. Weak
+positives are excluded from the sampled negative pool; if an anchor has no weak
+positives, it falls back naturally to the same-edge positive.
 
 ### Morphology-aware pretraining (optional)
 
