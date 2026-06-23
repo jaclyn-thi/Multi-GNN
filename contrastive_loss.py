@@ -15,7 +15,7 @@ Supporting utilities align shared ``edge_id`` rows across views before loss
 computation. See ``morphology/contrast.py`` and ``morphology/contrastive_train.py``.
 """
 
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -675,6 +675,8 @@ def _directional_aligned_infonce(
     multi_positive_mode: str = "none",
     multi_positive_weight: float = 0.1,
     multi_positive_stats: Optional[Dict[str, float]] = None,
+    knn_filter: Optional[Any] = None,
+    knn_filter_stats: Optional[Dict[str, float]] = None,
 ) -> torch.Tensor:
     if z_anchor.shape != z_other.shape:
         raise ValueError("Aligned directional InfoNCE expects z_anchor and z_other to share shape.")
@@ -766,17 +768,35 @@ def _directional_aligned_infonce(
 
         if use_neg_subsample:
             allowed = None
+            endpoint_allowed = None
             if (
                 false_neg_filter_mode != "none"
                 and edge_endpoints is not None
                 and candidate_endpoints is not None
             ):
-                allowed = _false_negative_allowed_mask(
+                endpoint_allowed = _false_negative_allowed_mask(
                     edge_endpoints[i0:i1],
                     candidate_endpoints,
                     false_neg_filter_mode,
                 )
-                _update_false_negative_filter_stats(allowed, stats=false_neg_filter_stats)
+                _update_false_negative_filter_stats(endpoint_allowed, stats=false_neg_filter_stats)
+                allowed = endpoint_allowed
+            if knn_filter is not None:
+                knn_allowed = knn_filter.allowed_mask(
+                    ids_b,
+                    candidate_ids,
+                    stats=knn_filter_stats,
+                )
+                if endpoint_allowed is not None and knn_filter_stats is not None:
+                    knn_filter_stats["overlap_with_endpoint_removed"] = (
+                        knn_filter_stats.get("overlap_with_endpoint_removed", 0.0)
+                        + float(((~endpoint_allowed) & (~knn_allowed)).sum().item())
+                    )
+                allowed = knn_allowed if allowed is None else (allowed & knn_allowed)
+            if allowed is not None:
+                if knn_filter_stats is not None:
+                    fallback_rows = (allowed.sum(dim=1) < int(false_neg_filter_min_negatives)).sum().item()
+                    knn_filter_stats["fallback_rows"] = knn_filter_stats.get("fallback_rows", 0.0) + float(fallback_rows)
                 allowed = _apply_false_negative_fallback(
                     allowed,
                     min_negatives=false_neg_filter_min_negatives,
@@ -849,6 +869,13 @@ def _directional_aligned_infonce(
                         stats=false_neg_filter_stats,
                     )
                     logits = torch.where(allowed, logits, torch.full_like(logits, float("-inf")))
+                if knn_filter is not None:
+                    knn_allowed = knn_filter.allowed_mask(
+                        ids_b,
+                        edge_ids[j0:j1],
+                        stats=knn_filter_stats,
+                    )
+                    logits = torch.where(knn_allowed, logits, torch.full_like(logits, float("-inf")))
                 if use_multi_pos and current_positive_mask is not None:
                     logits = torch.where(
                         ~current_positive_mask[:, j0:j1],
@@ -940,6 +967,8 @@ def edge_identity_infonce_loss(
     multi_positive_mode: str = "none",
     multi_positive_weight: float = 0.1,
     multi_positive_stats: Optional[Dict[str, float]] = None,
+    knn_filter: Optional[Any] = None,
+    knn_filter_stats: Optional[Dict[str, float]] = None,
 ):
     """
     InfoNCE-style edge contrastive loss with identity positives, optionally merged
@@ -1013,6 +1042,8 @@ def edge_identity_infonce_loss(
         multi_positive_mode=multi_positive_mode,
         multi_positive_weight=multi_positive_weight,
         multi_positive_stats=multi_positive_stats,
+        knn_filter=knn_filter,
+        knn_filter_stats=knn_filter_stats,
     )
     if symmetric:
         loss_21 = _directional_aligned_infonce(
@@ -1031,6 +1062,8 @@ def edge_identity_infonce_loss(
             multi_positive_mode=multi_positive_mode,
             multi_positive_weight=multi_positive_weight,
             multi_positive_stats=multi_positive_stats,
+            knn_filter=knn_filter,
+            knn_filter_stats=knn_filter_stats,
         )
         loss = 0.5 * (loss_12 + loss_21)
     else:

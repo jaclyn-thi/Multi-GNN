@@ -372,13 +372,15 @@ def transform_morph_targets(
     local_feats: torch.Tensor,
     edge_native: Optional[torch.Tensor] = None,
     global_feats: Optional[torch.Tensor] = None,
+    flow_feats: Optional[torch.Tensor] = None,
     tier2_feats: Optional[torch.Tensor] = None,
     local_count_indices: Optional[Sequence[int]] = None,
 ) -> torch.Tensor:
     """
-    Concatenate local / global / tier2 / edge-native blocks into the expert target vector.
+    Concatenate local / global / flow / tier2 / edge-native blocks into the expert target vector.
 
     Applies log1p to count-like columns (local, global degree, Tier 2 BC lift).
+    Flow-balance and edge-native blocks are expected pre-transformed at lift time.
     """
     from morphology.tier0_global import GLOBAL_COUNT_FEATURE_INDICES
 
@@ -396,6 +398,8 @@ def transform_morph_targets(
         for idx in GLOBAL_COUNT_FEATURE_INDICES:
             g[:, idx] = torch.log1p(g[:, idx].clamp(min=0))
         parts.append(g)
+    if flow_feats is not None and flow_feats.numel() > 0:
+        parts.append(flow_feats.float())
     if tier2_feats is not None and tier2_feats.numel() > 0:
         t2 = tier2_feats.clone()
         for idx in range(t2.shape[1]):

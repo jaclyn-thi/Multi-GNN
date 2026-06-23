@@ -42,6 +42,7 @@ from pytorch_metric_learning.losses import NTXentLoss
 from graph_augmentations import generate_views
 from contrastive_loss import EdgeMemoryQueue, edge_identity_infonce_loss
 from contrastive_projection import project_seed_pair, project_seeds, setup_contrastive_projection
+from knn_filter import load_transaction_knn_filter
 from morphology.contrast import setup_morph_contrast_bin_edges, setup_morphology_contrast
 from morphology.contrastive_train import (
     eval_morph_contrast_val_hetero,
@@ -57,6 +58,7 @@ from morphology.contrastive_train import (
 from morphology.expert import (
     finalize_morph_expert_diagnostics,
     setup_morph_tier0_contexts,
+    setup_morph_tier0_flow_contexts,
     setup_morphology_expert,
 )
 import wandb
@@ -121,6 +123,29 @@ def _log_multi_positive_stats(prefix: str, stats: dict, mode: str, weight: float
     )
 
 
+def _log_knn_filter_stats(prefix: str, stats: dict) -> None:
+    before = float(stats.get("candidate_before", 0.0))
+    rows = float(stats.get("rows", 0.0))
+    if before <= 0 or rows <= 0:
+        return
+    removed = float(stats.get("knn_removed", max(0.0, before - float(stats.get("candidate_after", before)))))
+    rows_with_cache = float(stats.get("rows_with_cache", 0.0))
+    rows_with_knn = float(stats.get("rows_with_knn_in_pool", 0.0))
+    fallback_rows = float(stats.get("fallback_rows", 0.0))
+    overlap = float(stats.get("overlap_with_endpoint_removed", 0.0))
+    logging.info(
+        "%s KNN negative filter: candidates=%d removed=%d (%.4f), anchors_with_cache=%.4f, anchors_with_knn_in_pool=%.4f, endpoint_overlap_removed=%d, fallback_rows=%d",
+        prefix,
+        int(before),
+        int(removed),
+        removed / before,
+        rows_with_cache / rows,
+        rows_with_knn / rows,
+        int(overlap),
+        int(fallback_rows),
+    )
+
+
 def _log_morphology_group_losses(prefix: str, metrics: dict) -> None:
     """Print compact morphology group diagnostics for Slurm/stdout inspection."""
     if not metrics:
@@ -164,6 +189,12 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
     if contrastive_temperature <= 0.0:
         raise ValueError("--contrastive_temperature must be > 0.")
     logging.info("Contrastive temperature: %.4f", contrastive_temperature)
+    knn_filter = load_transaction_knn_filter(
+        getattr(args, "knn_cache_path", None),
+        enabled=bool(getattr(args, "enable_knn_negative_filter", False)),
+        filter_k=int(getattr(args, "knn_filter_k", 0)),
+        device=device,
+    )
     train_edge_index = tr_loader.data.edge_index.detach().cpu()
     try:
         n_train_batches = len(tr_loader)
@@ -193,6 +224,7 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
         morph_diag_accumulator = {} if morph_head is not None else None
         false_neg_stats = dict()
         multi_pos_stats = dict()
+        knn_filter_stats = dict()
         optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(tqdm.tqdm(tr_loader, disable=not args.tqdm)):
             seed_edge_ids = get_homo_seed_edge_ids(batch, tr_loader.data)
@@ -290,6 +322,8 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
                     multi_positive_mode=multi_positive_mode,
                     multi_positive_weight=multi_positive_weight,
                     multi_positive_stats=multi_pos_stats,
+                    knn_filter=knn_filter,
+                    knn_filter_stats=knn_filter_stats,
                 )
                 # M1/M1b: predict detached morphology targets from z_seed (view1)
                 if morph_head is not None and morph_cfg is not None:
@@ -301,6 +335,7 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
                         morph_head,
                         morph_cfg,
                         tier0_ctx=getattr(args, "morph_tier0_train", None),
+                        flow_ctx=getattr(args, "morph_tier0_flow_train", None),
                         tier2_ctx=getattr(args, "morph_tier2_train", None),
                         diagnostics_accumulator=morph_diag_accumulator,
                     )
@@ -355,6 +390,7 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
             logging.info(f"Train Loss: {avg_loss:.4f}")
         _log_false_neg_filter_stats("homo/train", false_neg_stats, false_neg_filter_mode)
         _log_multi_positive_stats("homo/train", multi_pos_stats, multi_positive_mode, multi_positive_weight)
+        _log_knn_filter_stats("homo/train", knn_filter_stats)
         if (
             morph_contrast_cfg is not None
             and val_loader is not None
@@ -552,6 +588,12 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
     if contrastive_temperature <= 0.0:
         raise ValueError("--contrastive_temperature must be > 0.")
     logging.info("Contrastive temperature: %.4f", contrastive_temperature)
+    knn_filter = load_transaction_knn_filter(
+        getattr(args, "knn_cache_path", None),
+        enabled=bool(getattr(args, "enable_knn_negative_filter", False)),
+        filter_k=int(getattr(args, "knn_filter_k", 0)),
+        device=device,
+    )
     train_edge_index = tr_loader.data[FORWARD_EDGE_TYPE].edge_index.detach().cpu()
     try:
         n_train_batches = len(tr_loader)
@@ -581,6 +623,7 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
         morph_diag_accumulator = {} if morph_head is not None else None
         false_neg_stats = dict()
         multi_pos_stats = dict()
+        knn_filter_stats = dict()
         optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(tqdm.tqdm(tr_loader, disable=not args.tqdm)):
             seed_edge_ids = get_hetero_seed_edge_ids(batch, tr_loader.data)
@@ -695,6 +738,8 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                     multi_positive_mode=multi_positive_mode,
                     multi_positive_weight=multi_positive_weight,
                     multi_positive_stats=multi_pos_stats,
+                    knn_filter=knn_filter,
+                    knn_filter_stats=knn_filter_stats,
                 )
                 # M1/M1b: auxiliary morphology MSE on shared seed embeddings
                 if morph_head is not None and morph_cfg is not None:
@@ -706,6 +751,7 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                         morph_head,
                         morph_cfg,
                         tier0_ctx=getattr(args, "morph_tier0_train", None),
+                        flow_ctx=getattr(args, "morph_tier0_flow_train", None),
                         tier2_ctx=getattr(args, "morph_tier2_train", None),
                         diagnostics_accumulator=morph_diag_accumulator,
                     )
@@ -760,6 +806,7 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
             logging.info(f"Train Loss: {avg_loss:.4f}")
         _log_false_neg_filter_stats("hetero/train", false_neg_stats, false_neg_filter_mode)
         _log_multi_positive_stats("hetero/train", multi_pos_stats, multi_positive_mode, multi_positive_weight)
+        _log_knn_filter_stats("hetero/train", knn_filter_stats)
         if (
             morph_contrast_cfg is not None
             and val_loader is not None
@@ -884,6 +931,9 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
             "contrastive_asymmetric": bool(getattr(args, "contrastive_asymmetric", False)),
             "contrastive_accum_steps": int(getattr(args, "contrastive_accum_steps", 1)),
             "contrastive_memory_bank_size": int(getattr(args, "contrastive_memory_bank_size", 0)),
+            "enable_knn_negative_filter": bool(getattr(args, "enable_knn_negative_filter", False)),
+            "knn_cache_path": getattr(args, "knn_cache_path", None),
+            "knn_filter_k": int(getattr(args, "knn_filter_k", 0)),
             "loader_num_workers": int(getattr(args, "loader_num_workers", 10)),
             "morph_expert": bool(getattr(args, "morph_expert", False)),
             "morph_targets": getattr(args, "morph_targets", "local"),
@@ -943,6 +993,9 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
     )
     if need_tier0:
         setup_morph_tier0_contexts(args, tr_data, val_data, device)
+
+    if morph_cfg is not None and morph_cfg.include_flow_balance:
+        setup_morph_tier0_flow_contexts(args, tr_data, val_data, device)
 
     need_tier2 = morph_cfg is not None and morph_cfg.include_tier2
     if need_tier2:

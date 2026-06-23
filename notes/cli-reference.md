@@ -91,6 +91,9 @@ These flags are optional experiments for the edge-level contrastive loss. Defaul
 |----------|---------|-------------|
 | `--false_neg_filter_mode` | `none` | Exclude likely false negatives from the negative pool. Modes: `same_sender`, `same_receiver`, `same_endpoint`, `same_pair` |
 | `--false_neg_filter_min_negatives` | `1` | Per-anchor fallback threshold. If fewer than this many candidates remain after filtering, that anchor uses the unfiltered candidate set |
+| `--knn_cache_path` | — | Sparse offline transaction KNN `.npz` cache from `scripts/precompute_transaction_knn.py` |
+| `--enable_knn_negative_filter` | off | Exclude cached KNN neighbors from contrastive negatives |
+| `--knn_filter_k` | `0` | Use first K cached neighbors for exclusion (`0` = all cached neighbors) |
 | `--multi_positive_mode` | `none` | Add endpoint/pair weak positives in the numerator. Modes: `same_sender`, `same_receiver`, `same_endpoint`, `same_pair` |
 | `--multi_positive_weight` | `0.1` | Weight for weak positives. Identity positives remain weight `1.0` |
 
@@ -111,6 +114,36 @@ Implementation notes:
 - Logs include before/after candidate counts for filtering, fallback rows, identity positives, weak positives, average positives per anchor, and fraction of anchors without weak positives.
 - Small-HI follow-up: `--false_neg_filter_mode same_pair` is the leading F1/recall candidate across seeds. `same_endpoint` and `same_receiver` were less stable. Default remains `none`.
 - Multi-positive runs so far underperform exclusion-only filtering. Lower `same_pair` weight `0.05` helped relative to `0.1`, but still did not beat no-filter or `same_pair` false-negative filtering.
+
+### Offline feature-KNN negative filtering
+
+Precompute sparse train-only KNN caches over label-free transaction features:
+
+```bash
+python scripts/precompute_transaction_knn.py \
+  --data Small-HI --feature_set edge_native --k 50 \
+  --output morphology_cache/Small-HI/transaction_knn_edge_native_k50.npz
+
+python scripts/precompute_transaction_knn.py \
+  --data Small-HI --feature_set degree_fan --k 50 \
+  --output morphology_cache/Small-HI/transaction_knn_degree_fan_k50.npz
+
+python scripts/precompute_transaction_knn.py \
+  --data Small-HI --feature_set edge_native+degree_fan --k 50 \
+  --output morphology_cache/Small-HI/transaction_knn_edge_native_degree_fan_k50.npz
+```
+
+Then enable exclusion-only KNN filtering during contrastive pretrain:
+
+```bash
+--enable_knn_negative_filter \
+--knn_cache_path morphology_cache/Small-HI/transaction_knn_degree_fan_k50.npz \
+--knn_filter_k 50
+```
+
+The cache uses train split-local `edge_id` values, matching contrastive training.
+KNN neighbors are removed from negatives only; they are not added as positives.
+Queue KNN filtering is intentionally deferred.
 
 Example:
 
@@ -139,6 +172,8 @@ Requires `--objective contrastive` and `--morph_expert`. Adds `L_morph_expert` (
 | `--morph_expert` | off | Enable morphology expert auxiliary loss |
 | `--morph_targets` | `local` | `local` (Tier 1 + edge-native); `local+global` (M1b); `local+tier2`; `local+global+tier2` (M3) |
 | `--morph_tier0_cache` | — | Directory with `{train,val,test}_node_morphology.csv` from `scripts/precompute_morphology_tier0.py` |
+| `--morph_flow_balance` | off | Append 10 Tier 0 flow-balance expert targets (see morphology reference) |
+| `--morph_tier0_flow_cache` | — | Directory with `{train,val,test}_node_flow_balance.csv`; falls back to `--morph_tier0_cache` |
 | `--morph_tier2_cache` | — | Directory with `{train,val,test}_node_tier2.csv` from `scripts/precompute_morphology_tier2.py` |
 | `--morph_tier2_lift` | `full` | BC lift: `full` (4 cols) or `max` (1 col) |
 | `--morph_expert_loss` | `mse` | `mse` or `mae` |
@@ -147,13 +182,15 @@ Requires `--objective contrastive` and `--morph_expert`. Adds `L_morph_expert` (
 | `--morph_expert_layout` | `shared` | `shared` or `grouped` (M5a) |
 | `--morph_expert_group_weight_tier2` | `1.0` | Tier 2 block weight when `layout=grouped` |
 | `--morph_local_subset` | `all` | Tier-1 columns: `all` (14), `degree` (8), `clustering` (11), `triangles` (11) |
-| `--morph_target_groups` | `all` | Shared-head target filter by semantic group, e.g. `degree_fan`, `local_motif`, or `degree_fan,local_motif` |
+| `--morph_target_groups` | `all` | Shared-head target filter by semantic group, e.g. `degree_fan`, `motif_participation`, or legacy `local_motif` |
 | `--no_morph_edge_native` | off | Exclude forward `edge_attr` from morphology targets |
 
 Expert diagnostics log the unchanged total loss as `morph/expert_train` and
 `morphology/loss_total`, plus per-group MSE keys such as
-`morphology/loss_group/degree_fan`, `local_motif`, `centrality`,
-`volume_activity`, `temporal`, and `other`. These logs are diagnostic only; they
+`morphology/loss_group/degree_fan`, `motif_participation`, `local_density`,
+`local_context_size`, `global_role`, `volume_activity`, `temporal_behavior`,
+and `other`. Legacy aliases (`local_motif`, `centrality`, `temporal`) expand to
+these groups. These logs are diagnostic only; they
 do not change the shared expert head or default loss. Group losses are also
 printed to stdout once per epoch for Slurm smoke-test inspection.
 

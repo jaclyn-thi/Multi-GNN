@@ -30,25 +30,38 @@ Label-free structural features on each **seed transaction**. Uses:
 |-------------------|-----------------|---------------------|
 | `local` (M1) | Tier 1 + edge-native | **18** (14 + 4) |
 | `local+global` (M1b) | Tier 1 + Tier 0 lift + edge-native | **27** (14 + 9 + 4) |
+| `local+global` + `--morph_flow_balance` | above + flow-balance lift | **37** (14 + 9 + 10 + 4) |
 | `local+tier2` | Tier 1 + BC lift + edge-native | **22** (14 + 4 + 4) |
 | `local+global+tier2` (M3) | all blocks | **31** (14 + 9 + 4 + 4) |
+| `local+global+tier2` + `--morph_flow_balance` | all blocks + flow | **41** (14 + 9 + 10 + 4 + 4) |
 
 **`log1p` rule:** count-like columns (ego, degrees, global lift, BC) get `log1p` before expert loss. Clustering coefficients stay in **[0, 1]**. Edge-native attributes used as-is.
 
 ### Diagnostic target groups
 
 The shared expert head and total expert loss are unchanged by default. During
-expert training, scalar targets are also grouped for diagnostic MSE logging:
+expert training, scalar targets are also grouped for diagnostic MSE logging.
+At expert setup, runs also log per-group target counts and member names.
 
-| Group | Typical targets |
-|-------|-----------------|
-| `degree_fan` | local/global degree, in/out degree, fan-in/fan-out features |
-| `local_motif` | ego size, local clustering, triangles, motif-like structure |
-| `centrality` | betweenness centrality and related centrality lifts |
-| `flow_balance` | future in/out/net balance-style features |
-| `volume_activity` | amount, volume, count, activity features |
-| `temporal` | timestamp, burst, interarrival, temporal features |
-| `other` | unrecognized or categorical targets, e.g. currency/payment format |
+| Group | Scope | Typical targets |
+|-------|-------|-----------------|
+| `degree_fan` | Tier 1 local + Tier 0 global endpoint lift | sender/receiver in/out/total degree, degree sums |
+| `flow_balance` | Tier 0 global precomputed | split-global amount in/out totals, balance ratios, edge-relative flow |
+| `volume_activity` | edge-native | `Amount Received`, `Amount Sent` |
+| `temporal_behavior` | edge-native | `Timestamp`, burst/interarrival/recency features |
+| `motif_participation` | Tier 1 local sampled | triangle counts, wedge/cycle/motif participation |
+| `local_density` | Tier 1 local sampled | local clustering coefficient, ego/neighborhood density |
+| `local_context_size` | Tier 1 local sampled | `n_edges_sub`, `n_nodes_sub`, ego edge/node counts |
+| `global_role` | Tier 2 global precomputed | betweenness centrality endpoint lift (`sender_bc`, `bc_max_global`, …) |
+| `other` | edge-native / unrecognized | categorical codes (`Received Currency`, `Payment Format`) |
+
+**Legacy CLI aliases** (expand to the groups above, backward compatible):
+
+| Alias | Expands to |
+|-------|------------|
+| `local_motif` | `motif_participation`, `local_density`, `local_context_size` |
+| `centrality` | `global_role` |
+| `temporal` | `temporal_behavior` |
 
 Logged keys include `morphology/loss_total`,
 `morphology/loss_group/{group}`, and
@@ -57,9 +70,19 @@ experiments may add separate expert heads or group-weighted losses.
 
 Targeted expert diagnostics can use `--morph_target_groups` to keep only selected
 semantic groups with the same shared expert head. Examples:
-`--morph_target_groups degree_fan`, `--morph_target_groups local_motif`, or
-`--morph_target_groups degree_fan,local_motif`. The default `all` preserves the
-full historical target vector.
+`--morph_target_groups degree_fan`,
+`--morph_target_groups motif_participation,local_density`, or
+`--morph_target_groups degree_fan,local_motif` (legacy alias). The default
+`all` preserves the full historical target vector.
+
+**Targeted group scouts (Small-HI):** full tables and interpretation in
+[`results.md` § Morphology target-group scouts](results.md#morphology-target-group-scouts-small-hi).
+Among morphology-only variants, **`degree_fan` @ 10 ep, w=1.0** still has the
+best F1 (0.208); **`motif_participation` @ w=0.05** has the best AUROC (0.937)
+among semantic-group scouts. The legacy `local_motif` bucket alone is weak
+(0.909 AUROC); splitting it isolates useful triangle signal. All targeted
+morphology runs trail the no-morph asym+proj baseline (0.951 / 0.233) and
+`same_pair` filtering (~0.949 / 0.255).
 
 ### Tier 0 — global (9 cols; M1b+)
 
@@ -71,6 +94,25 @@ Split-global node degrees per train/val/test; **endpoint lift** to each seed edg
 | edge sums | `deg_sum_out/in/total_global` | `global_degree` |
 
 Precompute: `scripts/precompute_morphology_tier0.py` → `morphology_cache/{data}/{split}_node_morphology.csv`.
+
+### Tier 0 flow balance (10 cols; opt-in via `--morph_flow_balance`)
+
+Split-global **Amount Received** aggregates per account on the forward split graph,
+lifted to seed edges. Label-free; train targets use the train split only.
+
+| Target | Description |
+|--------|-------------|
+| `sender_in_amount_log`, `sender_out_amount_log` | log1p total received/sent by sender |
+| `receiver_in_amount_log`, `receiver_out_amount_log` | log1p total received/sent by receiver |
+| `sender_flow_balance_ratio`, `receiver_flow_balance_ratio` | `(out - in) / (out + in + eps)`, clipped to [-1, 1] |
+| `sender_abs_flow_imbalance_log`, `receiver_abs_flow_imbalance_log` | log1p \|out - in\| |
+| `edge_to_sender_out_ratio_log` | log1p edge amount / (sender out total + eps) |
+| `edge_to_receiver_in_ratio_log` | log1p edge amount / (receiver in total + eps) |
+
+Precompute: `scripts/precompute_morphology_tier0_flow.py` → `{split}_node_flow_balance.csv`.
+If cache files are absent, tables are computed from split graphs at startup (same as Tier 0 degrees).
+
+**Default behavior:** `--morph_flow_balance` is **off**. Existing runs unchanged unless explicitly enabled.
 
 ### Edge-native (4 cols)
 

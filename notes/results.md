@@ -12,7 +12,7 @@ Quick-run numbers for internal comparison while configs and code still change. *
 
 **Label-efficiency:** sym+proj best @ **10%** labels (0.924 AUROC); 8192neg+proj best @ **50–100%** (0.931). See [label-efficiency](#label-efficiency-small-hi) below.
 
-**Morphology expert:** **M1b** @ 20 ep — best morph-only (0.920 AUROC). MAE expert loss did not beat MSE. Stacking BC on M1b hurts; M5a grouped heads did not fix interference (0.887 AUROC).
+**Morphology expert:** **M1b** @ 20 ep — best full-expert morph-only (0.920 AUROC). Targeted group scouts: best F1 **`degree_fan` 10 ep** (0.208); best new-group AUROC **`motif_participation`** (0.937) — both trail no-morph baseline. See [morphology target-group scouts](#morphology-target-group-scouts-small-hi). MAE expert loss did not beat MSE. Stacking BC on M1b hurts; M5a grouped heads did not fix interference (0.887 AUROC).
 
 **Projection ablation:** [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md). Earlier best contrastive+proj AUROC before the queue sweep: asym + 8192 negs (**0.930**). Earlier best F1: sym + 1024 @ `bs=16384` (**0.222**).
 
@@ -118,14 +118,65 @@ Symmetric + projection with `8192` negatives, `queue=0`, `bs=4096`, and
 `accum=8` fit without OOM, but underperformed the asym baseline
 (0.931 AUROC / 0.161 F1). This is a viable fit recipe, not a current winner.
 
-### Morphology group diagnostics
+### Morphology target-group scouts (Small-HI)
 
-`morph_group_diag_full_10ep` verified the new semantic group loss logging with
-the shared M1b expert and no M2/FNF/multi-positive changes. Final group MSEs
-were lowest for temporal/other targets and highest for `local_motif`; downstream
-probe quality was diagnostic-only (0.934 AUROC / 0.079 F1). Next targeted scouts
-use `--morph_target_groups degree_fan`, `local_motif`, and
-`degree_fan,local_motif`.
+Targeted morphology runs keep the current **asym contrastive + projection**
+backbone (8192 negs, `queue=0`, `bs=8192 accum=4`, temp 0.5) and restrict the
+shared expert head with `--morph_target_groups`. Checkpoints use
+`--checkpoint_policy best` on morphology val loss. Artifacts:
+`embeddings/{unique_name}/probe_results.json`.
+
+**No-morph references:** no filter **0.951 / 0.233** · `same_pair` filter
+**~0.949 / 0.255** (best seed).
+
+#### Semantic groups (Jun 22, 2026)
+
+After splitting the coarse `local_motif` bucket into finer groups
+(`motif_participation`, `local_density`, `local_context_size`) and adding
+`flow_balance` targets. Slurm templates:
+`slurm/ablation_morph_degree_fan_only_asym_proj_20ep.sh`,
+`slurm/ablation_morph_semantic_group_scout_10ep.sh`.
+
+| Run | Groups | Ep | Weight | Test AUROC | Test F1 | Prec | Recall | Note |
+|-----|--------|----|--------|------------|---------|------|--------|------|
+| `motif_participation` only | 3 triangle targets | 9 | 0.05 | **0.937** | **0.190** | **0.173** | 0.211 | best AUROC among new scouts |
+| `flow_balance` only | 10 amount targets | 9 | 0.05 | 0.930 | 0.157 | 0.109 | 0.279 | viable; recall-leaning |
+| `degree_fan` only | degrees + global lift | 11 | 1.0 | 0.929 | 0.149 | 0.097 | 0.325 | 20 ep; F1 below 10 ep scout |
+| `degree_fan` only | degrees + global lift | 1 | 0.05 | 0.902 | 0.090 | 0.055 | 0.238 | undertrained; best ckpt ep 1 |
+
+**Takeaways:**
+
+1. **`motif_participation` is the strongest new semantic group** — AUROC 0.937
+   at w=0.05 beats the old coarse `local_motif` bucket (0.909) and is the best
+   morphology AUROC so far, but F1 still trails the best `degree_fan` scout.
+2. **`flow_balance` is learnable but not clearly better than `degree_fan`** on
+   headline metrics at 10 ep / w=0.05.
+3. **Extending `degree_fan` to 20 ep @ w=1.0 did not improve F1** vs the prior
+   10 ep scout (0.149 vs 0.208 val-tuned); extra epochs shifted the operating
+   point toward recall, not better ranking.
+4. **`morph_expert_weight=0.05` is too weak for 20 ep degree_fan** — morphology
+   val loss stays ~10× below w=1.0 and checkpoint selection locks to epoch 1.
+   Use w=1.0 for fair group comparisons, or treat w=0.05 as a separate regime.
+5. **All targeted morphology runs remain below** the no-morph baseline and
+   `same_pair` filtering on both AUROC and F1.
+
+#### Coarse grouping (Jun 2026, 10 ep, w=1.0)
+
+Earlier scouts used legacy group names before the semantic registry split:
+
+| Target groups | Test AUROC | Test F1 | Precision | Recall | Note |
+|---------------|------------|---------|-----------|--------|------|
+| `degree_fan` | 0.921 | **0.208** | 0.151 | 0.333 | **best morphology F1** |
+| `local_motif` (legacy) | 0.909 | 0.105 | 0.067 | 0.243 | weak coarse bucket |
+| `degree_fan,local_motif` | 0.922 | 0.049 | 0.027 | 0.253 | AUROC ok; F1 collapse |
+
+#### Group loss diagnostics
+
+`morph_group_diag_full_10ep` verified per-group MSE logging on the full M1b
+expert (0.934 AUROC / 0.079 F1 — logging check only). Final group MSEs were
+lowest for temporal/other and highest for the legacy `local_motif` bucket.
+
+Group registry and flags: [`morphology-reference.md`](morphology-reference.md).
 
 ### Multi-positive InfoNCE scouts
 

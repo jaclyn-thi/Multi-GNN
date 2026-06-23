@@ -108,6 +108,13 @@ The six phases below are preserved from the original implementation plan, but ea
    - Weak positives are added only when enabled, and are excluded from the sampled negative pool
    - Current implementation supports endpoint/pair rules only; morphology-bin, motif, and KNN positives remain future extensions
 
+7. **Optional offline feature-KNN negative filtering (Jun 2026)**
+   - Precompute train-only sparse KNN caches with `scripts/precompute_transaction_knn.py`
+   - Initial feature sets: `edge_native`, `degree_fan`, `edge_native+degree_fan`
+   - CLI: `--enable_knn_negative_filter --knn_cache_path ... --knn_filter_k K`
+   - Exclusion-only: cached feature-neighbors are removed from sampled negatives but are not added as positives
+   - Uses train split-local `edge_id` values to match the contrastive loss; dense KNN graph views are not built
+
 #### Important divergences from the original plan
 - We did **not** keep triplet loss and pairwise contrastive loss as near-term active alternatives
 - We standardized on **edge-level InfoNCE**
@@ -128,6 +135,7 @@ The six phases below are preserved from the original implementation plan, but ea
 - replicate endpoint false-negative filtering across seeds before adding richer structural positive tiers
 - avoid spending more GPU on larger negative counts unless memory behavior is the research target; `10240` fit and `12288` fit only with smaller batch, but neither improved AUROC
 - future structural positives: morphology-bin, motif/typology metadata, or KNN positives
+- evaluate whether KNN exclusion helps the current `8192` negatives / `queue=0` asym + projection recipe before adding KNN positives or queue-KNN filtering
 
 ---
 

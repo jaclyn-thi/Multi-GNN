@@ -25,7 +25,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from dataset_specs import DEFAULT_EDGE_FEATURE_COLS
-from morphology.target_registry import MORPH_TARGET_GROUPS, morph_target_group, safe_target_log_name
+from morphology.target_registry import (
+    MORPH_TARGET_GROUP_ALIASES,
+    MORPH_TARGET_GROUPS,
+    expand_morph_target_groups,
+    format_morph_target_group_details,
+    format_morph_target_group_summary,
+    morph_target_group,
+    safe_target_log_name,
+)
+from morphology.tier0_flow_balance import (
+    FLOW_BALANCE_FEATURE_NAMES,
+    FLOW_BALANCE_LIFT_DIM,
+    MorphTier0FlowContext,
+    lift_flow_balance_to_seed_edges_torch,
+    setup_morph_tier0_flow_contexts,
+)
 from morphology.tier0_global import (
     DEFAULT_LIFT_FEATURE_NAMES,
     MorphTier0Context,
@@ -70,6 +85,8 @@ class MorphExpertConfig:
         Append forward edge_attr columns to targets.
     include_global :
         Append Tier 0 endpoint lift (9 dims by default).
+    include_flow_balance :
+        Append Tier 0 flow-balance endpoint lift (10 dims; ``--morph_flow_balance``).
     include_tier2 :
         Append Tier 2 BC endpoint lift after global block (width set by ``tier2_lift_mode``).
     tier2_lift_mode :
@@ -95,6 +112,7 @@ class MorphExpertConfig:
     hidden_dim: int = 64
     include_edge_native: bool = True
     include_global: bool = False
+    include_flow_balance: bool = False
     include_tier2: bool = False
     tier2_lift_mode: str = "full"
     loss_weight: float = 1.0
@@ -103,6 +121,7 @@ class MorphExpertConfig:
     edge_attr_dim: int = 0
     group_weight_local: float = 1.0
     group_weight_global: float = 1.0
+    group_weight_flow_balance: float = 1.0
     group_weight_tier2: float = 1.0
     group_weight_edge_native: float = 1.0
     local_subset: str = "all"
@@ -126,7 +145,7 @@ class MorphologyExpertHead(nn.Module):
 
 
 # Target block order matches ``transform_morph_targets`` concatenation.
-MORPH_TARGET_BLOCK_ORDER: Tuple[str, ...] = ("local", "global", "tier2", "edge_native")
+MORPH_TARGET_BLOCK_ORDER: Tuple[str, ...] = ("local", "global", "flow_balance", "tier2", "edge_native")
 
 
 class MorphologyGroupedExpertHead(nn.Module):
@@ -170,6 +189,10 @@ def morph_target_blocks(cfg: MorphExpertConfig) -> List[Tuple[str, slice]]:
         n = len(DEFAULT_LIFT_FEATURE_NAMES)
         blocks.append(("global", slice(start, start + n)))
         start += n
+    if cfg.include_flow_balance:
+        n = FLOW_BALANCE_LIFT_DIM
+        blocks.append(("flow_balance", slice(start, start + n)))
+        start += n
     if cfg.include_tier2:
         n = tier2_bc_lift_dim(cfg.tier2_lift_mode)
         blocks.append(("tier2", slice(start, start + n)))
@@ -194,6 +217,8 @@ def _all_morph_target_names(cfg: MorphExpertConfig) -> List[str]:
     names = list(local_feature_names_for_subset(cfg.local_subset))
     if cfg.include_global:
         names.extend(DEFAULT_LIFT_FEATURE_NAMES)
+    if cfg.include_flow_balance:
+        names.extend(FLOW_BALANCE_FEATURE_NAMES)
     if cfg.include_tier2:
         names.extend(tier2_bc_lift_feature_names(cfg.tier2_lift_mode))
     if cfg.include_edge_native:
@@ -224,6 +249,7 @@ def _group_weight_for_block(block_name: str, cfg: MorphExpertConfig) -> float:
     return {
         "local": float(cfg.group_weight_local),
         "global": float(cfg.group_weight_global),
+        "flow_balance": float(cfg.group_weight_flow_balance),
         "tier2": float(cfg.group_weight_tier2),
         "edge_native": float(cfg.group_weight_edge_native),
     }.get(block_name, 1.0)
@@ -441,6 +467,7 @@ def build_morph_targets(
     num_nodes: int,
     cfg: MorphExpertConfig,
     tier0_ctx: Optional[MorphTier0Context] = None,
+    flow_ctx: Optional[MorphTier0FlowContext] = None,
     tier2_ctx: Optional[MorphTier2Context] = None,
 ) -> torch.Tensor:
     """
@@ -465,6 +492,11 @@ def build_morph_targets(
         if tier0_ctx is None:
             raise ValueError("include_global=True requires tier0_ctx")
         global_feats = lift_global_to_seed_edges_torch(seed_edge_ids, tier0_ctx)
+    flow_feats = None
+    if cfg.include_flow_balance:
+        if flow_ctx is None:
+            raise ValueError("include_flow_balance=True requires flow_ctx")
+        flow_feats = lift_flow_balance_to_seed_edges_torch(seed_edge_ids, flow_ctx)
     tier2_feats = None
     if cfg.include_tier2:
         if tier2_ctx is None:
@@ -481,6 +513,7 @@ def build_morph_targets(
         local,
         edge_native=edge_native,
         global_feats=global_feats,
+        flow_feats=flow_feats,
         tier2_feats=tier2_feats,
         local_count_indices=local_count_indices_in_subset(cfg.local_subset),
     ).detach()
@@ -505,6 +538,7 @@ def morphology_expert_step(
     expert_head: MorphExpertHead,
     cfg: MorphExpertConfig,
     tier0_ctx: Optional[MorphTier0Context] = None,
+    flow_ctx: Optional[MorphTier0FlowContext] = None,
     tier2_ctx: Optional[MorphTier2Context] = None,
     diagnostics_accumulator: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -527,6 +561,7 @@ def morphology_expert_step(
         num_nodes,
         cfg,
         tier0_ctx=tier0_ctx,
+        flow_ctx=flow_ctx,
         tier2_ctx=tier2_ctx,
     )
     if z_use.shape[0] != targets.shape[0]:
@@ -563,6 +598,8 @@ def _block_dims_for_config(edge_attr_dim: int, cfg: MorphExpertConfig) -> Dict[s
     blocks: Dict[str, int] = {"local": local_feature_dim_for_subset(cfg.local_subset)}
     if cfg.include_global:
         blocks["global"] = len(DEFAULT_LIFT_FEATURE_NAMES)
+    if cfg.include_flow_balance:
+        blocks["flow_balance"] = FLOW_BALANCE_LIFT_DIM
     if cfg.include_tier2:
         blocks["tier2"] = tier2_bc_lift_dim(cfg.tier2_lift_mode)
     if cfg.include_edge_native:
@@ -600,13 +637,15 @@ def _parse_morph_target_groups(raw: str) -> Tuple[str, ...]:
     if value in ("", "all"):
         return ()
     groups = tuple(part.strip() for part in value.split(",") if part.strip())
-    invalid = sorted(set(groups) - set(MORPH_TARGET_GROUPS))
+    allowed = set(MORPH_TARGET_GROUPS) | set(MORPH_TARGET_GROUP_ALIASES)
+    invalid = sorted(set(groups) - allowed)
     if invalid:
         raise ValueError(
             f"--morph_target_groups contains invalid groups {invalid}; "
-            f"use 'all' or a comma-separated subset of {list(MORPH_TARGET_GROUPS)}."
+            f"use 'all' or a comma-separated subset of {list(MORPH_TARGET_GROUPS)} "
+            f"(legacy aliases: {sorted(MORPH_TARGET_GROUP_ALIASES)})."
         )
-    return groups
+    return expand_morph_target_groups(groups)
 
 
 def setup_morphology_expert(args, tr_data, device, is_hetero: bool):
@@ -676,6 +715,7 @@ def setup_morphology_expert(args, tr_data, device, is_hetero: bool):
         hidden_dim=int(getattr(args, "morph_expert_hidden", 64)),
         include_edge_native=not bool(getattr(args, "no_morph_edge_native", False)),
         include_global=morph_targets_includes_global(targets),
+        include_flow_balance=bool(getattr(args, "morph_flow_balance", False)),
         include_tier2=morph_targets_includes_tier2(targets),
         tier2_lift_mode=str(getattr(args, "morph_tier2_lift", "full")).lower(),
         loss_weight=float(getattr(args, "morph_expert_weight", 1.0)),
@@ -689,6 +729,8 @@ def setup_morphology_expert(args, tr_data, device, is_hetero: bool):
     extra = ""
     if cfg.include_global:
         extra += f" + global={len(DEFAULT_LIFT_FEATURE_NAMES)}"
+    if cfg.include_flow_balance:
+        extra += f" + flow_balance={FLOW_BALANCE_LIFT_DIM}"
     if cfg.include_tier2:
         extra += f" + tier2_bc={tier2_bc_lift_dim(cfg.tier2_lift_mode)}({cfg.tier2_lift_mode})"
     if cfg.include_edge_native:
@@ -699,6 +741,8 @@ def setup_morphology_expert(args, tr_data, device, is_hetero: bool):
     group_extra = ""
     if cfg.target_groups:
         group_extra = f" target_groups={','.join(cfg.target_groups)}"
+    active_names = morph_target_names(cfg)
+    all_names = _all_morph_target_names(cfg)
     logging.info(
         "Morphology expert head: target_dim=%d (local=%d subset=%s%s) loss=%s weight=%.4f morph_targets=%s%s%s",
         head.target_dim,
@@ -711,6 +755,19 @@ def setup_morphology_expert(args, tr_data, device, is_hetero: bool):
         layout_extra,
         group_extra,
     )
+    logging.info(
+        "Morphology target groups active: %s",
+        format_morph_target_group_summary(active_names),
+    )
+    for line in format_morph_target_group_details(active_names):
+        logging.info("Morphology targets | %s", line)
+    if cfg.target_groups:
+        excluded = [name for name in all_names if name not in active_names]
+        if excluded:
+            logging.info(
+                "Morphology target groups filtered out: %s",
+                format_morph_target_group_summary(excluded),
+            )
     return head, cfg
 
 

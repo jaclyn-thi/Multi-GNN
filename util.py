@@ -148,6 +148,23 @@ def create_parser():
         ),
     )
     parser.add_argument(
+        "--knn_cache_path",
+        type=str,
+        default=None,
+        help="Optional sparse transaction KNN .npz cache for contrastive negative exclusion.",
+    )
+    parser.add_argument(
+        "--enable_knn_negative_filter",
+        action="store_true",
+        help="Exclude candidates listed in --knn_cache_path from the contrastive negative pool.",
+    )
+    parser.add_argument(
+        "--knn_filter_k",
+        type=int,
+        default=0,
+        help="Use only the first K KNN neighbors from --knn_cache_path (0 = all cached neighbors).",
+    )
+    parser.add_argument(
         "--multi_positive_mode",
         type=str,
         default="none",
@@ -210,6 +227,19 @@ def create_parser():
         "If omitted with local+global(+tier2), tables are computed from split graphs at startup.",
     )
     parser.add_argument(
+        "--morph_flow_balance",
+        action="store_true",
+        help="Append Tier 0 flow-balance morphology targets (10 dims) to the expert head. "
+        "Off by default; does not change existing runs unless explicitly enabled.",
+    )
+    parser.add_argument(
+        "--morph_tier0_flow_cache",
+        type=str,
+        default=None,
+        help="Directory with {train,val,test}_node_flow_balance.csv from precompute_morphology_tier0_flow.py. "
+        "Falls back to --morph_tier0_cache, then on-the-fly split-graph computation.",
+    )
+    parser.add_argument(
         "--morph_tier2_cache",
         type=str,
         default=None,
@@ -268,8 +298,9 @@ def create_parser():
         type=str,
         default="all",
         help="Semantic morphology target groups to keep for the shared expert head: "
-        "all (default) or comma-separated groups such as degree_fan,local_motif. "
-        "Uses the diagnostic target registry and leaves default behavior unchanged.",
+        "all (default) or comma-separated groups such as degree_fan,motif_participation "
+        "(legacy alias local_motif expands to motif_participation,local_density,local_context_size). "
+        "Uses the diagnostic target registry and leaves default training behavior unchanged.",
     )
     parser.add_argument(
         "--no_morph_edge_native",
