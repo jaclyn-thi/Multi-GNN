@@ -175,6 +175,38 @@ def _align_edge_endpoints_to_shared(
     return endpoints[order].long().view(-1, 2)
 
 
+def _align_knn_soft_positives_to_shared(
+    edge_id1: torch.Tensor,
+    edge_id2: torch.Tensor,
+    knn_pos_ids: torch.Tensor,
+    knn_pos_weights: torch.Tensor,
+    knn_pos_valid: torch.Tensor,
+    knn_pos_z2: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reorder per-anchor KNN positives to match ``_align_shared_edge_pairs`` rows."""
+    edge_id1 = edge_id1.long().view(-1)
+    edge_id2 = edge_id2.long().view(-1)
+    if knn_pos_ids.shape[0] != edge_id1.shape[0]:
+        raise ValueError("KNN soft-positive rows must align with edge_id1 before pairing.")
+    shared_ids = edge_id1[torch.isin(edge_id1, edge_id2)]
+    if shared_ids.numel() == 0:
+        empty_ids = knn_pos_ids.new_empty((0, knn_pos_ids.shape[1]))
+        empty_w = knn_pos_weights.new_empty((0, knn_pos_weights.shape[1]))
+        empty_v = knn_pos_valid.new_empty((0, knn_pos_valid.shape[1]))
+        empty_z = knn_pos_z2.new_empty((0, knn_pos_z2.shape[1], knn_pos_z2.shape[2]))
+        return empty_ids, empty_w, empty_v, empty_z
+    shared_ids = torch.unique(shared_ids, sorted=True)
+    keep1 = torch.isin(edge_id1, shared_ids)
+    ids = edge_id1[keep1]
+    order = torch.argsort(ids)
+    return (
+        knn_pos_ids[keep1][order],
+        knn_pos_weights[keep1][order],
+        knn_pos_valid[keep1][order],
+        knn_pos_z2[keep1][order],
+    )
+
+
 def _align_shared_edge_pairs(
     z1: torch.Tensor,
     edge_id1: torch.Tensor,
@@ -623,6 +655,71 @@ def _multi_positive_log_num(
     return _weighted_logsumexp(logits, weights), (identity | weak)
 
 
+def _knn_soft_positive_log_num(
+    z_b: torch.Tensor,
+    z_identity: torch.Tensor,
+    knn_pos_z2: torch.Tensor,
+    knn_pos_weights: torch.Tensor,
+    knn_pos_valid: torch.Tensor,
+    temperature: float,
+    *,
+    stats: Optional[Dict[str, float]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Weighted numerator: identity @ 1.0 plus KNN positives sharing total soft weight."""
+    identity_logits = (z_b * z_identity).sum(dim=1, keepdim=True) / temperature
+    knn_logits = (z_b.unsqueeze(1) * knn_pos_z2).sum(dim=-1) / temperature
+    knn_logits = torch.where(knn_pos_valid, knn_logits, torch.full_like(knn_logits, float("-inf")))
+
+    identity_weight = torch.ones_like(identity_logits)
+    knn_weights = knn_pos_weights * knn_pos_valid.to(knn_pos_weights.dtype)
+    all_logits = torch.cat([identity_logits, knn_logits], dim=1)
+    all_weights = torch.cat([identity_weight, knn_weights], dim=1)
+
+    if stats is not None:
+        valid_knn = knn_pos_valid
+        knn_weight_sum = (knn_weights * valid_knn.to(knn_weights.dtype)).sum(dim=1)
+        identity_contrib = torch.exp(identity_logits.squeeze(1))
+        knn_contrib = torch.zeros_like(identity_contrib)
+        for col in range(knn_logits.shape[1]):
+            knn_contrib = knn_contrib + torch.where(
+                valid_knn[:, col],
+                torch.exp(knn_logits[:, col]) * knn_weights[:, col],
+                torch.zeros_like(knn_contrib),
+            )
+        stats["identity_num_contrib"] = stats.get("identity_num_contrib", 0.0) + float(identity_contrib.sum().item())
+        stats["knn_num_contrib"] = stats.get("knn_num_contrib", 0.0) + float(knn_contrib.sum().item())
+        stats["anchors_with_knn_pos"] = stats.get("anchors_with_knn_pos", 0.0) + float((valid_knn.any(dim=1)).sum().item())
+        stats["usable_knn_positives"] = stats.get("usable_knn_positives", 0.0) + float(valid_knn.sum().item())
+        stats["knn_weight_sum"] = stats.get("knn_weight_sum", 0.0) + float(knn_weight_sum.sum().item())
+
+    positive_mask = torch.cat(
+        [
+            torch.ones((z_b.shape[0], 1), dtype=torch.bool, device=z_b.device),
+            knn_pos_valid,
+        ],
+        dim=1,
+    )
+    return _weighted_logsumexp(all_logits, all_weights), positive_mask
+
+
+def _knn_positive_negative_mask(
+    ids_b: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    knn_pos_ids: torch.Tensor,
+    knn_pos_valid: torch.Tensor,
+) -> torch.Tensor:
+    """Exclude KNN positive ids from the negative candidate pool per anchor."""
+    if knn_pos_ids is None or knn_pos_valid is None or knn_pos_ids.numel() == 0:
+        return torch.ones(
+            (ids_b.numel(), candidate_ids.numel()),
+            dtype=torch.bool,
+            device=ids_b.device,
+        )
+    exclude = (candidate_ids.view(1, 1, -1) == knn_pos_ids.unsqueeze(-1)) & knn_pos_valid.unsqueeze(-1)
+    allowed = ~exclude.any(dim=1)
+    return allowed
+
+
 def _apply_false_negative_fallback(
     allowed: torch.Tensor,
     *,
@@ -677,6 +774,11 @@ def _directional_aligned_infonce(
     multi_positive_stats: Optional[Dict[str, float]] = None,
     knn_filter: Optional[Any] = None,
     knn_filter_stats: Optional[Dict[str, float]] = None,
+    knn_pos_ids: Optional[torch.Tensor] = None,
+    knn_pos_z2: Optional[torch.Tensor] = None,
+    knn_pos_weights: Optional[torch.Tensor] = None,
+    knn_pos_valid: Optional[torch.Tensor] = None,
+    knn_soft_pos_stats: Optional[Dict[str, float]] = None,
 ) -> torch.Tensor:
     if z_anchor.shape != z_other.shape:
         raise ValueError("Aligned directional InfoNCE expects z_anchor and z_other to share shape.")
@@ -718,6 +820,14 @@ def _directional_aligned_infonce(
 
     use_morph = morph_bin_ids is not None
     use_multi_pos = multi_positive_mode != "none" and edge_endpoints is not None
+    use_knn_soft = (
+        knn_pos_z2 is not None
+        and knn_pos_valid is not None
+        and knn_pos_weights is not None
+        and knn_pos_ids is not None
+    )
+    if use_knn_soft and (use_multi_pos or use_morph):
+        raise ValueError("KNN soft positives cannot be combined with morphology bins or endpoint multi-positive mode.")
     if multi_positive_mode not in MULTI_POSITIVE_MODES:
         raise ValueError(f"Unsupported multi_positive_mode={multi_positive_mode!r}")
     bin_inv: Optional[torch.Tensor] = None
@@ -734,7 +844,18 @@ def _directional_aligned_infonce(
         log_num = z_b.new_empty((chunk_rows,))
 
         current_positive_mask = None
-        if use_multi_pos:
+        if use_knn_soft:
+            assert knn_pos_z2 is not None and knn_pos_valid is not None and knn_pos_weights is not None
+            log_num, _ = _knn_soft_positive_log_num(
+                z_b,
+                z_other[i0:i1],
+                knn_pos_z2[i0:i1],
+                knn_pos_weights[i0:i1],
+                knn_pos_valid[i0:i1],
+                temperature,
+                stats=knn_soft_pos_stats,
+            )
+        elif use_multi_pos:
             z_pos_candidates = z_other
             id_pos_candidates = edge_ids
             endpoint_pos_candidates = edge_endpoints
@@ -793,6 +914,14 @@ def _directional_aligned_infonce(
                         + float(((~endpoint_allowed) & (~knn_allowed)).sum().item())
                     )
                 allowed = knn_allowed if allowed is None else (allowed & knn_allowed)
+            if use_knn_soft:
+                knn_allowed = _knn_positive_negative_mask(
+                    ids_b,
+                    candidate_ids,
+                    knn_pos_ids[i0:i1],
+                    knn_pos_valid[i0:i1],
+                )
+                allowed = knn_allowed if allowed is None else (allowed & knn_allowed)
             if allowed is not None:
                 if knn_filter_stats is not None:
                     fallback_rows = (allowed.sum(dim=1) < int(false_neg_filter_min_negatives)).sum().item()
@@ -811,6 +940,14 @@ def _directional_aligned_infonce(
                 identity_candidate_pos = ids_b.unsqueeze(1) == candidate_ids.unsqueeze(0)
                 positive_candidate_mask = weak_candidate_pos | identity_candidate_pos
                 allowed = ~positive_candidate_mask if allowed is None else (allowed & ~positive_candidate_mask)
+            elif use_knn_soft:
+                positive_candidate_mask = _knn_positive_negative_mask(
+                    ids_b,
+                    candidate_ids,
+                    knn_pos_ids[i0:i1],
+                    knn_pos_valid[i0:i1],
+                )
+                allowed = positive_candidate_mask if allowed is None else (allowed & positive_candidate_mask)
             if use_morph and morph_bin_ids is not None:
                 neg_idx = _sample_negative_indices_by_bin(
                     morph_bin_ids,
@@ -876,6 +1013,14 @@ def _directional_aligned_infonce(
                         stats=knn_filter_stats,
                     )
                     logits = torch.where(knn_allowed, logits, torch.full_like(logits, float("-inf")))
+                if use_knn_soft:
+                    knn_allowed = _knn_positive_negative_mask(
+                        ids_b,
+                        edge_ids[j0:j1],
+                        knn_pos_ids[i0:i1],
+                        knn_pos_valid[i0:i1],
+                    )
+                    logits = torch.where(knn_allowed, logits, torch.full_like(logits, float("-inf")))
                 if use_multi_pos and current_positive_mask is not None:
                     logits = torch.where(
                         ~current_positive_mask[:, j0:j1],
@@ -887,7 +1032,7 @@ def _directional_aligned_infonce(
 
             if log_denom is None:
                 continue
-            if use_multi_pos:
+            if use_multi_pos or use_knn_soft:
                 log_denom = torch.logaddexp(log_num, log_denom)
             log_queue = _logsumexp_over_queue(
                 z_b,
@@ -969,6 +1114,11 @@ def edge_identity_infonce_loss(
     multi_positive_stats: Optional[Dict[str, float]] = None,
     knn_filter: Optional[Any] = None,
     knn_filter_stats: Optional[Dict[str, float]] = None,
+    knn_pos_ids: Optional[torch.Tensor] = None,
+    knn_pos_weights: Optional[torch.Tensor] = None,
+    knn_pos_valid: Optional[torch.Tensor] = None,
+    knn_pos_z2: Optional[torch.Tensor] = None,
+    knn_soft_pos_stats: Optional[Dict[str, float]] = None,
 ):
     """
     InfoNCE-style edge contrastive loss with identity positives, optionally merged
@@ -1014,6 +1164,15 @@ def edge_identity_infonce_loss(
     z1, ids1, z2, ids2 = _align_shared_edge_pairs(z1, edge_id1, z2, edge_id2)
     if morph_bin_ids is not None:
         morph_bin_ids = _align_morph_bin_ids_to_shared(morph_bin_ids, edge_id1, edge_id2)
+    if knn_pos_ids is not None and knn_pos_z2 is not None and knn_pos_weights is not None and knn_pos_valid is not None:
+        knn_pos_ids, knn_pos_weights, knn_pos_valid, knn_pos_z2 = _align_knn_soft_positives_to_shared(
+            edge_id1,
+            edge_id2,
+            knn_pos_ids,
+            knn_pos_weights,
+            knn_pos_valid,
+            knn_pos_z2,
+        )
 
     n_pairs = int(ids1.numel())
     if n_pairs == 0:
@@ -1044,6 +1203,11 @@ def edge_identity_infonce_loss(
         multi_positive_stats=multi_positive_stats,
         knn_filter=knn_filter,
         knn_filter_stats=knn_filter_stats,
+        knn_pos_ids=knn_pos_ids,
+        knn_pos_z2=knn_pos_z2,
+        knn_pos_weights=knn_pos_weights,
+        knn_pos_valid=knn_pos_valid,
+        knn_soft_pos_stats=knn_soft_pos_stats,
     )
     if symmetric:
         loss_21 = _directional_aligned_infonce(
@@ -1064,6 +1228,11 @@ def edge_identity_infonce_loss(
             multi_positive_stats=multi_positive_stats,
             knn_filter=knn_filter,
             knn_filter_stats=knn_filter_stats,
+            knn_pos_ids=knn_pos_ids,
+            knn_pos_z2=knn_pos_z2,
+            knn_pos_weights=knn_pos_weights,
+            knn_pos_valid=knn_pos_valid,
+            knn_soft_pos_stats=knn_soft_pos_stats,
         )
         loss = 0.5 * (loss_12 + loss_21)
     else:

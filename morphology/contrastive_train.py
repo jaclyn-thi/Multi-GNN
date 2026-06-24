@@ -23,6 +23,7 @@ from torch_geometric.data import Data, HeteroData
 
 from morphology.contrast import MorphContrastConfig, build_morph_bin_ids_for_seeds
 from morphology.expert import MorphExpertConfig, MorphExpertHead, morphology_expert_step
+from morphology.tier0_flow_balance import MorphTier0FlowContext
 from morphology.tier0_global import MorphTier0Context
 from morphology.tier2_global import MorphTier2Context
 from train_util import FORWARD_EDGE_TYPE
@@ -169,6 +170,9 @@ def eval_morph_expert_val_hetero(
     tier0_ctx: Optional[MorphTier0Context] = getattr(args, "morph_tier0_val", None)
     if cfg.include_global and tier0_ctx is None:
         raise ValueError("morph_tier0_val missing for local+global morphology eval")
+    flow_ctx: Optional[MorphTier0FlowContext] = getattr(args, "morph_tier0_flow_val", None)
+    if cfg.include_flow_balance and flow_ctx is None:
+        raise ValueError("morph_tier0_flow_val missing for flow-balance morphology eval")
     tier2_ctx: Optional[MorphTier2Context] = getattr(args, "morph_tier2_val", None)
     if cfg.include_tier2 and tier2_ctx is None:
         raise ValueError("morph_tier2_val missing for local+global+tier2 morphology eval")
@@ -210,6 +214,7 @@ def eval_morph_expert_val_hetero(
             expert_head,
             cfg,
             tier0_ctx=tier0_ctx,
+            flow_ctx=flow_ctx,
             tier2_ctx=tier2_ctx,
         )
         loss_sum = loss_sum + loss.detach()
@@ -239,6 +244,9 @@ def eval_morph_expert_val_homo(
     tier0_ctx: Optional[MorphTier0Context] = getattr(args, "morph_tier0_val", None)
     if cfg.include_global and tier0_ctx is None:
         raise ValueError("morph_tier0_val missing for local+global morphology eval")
+    flow_ctx: Optional[MorphTier0FlowContext] = getattr(args, "morph_tier0_flow_val", None)
+    if cfg.include_flow_balance and flow_ctx is None:
+        raise ValueError("morph_tier0_flow_val missing for flow-balance morphology eval")
     tier2_ctx: Optional[MorphTier2Context] = getattr(args, "morph_tier2_val", None)
     if cfg.include_tier2 and tier2_ctx is None:
         raise ValueError("morph_tier2_val missing for local+global+tier2 morphology eval")
@@ -278,6 +286,7 @@ def eval_morph_expert_val_homo(
             expert_head,
             cfg,
             tier0_ctx=tier0_ctx,
+            flow_ctx=flow_ctx,
             tier2_ctx=tier2_ctx,
         )
         loss_sum = loss_sum + loss.detach()
@@ -299,6 +308,7 @@ def morph_expert_loss_hetero_step(
     expert_head: MorphExpertHead,
     cfg: MorphExpertConfig,
     tier0_ctx: Optional[MorphTier0Context] = None,
+    flow_ctx: Optional[MorphTier0FlowContext] = None,
     tier2_ctx: Optional[MorphTier2Context] = None,
     diagnostics_accumulator: Optional[Dict[str, Any]] = None,
 ) -> torch.Tensor:
@@ -306,7 +316,7 @@ def morph_expert_loss_hetero_step(
     Single training-step morphology expert loss (hetero).
 
     Targets are built from **view1** subgraph features (detached). Uses train-split
-    ``tier0_ctx`` / ``tier2_ctx`` when global / Tier 2 targets are enabled.
+    ``tier0_ctx`` / ``flow_ctx`` / ``tier2_ctx`` when global / flow / Tier 2 targets are enabled.
     """
     store = view1[FORWARD_EDGE_TYPE]
     loss, _ = morphology_expert_step(
@@ -319,6 +329,7 @@ def morph_expert_loss_hetero_step(
         expert_head,
         cfg,
         tier0_ctx=tier0_ctx,
+        flow_ctx=flow_ctx,
         tier2_ctx=tier2_ctx,
         diagnostics_accumulator=diagnostics_accumulator,
     )
@@ -333,6 +344,7 @@ def morph_expert_loss_homo_step(
     expert_head: MorphExpertHead,
     cfg: MorphExpertConfig,
     tier0_ctx: Optional[MorphTier0Context] = None,
+    flow_ctx: Optional[MorphTier0FlowContext] = None,
     tier2_ctx: Optional[MorphTier2Context] = None,
     diagnostics_accumulator: Optional[Dict[str, Any]] = None,
 ) -> torch.Tensor:
@@ -348,6 +360,7 @@ def morph_expert_loss_homo_step(
         expert_head,
         cfg,
         tier0_ctx=tier0_ctx,
+        flow_ctx=flow_ctx,
         tier2_ctx=tier2_ctx,
         diagnostics_accumulator=diagnostics_accumulator,
     )

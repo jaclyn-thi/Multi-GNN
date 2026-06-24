@@ -1,58 +1,82 @@
 #!/usr/bin/env python
 """Precompute sparse feature-KNN neighbors for transaction contrastive filtering.
 
-This script builds train-only KNN over label-free transaction features and saves
-only top-k neighbor IDs/similarities. It does not create a dense graph view.
-Saved ``edge_ids`` and ``neighbor_ids`` are train split-local IDs, matching the
-``edge_id`` values used by contrastive training after ``add_arange_ids``.
-Original CSV ``EdgeID`` values are also saved for audit/debugging.
+Supports CPU sklearn, FAISS GPU exact search, PyTorch CUDA batched top-k, optional
+FAISS IVF approximate search, and resumable shard output.
+
+Examples:
+
+  # 100k-row GPU smoke
+  python scripts/precompute_transaction_knn.py precompute \\
+    --data Small-HI --feature_set edge_native+degree_fan --k 15 \\
+    --backend auto --max_rows 100000 \\
+    --output morphology_cache/Small-HI/transaction_knn_edge_native_degree_fan_k15_smoke100k.npz
+
+  # Full train GPU job with periodic shards
+  python scripts/precompute_transaction_knn.py precompute \\
+    --data Small-HI --feature_set edge_native+degree_fan --k 15 \\
+    --backend auto --query_batch_size 8192 --shard_rows 250000 \\
+    --shard_dir morphology_cache/Small-HI/transaction_knn_edge_native_degree_fan_k15_shards \\
+    --output morphology_cache/Small-HI/transaction_knn_edge_native_degree_fan_k15.npz
+
+  # Merge shards only
+  python scripts/precompute_transaction_knn.py merge \\
+    --shard_dir morphology_cache/Small-HI/transaction_knn_edge_native_degree_fan_k15_shards \\
+    --output morphology_cache/Small-HI/transaction_knn_edge_native_degree_fan_k15.npz
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import sys
 from pathlib import Path
-from typing import List, Tuple
 
 import numpy as np
-import pandas as pd
-import torch
-from sklearn.neighbors import NearestNeighbors
-from sklearn.preprocessing import StandardScaler
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from dataset_specs import DEFAULT_EDGE_FEATURE_COLS, get_dataset_spec, spec_summary
-from dataset_splits import temporal_edge_split
 from morphology.target_registry import morph_target_group
+from transaction_knn.backends import build_backend, build_exact_reference_backend, list_backends
+from transaction_knn.features import (
+    build_features_detailed,
+    dataset_metadata,
+    feature_set_metadata,
+    load_train_frame,
+    standardize_features,
+)
+from transaction_knn.shards import (
+    merge_shards,
+    print_sanity_report,
+    shard_path,
+    validate_cache,
+    write_shard,
+)
 
 
-EDGE_NATIVE_COLUMNS = list(DEFAULT_EDGE_FEATURE_COLS)
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--data", default="Small-HI", help="Dataset folder under aml-data")
     parser.add_argument("--data_config", default="data_config.json", help="Path to data_config.json")
     parser.add_argument(
         "--feature_set",
         default="edge_native",
-        choices=["edge_native", "degree_fan", "edge_native+degree_fan"],
-        help="Label-free feature family for KNN.",
+        help="Label-free feature family for KNN (e.g. edge_native+degree_fan, richer_v1).",
+    )
+    parser.add_argument(
+        "--categorical_encoding",
+        default="ordinal",
+        choices=["ordinal", "one_hot"],
+        help="Encoding for currency/payment format when edge_native is included.",
+    )
+    parser.add_argument(
+        "--scaling",
+        default="legacy_standard",
+        choices=["legacy_standard", "standard", "robust", "none"],
+        help="legacy_standard = global StandardScaler; richer sets often use robust per-group.",
     )
     parser.add_argument("--k", type=int, default=50, help="Top-k neighbors per train transaction")
-    parser.add_argument("--output", required=True, help="Output .npz path")
-    parser.add_argument(
-        "--query_batch_size",
-        type=int,
-        default=10000,
-        help="Rows queried per KNN batch; lowers peak memory for large datasets.",
-    )
     parser.add_argument(
         "--metric",
         default="cosine",
@@ -60,168 +84,229 @@ def parse_args() -> argparse.Namespace:
         help="KNN metric after preprocessing/standardization",
     )
     parser.add_argument("--log_level", default="INFO", help="Python logging level")
-    return parser.parse_args()
 
 
-def load_data_config(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def _add_precompute_args(parser: argparse.ArgumentParser) -> None:
+    _add_common_args(parser)
+    parser.add_argument("--output", required=True, help="Final merged .npz path")
+    parser.add_argument(
+        "--backend",
+        default="auto",
+        choices=list_backends(),
+        help="KNN backend (auto prefers FAISS GPU, then torch GPU, then CPU sklearn)",
+    )
+    parser.add_argument(
+        "--query_batch_size",
+        type=int,
+        default=8192,
+        help="Rows queried per KNN batch; lowers peak GPU memory.",
+    )
+    parser.add_argument(
+        "--shard_rows",
+        type=int,
+        default=250_000,
+        help="Write a shard every N query rows (0 = only final output).",
+    )
+    parser.add_argument(
+        "--shard_dir",
+        default="",
+        help="Directory for shard .npz files (default: <output_stem>_shards).",
+    )
+    parser.add_argument("--resume", action="store_true", help="Skip shards that already exist.")
+    parser.add_argument("--max_rows", type=int, default=0, help="Optional cap for smoke tests.")
+    parser.add_argument(
+        "--approx_recall_subset",
+        type=int,
+        default=0,
+        help="If >0 and backend is approximate, compare recall@k vs exact on this many queries.",
+    )
+    parser.add_argument("--faiss_nlist", type=int, default=4096, help="IVF nlist (faiss_ivf only).")
+    parser.add_argument("--faiss_nprobe", type=int, default=64, help="IVF nprobe (faiss_ivf only).")
+    parser.add_argument("--faiss_train_size", type=int, default=200_000, help="IVF train sample size.")
+    parser.add_argument("--no_merge", action="store_true", help="Write shards only; skip final merge.")
 
 
-def _safe_log1p(values: pd.Series) -> np.ndarray:
-    arr = values.astype(float).to_numpy()
-    arr = np.maximum(arr, 0.0)
-    return np.log1p(arr)
-
-
-def edge_native_features(df: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
-    cols = [c for c in EDGE_NATIVE_COLUMNS if c in df.columns]
-    if len(cols) != len(EDGE_NATIVE_COLUMNS):
-        missing = sorted(set(EDGE_NATIVE_COLUMNS) - set(cols))
-        raise ValueError(f"formatted_transactions.csv missing edge-native columns: {missing}")
-    parts = []
-    names = []
-    for col in cols:
-        if "Amount" in col:
-            parts.append(_safe_log1p(df[col]))
-            names.append(f"log1p_{col}")
-        else:
-            parts.append(df[col].astype(float).to_numpy())
-            names.append(col)
-    return np.column_stack(parts).astype(np.float32), names
-
-
-def degree_fan_features(df: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
-    from_ids = df["from_id"].astype(np.int64).to_numpy()
-    to_ids = df["to_id"].astype(np.int64).to_numpy()
-    max_node = int(max(from_ids.max(initial=0), to_ids.max(initial=0))) + 1
-    out_deg = np.bincount(from_ids, minlength=max_node).astype(np.float32)
-    in_deg = np.bincount(to_ids, minlength=max_node).astype(np.float32)
-    features = np.column_stack(
-        [
-            np.log1p(out_deg[from_ids]),
-            np.log1p(in_deg[from_ids]),
-            np.log1p(out_deg[to_ids]),
-            np.log1p(in_deg[to_ids]),
-            np.log1p(out_deg[from_ids] + in_deg[from_ids]),
-            np.log1p(out_deg[to_ids] + in_deg[to_ids]),
-            np.log1p(out_deg[from_ids] + out_deg[to_ids]),
-            np.log1p(in_deg[from_ids] + in_deg[to_ids]),
-        ]
-    ).astype(np.float32)
-    names = [
-        "log1p_sender_out_degree_train",
-        "log1p_sender_in_degree_train",
-        "log1p_receiver_out_degree_train",
-        "log1p_receiver_in_degree_train",
-        "log1p_sender_total_degree_train",
-        "log1p_receiver_total_degree_train",
-        "log1p_pair_out_degree_sum_train",
-        "log1p_pair_in_degree_sum_train",
-    ]
-    return features, names
-
-
-def build_features(df_train: pd.DataFrame, feature_set: str) -> Tuple[np.ndarray, List[str]]:
-    matrices: List[np.ndarray] = []
-    names: List[str] = []
-    if "edge_native" in feature_set:
-        x, n = edge_native_features(df_train)
-        matrices.append(x)
-        names.extend(n)
-    if "degree_fan" in feature_set:
-        x, n = degree_fan_features(df_train)
-        matrices.append(x)
-        names.extend(n)
-    if not matrices:
-        raise ValueError(f"Unsupported feature_set={feature_set!r}")
-    features = np.concatenate(matrices, axis=1).astype(np.float32)
-    if not np.isfinite(features).all():
-        raise ValueError("KNN features contain non-finite values after preprocessing")
-    return features, names
-
-
-def cosine_similarity_from_distance(distance: np.ndarray, metric: str) -> np.ndarray:
-    if metric == "cosine":
-        return (1.0 - distance).astype(np.float32)
-    return (-distance).astype(np.float32)
-
-
-def main() -> None:
-    args = parse_args()
-    logging.basicConfig(level=getattr(logging, str(args.log_level).upper()), format="%(asctime)s [%(levelname)s] %(message)s")
+def cmd_precompute(args: argparse.Namespace) -> None:
     if args.k <= 0:
         raise ValueError("--k must be positive")
 
-    spec = get_dataset_spec(args.data)
-    cfg = load_data_config(args.data_config)
-    csv_path = Path(cfg["paths"]["aml_data"]) / args.data / spec.formatted_csv_name()
-    if not csv_path.is_file():
-        raise FileNotFoundError(csv_path)
-
-    logging.info("Loading transactions: %s", csv_path)
-    df = pd.read_csv(csv_path)
-    df["Timestamp"] = df["Timestamp"] - df["Timestamp"].min()
-    y = torch.LongTensor(df[spec.label_col].to_numpy())
-    timestamps = torch.Tensor(df["Timestamp"].to_numpy())
-    tr_inds, _, _, split = temporal_edge_split(timestamps, y, spec)
-    train_pos = tr_inds.numpy()
-    df_train = df.iloc[train_pos].reset_index(drop=True)
+    df, df_train, split, spec = load_train_frame(
+        args.data,
+        args.data_config,
+        max_rows=int(args.max_rows),
+    )
     logging.info("Train-only KNN rows: %d / %d", len(df_train), len(df))
 
-    features, feature_names = build_features(df_train, args.feature_set)
+    detail = build_features_detailed(
+        df_train,
+        args.feature_set,
+        categorical_encoding=args.categorical_encoding,
+        scaling="none" if args.scaling == "legacy_standard" else args.scaling,
+    )
+    features = detail.features
+    feature_names = detail.names
+    if args.scaling == "legacy_standard":
+        features = standardize_features(features)
+    elif args.scaling in {"standard", "robust"}:
+        pass  # already scaled in build_features_detailed
+    elif args.scaling == "none":
+        pass
     if features.shape[0] < 2:
         raise ValueError("Need at least two train transactions to build KNN")
-    scaler = StandardScaler()
-    features = scaler.fit_transform(features).astype(np.float32)
     k = min(int(args.k), features.shape[0] - 1)
-    logging.info("Fitting KNN: feature_set=%s dim=%d k=%d metric=%s", args.feature_set, features.shape[1], k, args.metric)
-    nbrs = NearestNeighbors(n_neighbors=k + 1, metric=args.metric, algorithm="auto", n_jobs=-1)
-    nbrs.fit(features)
-    neighbor_ids = np.full((features.shape[0], k), -1, dtype=np.int64)
-    neighbor_sims = np.full((features.shape[0], k), np.nan, dtype=np.float32)
     query_batch_size = max(1, int(args.query_batch_size))
-    for start in range(0, features.shape[0], query_batch_size):
-        end = min(start + query_batch_size, features.shape[0])
-        logging.info("Querying KNN rows %d:%d", start, end)
-        distances, indices = nbrs.kneighbors(features[start:end], return_distance=True)
-        # Drop self-neighbor when present; fall back to first k non-self entries.
-        for local_i in range(end - start):
-            row_i = start + local_i
-            keep = indices[local_i] != row_i
-            idx = indices[local_i][keep][:k]
-            dist = distances[local_i][keep][:k]
-            neighbor_ids[row_i, : idx.shape[0]] = idx.astype(np.int64)
-            neighbor_sims[row_i, : idx.shape[0]] = cosine_similarity_from_distance(dist, args.metric)
+    shard_rows = max(0, int(args.shard_rows))
+
+    backend = build_backend(
+        args.backend,
+        metric=args.metric,
+        faiss_nlist=args.faiss_nlist,
+        faiss_nprobe=args.faiss_nprobe,
+        faiss_train_size=args.faiss_train_size,
+    )
+    logging.info(
+        "Fitting KNN backend=%s feature_set=%s dim=%d k=%d metric=%s rows=%d",
+        backend.name,
+        args.feature_set,
+        features.shape[1],
+        k,
+        args.metric,
+        features.shape[0],
+    )
+    backend.fit(features, k=k)
+
+    if int(args.approx_recall_subset) > 0 and args.backend == "faiss_ivf":
+        n = min(int(args.approx_recall_subset), features.shape[0])
+        rng = np.random.default_rng(0)
+        q_idx = np.sort(rng.choice(features.shape[0], size=n, replace=False))
+        exact = build_exact_reference_backend(args.metric)
+        exact.fit(features, k=k)
+        recall = backend.recall_at_k(q_idx, k, exact)
+        logging.info("Approximate recall@k on %d queries vs exact backend: %.4f", n, recall)
 
     output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    metadata = {
-        "data": args.data,
-        "dataset_spec": dict(spec_summary(spec)),
-        "feature_set": args.feature_set,
-        "feature_names": feature_names,
-        "k": k,
-        "metric": args.metric,
-        "query_batch_size": query_batch_size,
-        "id_space": "train_split_local_edge_id",
-        "n_train": int(features.shape[0]),
-        "split_buckets": split,
-        "label_free": True,
-    }
-    np.savez_compressed(
-        output,
-        edge_ids=np.arange(features.shape[0], dtype=np.int64),
-        csv_edge_ids=df_train["EdgeID"].astype(np.int64).to_numpy(),
-        neighbor_ids=neighbor_ids,
-        neighbor_sims=neighbor_sims,
-        feature_names=np.asarray(feature_names, dtype=object),
-        k=np.asarray(k, dtype=np.int64),
-        feature_set=np.asarray(args.feature_set),
-        metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
+    shard_dir = Path(args.shard_dir) if args.shard_dir else output.with_suffix("").with_name(output.stem + "_shards")
+    use_shards = shard_rows > 0
+    if use_shards:
+        shard_dir.mkdir(parents=True, exist_ok=True)
+
+    metadata = dataset_metadata(
+        args.data,
+        spec,
+        args.feature_set,
+        feature_names,
+        k,
+        args.metric,
+        query_batch_size,
+        backend.backend_id,
+        features.shape[0],
+        split,
+        shard_dir=str(shard_dir) if use_shards else None,
+        shard_rows=shard_rows,
+        max_rows=int(args.max_rows),
+        requested_backend=args.backend,
+        **feature_set_metadata(detail),
     )
-    logging.info("Wrote sparse KNN cache: %s", output)
-    logging.info("Feature groups in cache: %s", sorted({morph_target_group(n) for n in feature_names}))
+
+    n_rows = features.shape[0]
+    csv_edge_ids = df_train["EdgeID"].astype(np.int64).to_numpy()
+
+    for shard_start in range(0, n_rows, shard_rows if use_shards else n_rows):
+        shard_end = min(shard_start + (shard_rows if use_shards else n_rows), n_rows)
+        if use_shards:
+            out = shard_path(shard_dir, shard_start, shard_end)
+            if args.resume and out.is_file():
+                logging.info("Skipping existing shard %s", out)
+                continue
+
+        neighbor_ids = np.full((shard_end - shard_start, k), -1, dtype=np.int64)
+        neighbor_sims = np.full((shard_end - shard_start, k), np.nan, dtype=np.float32)
+        query_positions = np.arange(shard_start, shard_end, dtype=np.int64)
+
+        for batch_start in range(0, query_positions.shape[0], query_batch_size):
+            batch_end = min(batch_start + query_batch_size, query_positions.shape[0])
+            batch_idx = query_positions[batch_start:batch_end]
+            logging.info("Querying rows %d:%d (backend=%s)", int(batch_idx[0]), int(batch_idx[-1] + 1), backend.name)
+            idx, sims = backend.query(batch_idx, k)
+            neighbor_ids[batch_start:batch_end] = idx
+            neighbor_sims[batch_start:batch_end] = sims
+
+        edge_ids = np.arange(shard_start, shard_end, dtype=np.int64)
+        if use_shards:
+            write_shard(
+                shard_dir,
+                shard_start,
+                shard_end,
+                edge_ids=edge_ids,
+                csv_edge_ids=csv_edge_ids[shard_start:shard_end],
+                neighbor_ids=neighbor_ids,
+                neighbor_sims=neighbor_sims,
+                metadata=metadata,
+            )
+
+    if use_shards and not args.no_merge:
+        final_path = merge_shards(shard_dir, output)
+    elif not use_shards:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            output,
+            edge_ids=np.arange(n_rows, dtype=np.int64),
+            csv_edge_ids=csv_edge_ids,
+            neighbor_ids=neighbor_ids,
+            neighbor_sims=neighbor_sims,
+            feature_names=np.asarray(feature_names, dtype=object),
+            k=np.asarray(k, dtype=np.int64),
+            feature_set=np.asarray(args.feature_set),
+            metadata_json=np.asarray(__import__("json").dumps(metadata, sort_keys=True)),
+        )
+        logging.info("Wrote sparse KNN cache: %s", output)
+        final_path = output
+    else:
+        logging.info("Shard-only run complete; merge skipped (%s)", shard_dir)
+        return
+
+    report = validate_cache(final_path)
+    print_sanity_report(report)
+    logging.info(
+        "Feature groups in cache: %s",
+        sorted({morph_target_group(n) for n in feature_names}),
+    )
+
+
+def cmd_merge(args: argparse.Namespace) -> None:
+    output = merge_shards(Path(args.shard_dir), Path(args.output))
+    report = validate_cache(output)
+    print_sanity_report(report)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--log_level", default="INFO", help="Python logging level")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_pre = sub.add_parser("precompute", help="Build KNN cache (optionally sharded).")
+    _add_precompute_args(p_pre)
+    p_pre.set_defaults(func=cmd_precompute)
+
+    p_merge = sub.add_parser("merge", help="Merge shard directory into final .npz.")
+    p_merge.add_argument("--shard_dir", required=True)
+    p_merge.add_argument("--output", required=True)
+    p_merge.set_defaults(func=cmd_merge)
+    return parser
+
+
+def main() -> None:
+    # Backward compatibility: older invocations omitted the ``precompute`` subcommand.
+    if len(sys.argv) > 1 and sys.argv[1] not in ("precompute", "merge", "-h", "--help"):
+        sys.argv.insert(1, "precompute")
+
+    parser = build_parser()
+    args = parser.parse_args()
+    logging.basicConfig(
+        level=getattr(logging, str(args.log_level).upper()),
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+    args.func(args)
 
 
 if __name__ == "__main__":

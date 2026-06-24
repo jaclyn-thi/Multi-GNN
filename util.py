@@ -165,6 +165,54 @@ def create_parser():
         help="Use only the first K KNN neighbors from --knn_cache_path (0 = all cached neighbors).",
     )
     parser.add_argument(
+        "--enable_knn_soft_positives",
+        action="store_true",
+        help="Add low-weight KNN feature neighbors as soft positives in edge InfoNCE.",
+    )
+    parser.add_argument(
+        "--knn_pos_source_k",
+        type=int,
+        default=15,
+        help="Number of cached KNN neighbors to consider as soft-positive candidates per anchor.",
+    )
+    parser.add_argument(
+        "--knn_pos_m",
+        type=int,
+        default=1,
+        help="Number of KNN soft positives sampled/used per anchor per step.",
+    )
+    parser.add_argument(
+        "--knn_pos_weight",
+        type=float,
+        default=0.025,
+        help="Total soft-positive mass from KNN neighbors per anchor (split across pos_m positives).",
+    )
+    parser.add_argument(
+        "--knn_pos_weight_mode",
+        type=str,
+        default="uniform",
+        choices=["uniform", "similarity"],
+        help="How to split --knn_pos_weight across selected KNN positives.",
+    )
+    parser.add_argument(
+        "--knn_pos_min_sim",
+        type=float,
+        default=None,
+        help="Optional minimum cached cosine similarity required for a KNN soft positive.",
+    )
+    parser.add_argument(
+        "--knn_pos_seed",
+        type=int,
+        default=0,
+        help="Base seed for deterministic KNN soft-positive sampling.",
+    )
+    parser.add_argument(
+        "--knn_pos_loader_batch_size",
+        type=int,
+        default=4096,
+        help="Chunk size for auxiliary LinkNeighborLoader forwards that materialize KNN positives.",
+    )
+    parser.add_argument(
         "--multi_positive_mode",
         type=str,
         default="none",

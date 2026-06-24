@@ -94,6 +94,14 @@ These flags are optional experiments for the edge-level contrastive loss. Defaul
 | `--knn_cache_path` | — | Sparse offline transaction KNN `.npz` cache from `scripts/precompute_transaction_knn.py` |
 | `--enable_knn_negative_filter` | off | Exclude cached KNN neighbors from contrastive negatives |
 | `--knn_filter_k` | `0` | Use first K cached neighbors for exclusion (`0` = all cached neighbors) |
+| `--enable_knn_soft_positives` | off | Add cached KNN neighbors as low-weight InfoNCE positives (requires `--contrastive_asymmetric`) |
+| `--knn_pos_source_k` | `15` | Use top-k cached neighbors as positive candidates |
+| `--knn_pos_m` | `1` | KNN positives sampled per anchor per step |
+| `--knn_pos_weight` | `0.025` | Total KNN positive mass per anchor (split across `m`, not multiplied) |
+| `--knn_pos_weight_mode` | `uniform` | `uniform` or `similarity` (similarity renormalizes within selected positives) |
+| `--knn_pos_min_sim` | — | Optional minimum cached similarity for a KNN positive |
+| `--knn_pos_seed` | `0` | Base seed for deterministic KNN-positive sampling |
+| `--knn_pos_loader_batch_size` | `4096` | Chunk size for auxiliary seed forwards |
 | `--multi_positive_mode` | `none` | Add endpoint/pair weak positives in the numerator. Modes: `same_sender`, `same_receiver`, `same_endpoint`, `same_pair` |
 | `--multi_positive_weight` | `0.1` | Weight for weak positives. Identity positives remain weight `1.0` |
 
@@ -112,38 +120,47 @@ Implementation notes:
 - Multi-positive mode adds weak endpoint/pair positives among the aligned current cross-view seed batch; queue entries matching the weak-positive rule are excluded as negatives but are not used as positives.
 - Both features use split-local edge endpoints from the forward `edge_index`; they are compatible with asymmetric/symmetric InfoNCE, projection head, sampled negatives, and the memory queue.
 - Logs include before/after candidate counts for filtering, fallback rows, identity positives, weak positives, average positives per anchor, and fraction of anchors without weak positives.
+- KNN filter (when enabled): per-epoch `anchors_with_knn_in_pool`, `removed`, and `fallback_rows` — see [`knn-precompute-reference.md`](knn-precompute-reference.md).
+- KNN soft positives (when enabled): per-epoch anchor coverage, injected unique ids, similarity min/mean/max, endpoint overlap, identity vs KNN numerator contribution, and drop reasons — see [`knn-precompute-reference.md`](knn-precompute-reference.md).
 - Small-HI follow-up: `--false_neg_filter_mode same_pair` is the leading F1/recall candidate across seeds. `same_endpoint` and `same_receiver` were less stable. Default remains `none`.
 - Multi-positive runs so far underperform exclusion-only filtering. Lower `same_pair` weight `0.05` helped relative to `0.1`, but still did not beat no-filter or `same_pair` false-negative filtering.
 
 ### Offline feature-KNN negative filtering
 
-Precompute sparse train-only KNN caches over label-free transaction features:
+Precompute train-only sparse KNN caches, then exclude cached neighbors from
+contrastive negatives at train time. **Full reference:**
+[`knn-precompute-reference.md`](knn-precompute-reference.md) (feature sets, cache
+format, GPU backends, sharding, Slurm).
+
+Quick start:
 
 ```bash
-python scripts/precompute_transaction_knn.py \
-  --data Small-HI --feature_set edge_native --k 50 \
-  --output morphology_cache/Small-HI/transaction_knn_edge_native_k50.npz
-
-python scripts/precompute_transaction_knn.py \
-  --data Small-HI --feature_set degree_fan --k 50 \
-  --output morphology_cache/Small-HI/transaction_knn_degree_fan_k50.npz
-
-python scripts/precompute_transaction_knn.py \
-  --data Small-HI --feature_set edge_native+degree_fan --k 50 \
-  --output morphology_cache/Small-HI/transaction_knn_edge_native_degree_fan_k50.npz
+sbatch slurm/precompute_transaction_knn_small_hi_gpu_smoke100k.sh   # 100k smoke
+sbatch slurm/precompute_transaction_knn_small_hi_gpu_full_k15.sh    # full train
 ```
 
-Then enable exclusion-only KNN filtering during contrastive pretrain:
+Training flags (after cache exists):
 
 ```bash
 --enable_knn_negative_filter \
---knn_cache_path morphology_cache/Small-HI/transaction_knn_degree_fan_k50.npz \
---knn_filter_k 50
+--knn_cache_path morphology_cache/Small-HI/transaction_knn_edge_native_degree_fan_k15.npz \
+--knn_filter_k 15
 ```
 
 The cache uses train split-local `edge_id` values, matching contrastive training.
 KNN neighbors are removed from negatives only; they are not added as positives.
 Queue KNN filtering is intentionally deferred.
+
+**Jun 2026 ablation:** with random 8192 negatives, exclusion did not beat the
+no-filter baseline (k=5: 0.947 / 0.209; k=15: 0.928 / 0.176 vs 0.951 / 0.233).
+See [`results.md` § Feature-KNN](results.md#feature-knn-small-hi).
+
+**KNN soft positives:** `--enable_knn_soft_positives` adds low-weight cached
+neighbors to the InfoNCE numerator via an auxiliary seed forward pass. Requires
+`--contrastive_asymmetric`. **Jun 2026 ablation hurt** probe (0.849 / 0.067 vs
+0.951 / 0.233 baseline) — do not enable with the current saturated cache. Slurm:
+`slurm/ablation_knn_softpos_m1_w0025_asym_proj_8192neg_queue0_20ep.sh`.
+Feature-set audit: `python scripts/audit_transaction_knn_cache.py`.
 
 Example:
 

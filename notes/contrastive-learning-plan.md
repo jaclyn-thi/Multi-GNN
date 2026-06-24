@@ -110,10 +110,12 @@ The six phases below are preserved from the original implementation plan, but ea
 
 7. **Optional offline feature-KNN negative filtering (Jun 2026)**
    - Precompute train-only sparse KNN caches with `scripts/precompute_transaction_knn.py`
+   - GPU backends (PyTorch CUDA / optional FAISS); resumable shards — see [`knn-precompute-reference.md`](knn-precompute-reference.md)
    - Initial feature sets: `edge_native`, `degree_fan`, `edge_native+degree_fan`
    - CLI: `--enable_knn_negative_filter --knn_cache_path ... --knn_filter_k K`
    - Exclusion-only: cached feature-neighbors are removed from sampled negatives but are not added as positives
    - Uses train split-local `edge_id` values to match the contrastive loss; dense KNN graph views are not built
+   - **Jun 2026 ablation:** random 8192-neighbor sampling + exclusion **did not help** (sparse pool overlap); soft positives **hurt** — see [`results.md`](results.md#feature-knn-small-hi)
 
 #### Important divergences from the original plan
 - We did **not** keep triplet loss and pairwise contrastive loss as near-term active alternatives
@@ -135,7 +137,7 @@ The six phases below are preserved from the original implementation plan, but ea
 - replicate endpoint false-negative filtering across seeds before adding richer structural positive tiers
 - avoid spending more GPU on larger negative counts unless memory behavior is the research target; `10240` fit and `12288` fit only with smaller batch, but neither improved AUROC
 - future structural positives: morphology-bin, motif/typology metadata, or KNN positives
-- evaluate whether KNN exclusion helps the current `8192` negatives / `queue=0` asym + projection recipe before adding KNN positives or queue-KNN filtering
+- KNN exclusion with random 8192 negs tested and rejected (Jun 2026); next KNN ideas need structured negative pools or queue curation, not the current flag alone
 
 ---
 
@@ -629,7 +631,7 @@ Contrastive plan still owns: homo/hetero contrastive routing, extraction, linear
 - **May 2026 GFM decisions:** (1) no AML metrics during contrastive pretrain; (2) **primary** downstream = Papagei-style **frozen extract + sklearn linear probe**; (3) in-GNN `--finetune` supervised is **secondary**, not the main scientific claim.
 - The most important architectural win was making the loss scale with shared seed edges rather than full sampled subgraph edges.
 - **`return_embeddings=True`** is the extraction hook; extraction and sklearn probe are the primary downstream path (Phases 5a/5b).
-- **Jun 2026 status:** Small-HI benchmark matrix largely complete. **Relax grid (Jun 11):** asym+8192 negs **0.930** AUROC; sym+1024 **0.929** AUROC / **0.222** F1; asym@16384 confound shows batch size drives most F1 lift. Queue sweep improves the asym + projection recipe by disabling the queue: **0.951 AUROC**, **0.233 F1**. Follow-up runs show larger negatives and filtered queues do not improve metrics; `same_pair` false-negative filtering is the leading replicated F1/recall candidate. Multi-positive InfoNCE has not beaten exclusion-only filtering. See [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md) and [`results.md`](results.md). MAE expert ablation done (0.898, below MSE).
+- **Jun 2026 status:** Small-HI benchmark matrix largely complete. **Relax grid (Jun 11):** asym+8192 negs **0.930** AUROC; sym+1024 **0.929** AUROC / **0.222** F1; asym@16384 confound shows batch size drives most F1 lift. Queue sweep improves the asym + projection recipe by disabling the queue: **0.951 AUROC**, **0.233 F1**. Follow-up runs show larger negatives and filtered queues do not improve metrics; `same_pair` false-negative filtering is the leading replicated F1/recall candidate. Multi-positive InfoNCE has not beaten exclusion-only filtering. **Feature-KNN negative exclusion** (random 8192 negs) also did not help. See [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md) and [`results.md`](results.md). MAE expert ablation done (0.898, below MSE).
 - **Best SSL recipe (development):** **Current AUROC recommendation:** contrastive+projection, 8192 negatives, `queue=0`, `bs=8192`, `accum=4` (**0.951** / **0.233**). **Current F1/recall candidate:** same recipe + `--false_neg_filter_mode same_pair` (mean **0.942** / **0.236** over three seeds). **Morph (asym):** clustering+proj (**0.929** / 0.156). M1b+sym+proj does **not** beat sym F1 (0.134). README benchmark table is a sanity-check log, not formal recorded experiments.
 - **Pretrain checkpoint selection:** eventually contrastive val / morphology—not AML probe val.
 - **Declined:** per-epoch AML probe during contrastive; using AML val to pick encoder weights during pretrain; treating end-to-end `--finetune` CE as the definition of GFM downstream success.

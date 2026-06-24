@@ -43,6 +43,12 @@ from graph_augmentations import generate_views
 from contrastive_loss import EdgeMemoryQueue, edge_identity_infonce_loss
 from contrastive_projection import project_seed_pair, project_seeds, setup_contrastive_projection
 from knn_filter import load_transaction_knn_filter
+from knn_soft_positives import (
+    forward_view2_embeddings_for_edge_ids,
+    gather_knn_positive_embeddings,
+    load_knn_soft_positive_cache,
+    update_knn_endpoint_overlap_stats,
+)
 from morphology.contrast import setup_morph_contrast_bin_edges, setup_morphology_contrast
 from morphology.contrastive_train import (
     eval_morph_contrast_val_hetero,
@@ -144,6 +150,83 @@ def _log_knn_filter_stats(prefix: str, stats: dict) -> None:
         int(overlap),
         int(fallback_rows),
     )
+
+
+def _log_knn_soft_pos_stats(prefix: str, stats: dict) -> None:
+    anchors = float(stats.get("anchors", 0.0))
+    if anchors <= 0:
+        return
+    sim_count = float(stats.get("sim_count", 0.0))
+    sim_mean = float(stats.get("sim_sum", 0.0)) / sim_count if sim_count > 0 else float("nan")
+    logging.info(
+        "%s KNN soft positives: anchors_with_pos=%.4f usable_pos=%.0f requested=%.0f missing_emb=%.0f unique_resolved=%.0f sim_min/mean/max=%.4f/%.4f/%.4f same_sender/receiver/pair=%.0f/%.0f/%.0f identity_num=%.2e knn_num=%.2e",
+        prefix,
+        float(stats.get("anchors_with_any_pos", 0.0)) / anchors,
+        float(stats.get("usable_positives", 0.0)),
+        float(stats.get("requested_positives", 0.0)),
+        float(stats.get("positives_missing_embedding", 0.0)),
+        float(stats.get("unique_pos_ids_resolved", 0.0)),
+        float(stats.get("sim_min", float("nan"))),
+        sim_mean,
+        float(stats.get("sim_max", float("nan"))),
+        float(stats.get("knn_pos_same_sender", 0.0)),
+        float(stats.get("knn_pos_same_receiver", 0.0)),
+        float(stats.get("knn_pos_same_pair", 0.0)),
+        float(stats.get("identity_num_contrib", 0.0)),
+        float(stats.get("knn_num_contrib", 0.0)),
+    )
+
+
+def _prepare_knn_soft_positives(
+    *,
+    knn_soft_cache,
+    seed_ids: torch.Tensor,
+    tr_loader,
+    model,
+    proj_head,
+    args,
+    device,
+    use_amp: bool,
+    contrastive_symmetric: bool,
+    train_edge_index: torch.Tensor,
+    epoch: int,
+    step: int,
+    stats: dict,
+):
+    if knn_soft_cache is None:
+        return None, None, None, None
+    pos_ids, pos_sims, pos_weights, pos_valid, sample_stats = knn_soft_cache.sample(
+        seed_ids,
+        step=step,
+        epoch=epoch,
+    )
+    stats.update(sample_stats)
+    unique_ids = torch.unique(pos_ids[pos_valid])
+    unique_z2 = seed_ids.new_empty((0, 128), dtype=torch.float32)
+    if unique_ids.numel() > 0:
+        resolved_ids, z2_raw = forward_view2_embeddings_for_edge_ids(
+            tr_loader,
+            model,
+            unique_ids,
+            device=device,
+            use_amp=use_amp,
+            contrastive_symmetric=contrastive_symmetric,
+            chunk_size=int(getattr(args, "knn_pos_loader_batch_size", 4096)),
+            exclude_last_column=(args.model == "rgcn"),
+        )
+        z2_proj = project_seeds(proj_head, z2_raw.to(device))
+        unique_ids = resolved_ids.to(device)
+        unique_z2 = z2_proj
+    pos_z2, pos_valid = gather_knn_positive_embeddings(
+        pos_ids,
+        pos_valid,
+        unique_ids,
+        unique_z2,
+        stats=stats,
+    )
+    update_knn_endpoint_overlap_stats(seed_ids, pos_ids, pos_valid, train_edge_index, stats)
+    del pos_sims
+    return pos_ids, pos_weights, pos_valid, pos_z2
 
 
 def _log_morphology_group_losses(prefix: str, metrics: dict) -> None:
@@ -594,6 +677,17 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
         filter_k=int(getattr(args, "knn_filter_k", 0)),
         device=device,
     )
+    knn_soft_cache = load_knn_soft_positive_cache(
+        getattr(args, "knn_cache_path", None),
+        enabled=bool(getattr(args, "enable_knn_soft_positives", False)),
+        source_k=int(getattr(args, "knn_pos_source_k", 15)),
+        pos_m=int(getattr(args, "knn_pos_m", 1)),
+        total_weight=float(getattr(args, "knn_pos_weight", 0.025)),
+        weight_mode=str(getattr(args, "knn_pos_weight_mode", "uniform")),
+        min_sim=getattr(args, "knn_pos_min_sim", None),
+        base_seed=int(getattr(args, "knn_pos_seed", 0)),
+        device=device,
+    )
     train_edge_index = tr_loader.data[FORWARD_EDGE_TYPE].edge_index.detach().cpu()
     try:
         n_train_batches = len(tr_loader)
@@ -609,6 +703,12 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
     morph_head = getattr(args, "morph_expert_head", None)
     morph_cfg = getattr(args, "morph_expert_cfg", None)
     morph_contrast_cfg = getattr(args, "morph_contrast_cfg", None)
+    if knn_soft_cache is not None and contrastive_symmetric:
+        raise ValueError("KNN soft positives require asymmetric contrastive training (--contrastive_asymmetric).")
+    if knn_soft_cache is not None and morph_contrast_cfg is not None:
+        raise ValueError("KNN soft positives cannot be combined with --morph_contrast.")
+    if knn_soft_cache is not None and multi_positive_mode != "none":
+        raise ValueError("KNN soft positives cannot be combined with --multi_positive_mode.")
     proj_head = getattr(args, "contrast_projection_module", None)
     ckpt_tracker = CheckpointTracker(getattr(args, "checkpoint_policy", "last"))
     if ckpt_tracker.policy == "best":
@@ -624,6 +724,7 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
         false_neg_stats = dict()
         multi_pos_stats = dict()
         knn_filter_stats = dict()
+        knn_soft_pos_stats = dict()
         optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(tqdm.tqdm(tr_loader, disable=not args.tqdm)):
             seed_edge_ids = get_hetero_seed_edge_ids(batch, tr_loader.data)
@@ -715,6 +816,21 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                 if max_soft <= 0:
                     max_soft = None
                 z1_con, z2_con = project_seed_pair(proj_head, z1_seed, z2_seed)
+                knn_pos_ids, knn_pos_weights, knn_pos_valid, knn_pos_z2 = _prepare_knn_soft_positives(
+                    knn_soft_cache=knn_soft_cache,
+                    seed_ids=seed_id1,
+                    tr_loader=tr_loader,
+                    model=model,
+                    proj_head=proj_head,
+                    args=args,
+                    device=device,
+                    use_amp=use_amp,
+                    contrastive_symmetric=contrastive_symmetric,
+                    train_edge_index=train_edge_index,
+                    epoch=epoch,
+                    step=step,
+                    stats=knn_soft_pos_stats,
+                )
                 seed_endpoints = (
                     _edge_endpoints_for_ids(train_edge_index, seed_id1, device)
                     if false_neg_filter_mode != "none" or multi_positive_mode != "none"
@@ -740,6 +856,11 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                     multi_positive_stats=multi_pos_stats,
                     knn_filter=knn_filter,
                     knn_filter_stats=knn_filter_stats,
+                    knn_pos_ids=knn_pos_ids,
+                    knn_pos_weights=knn_pos_weights,
+                    knn_pos_valid=knn_pos_valid,
+                    knn_pos_z2=knn_pos_z2,
+                    knn_soft_pos_stats=knn_soft_pos_stats,
                 )
                 # M1/M1b: auxiliary morphology MSE on shared seed embeddings
                 if morph_head is not None and morph_cfg is not None:
@@ -807,6 +928,7 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
         _log_false_neg_filter_stats("hetero/train", false_neg_stats, false_neg_filter_mode)
         _log_multi_positive_stats("hetero/train", multi_pos_stats, multi_positive_mode, multi_positive_weight)
         _log_knn_filter_stats("hetero/train", knn_filter_stats)
+        _log_knn_soft_pos_stats("hetero/train", knn_soft_pos_stats)
         if (
             morph_contrast_cfg is not None
             and val_loader is not None
@@ -934,6 +1056,13 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
             "enable_knn_negative_filter": bool(getattr(args, "enable_knn_negative_filter", False)),
             "knn_cache_path": getattr(args, "knn_cache_path", None),
             "knn_filter_k": int(getattr(args, "knn_filter_k", 0)),
+            "enable_knn_soft_positives": bool(getattr(args, "enable_knn_soft_positives", False)),
+            "knn_pos_source_k": int(getattr(args, "knn_pos_source_k", 15)),
+            "knn_pos_m": int(getattr(args, "knn_pos_m", 1)),
+            "knn_pos_weight": float(getattr(args, "knn_pos_weight", 0.025)),
+            "knn_pos_weight_mode": getattr(args, "knn_pos_weight_mode", "uniform"),
+            "knn_pos_min_sim": getattr(args, "knn_pos_min_sim", None),
+            "knn_pos_seed": int(getattr(args, "knn_pos_seed", 0)),
             "loader_num_workers": int(getattr(args, "loader_num_workers", 10)),
             "morph_expert": bool(getattr(args, "morph_expert", False)),
             "morph_targets": getattr(args, "morph_targets", "local"),

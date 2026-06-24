@@ -22,6 +22,7 @@ The original **supervised** path (`--objective supervised`) remains as a baselin
 | **Dev benchmark numbers** | [`notes/results.md`](notes/results.md) |
 | **Downstream eval strategy** (PaySim, SAML-D, typology) | [`notes/downstream-eval-plan.md`](notes/downstream-eval-plan.md) |
 | **Contrastive design & protocol** | [`notes/contrastive-learning-plan.md`](notes/contrastive-learning-plan.md) |
+| **Feature-KNN cache** (precompute; exclusion / soft positives) | [`notes/knn-precompute-reference.md`](notes/knn-precompute-reference.md) · results: [`notes/results.md`](notes/results.md#feature-knn-small-hi) (neither helps with current recipe) |
 | **Run on Slurm** | [Slurm](#slurm) |
 | **Understand the codebase** | [Repo overview](#repo-overview) |
 

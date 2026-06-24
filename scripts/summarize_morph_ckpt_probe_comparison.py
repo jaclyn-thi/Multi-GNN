@@ -13,6 +13,8 @@ RUNS = [
     "morph_degree_fan_only_asym_proj_8192neg_queue0_20ep_defaultweight",
     "morph_motif_participation_only_asym_proj_8192neg_queue0_10ep_weight005",
     "morph_flow_balance_only_asym_proj_8192neg_queue0_10ep_weight005",
+    "morph_motif_participation_only_asym_proj_8192neg_queue0_10ep",
+    "morph_flow_balance_only_asym_proj_8192neg_queue0_10ep",
 ]
 
 

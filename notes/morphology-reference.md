@@ -75,14 +75,16 @@ semantic groups with the same shared expert head. Examples:
 `--morph_target_groups degree_fan,local_motif` (legacy alias). The default
 `all` preserves the full historical target vector.
 
-**Targeted group scouts (Small-HI):** full tables and interpretation in
+**Targeted group scouts (Small-HI):** full tables in
 [`results.md` § Morphology target-group scouts](results.md#morphology-target-group-scouts-small-hi).
-Among morphology-only variants, **`degree_fan` @ 10 ep, w=1.0** still has the
-best F1 (0.208); **`motif_participation` @ w=0.05** has the best AUROC (0.937)
-among semantic-group scouts. The legacy `local_motif` bucket alone is weak
-(0.909 AUROC); splitting it isolates useful triangle signal. All targeted
-morphology runs trail the no-morph asym+proj baseline (0.951 / 0.233) and
-`same_pair` filtering (~0.949 / 0.255).
+Best morphology **F1:** `degree_fan` @ 10 ep, w=1.0 (0.208). Best morphology
+**AUROC** in targeted scouts: `degree_fan` 20 ep w=0.05 **last epoch** (0.943)
+or `motif_participation` @ w=0.05 (0.937). Prefer **`motif_participation` /
+`flow_balance` @ w=0.05**. **Motif @ w=1.0:** morph-val best (ep 3) fails;
+last epoch (0.925 / 0.128) is better but still below w=0.05. **`--checkpoint_policy best`**
+on morph val often mis-ranks downstream quality — probe last epoch
+(`slurm/run_morph_lastckpt_extract_probe.sh`) before trusting morph-val best.
+All targeted morphology runs trail no-morph baseline (0.951 / 0.233).
 
 ### Tier 0 — global (9 cols; M1b+)
 
@@ -221,7 +223,7 @@ More examples (M2, clustering bins, Tier 2): [`morphology-metrics-plan.md`](morp
 | **Dedupe by `edge_id`** | One embedding per transaction before writing `.npz` |
 | **AUROC** | Primary downstream metric |
 | **F1** | At threshold = argmax F1 on **val** |
-| **Best ckpt (SSL)** | Morph: sum of `morph/expert_val` + `morph/contrast_val`; plain contrastive: `loss/train` |
+| **Best ckpt (SSL)** | Morph: sum of `morph/expert_val` + `morph/contrast_val`; plain contrastive: `loss/train`. For targeted group scouts at low `morph_expert_weight`, morph-val best can lock to early epochs — reprobe last epoch before trusting downstream numbers |
 
 AML labels are **never** used for encoder checkpoint selection during SSL pretrain.
 
