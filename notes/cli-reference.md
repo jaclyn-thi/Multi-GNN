@@ -72,6 +72,11 @@ Hyperparameters for each architecture come from [`model_settings.json`](../model
 | `--contrast_projection_head` | off | GraphCL-style MLP before InfoNCE only; extraction uses encoder `z` |
 | `--contrast_projection_hidden` | `128` | Hidden width when projection head enabled |
 | `--contrast_projection_dim` | `128` | Projection output dim (default matches embedding dim) |
+| `--edge_drop_policy` | `random` | `random` (legacy uniform), `degree_aware`, or `degree_flow_aware` |
+| `--edge_drop_target_rate` | `0.1` | Target mean drop rate (matches legacy `0.1` random drop) |
+| `--edge_drop_min_prob` / `--edge_drop_max_prob` | `0.01` / `0.95` | Per-edge probability clip bounds for non-random policies |
+| `--edge_drop_importance_alpha` | `2.0` | Nonuniform drop strength (higher → keep important edges more) |
+| `--edge_drop_score_cache_path` | — | Optional precomputed train-split `.npz` (see `scripts/precompute_edge_drop_scores.py`) |
 
 Hetero contrastive training (`--reverse_mp --objective contrastive`) uses the same augmentation and InfoNCE machinery on the heterogeneous graph path.
 
@@ -81,6 +86,7 @@ Practical Small-HI guidance:
 - Queue-size ablations found `queue=0` best; larger queues reduced downstream AUROC/F1 in this setup.
 - Temperature is configurable with `--contrastive_temperature`; the current recipe should keep the default `0.5`. Lower values `0.05`, `0.10`, and `0.20` underperformed in the first sweep.
 - `10240` negatives fits with `queue=0`, `batch_size=8192`, `accum=4`, but did not improve AUROC. Direct `12288` at that batch size OOMed; `12288` fits with `batch_size=4096`, `accum=8` but did not improve metrics.
+- `--edge_drop_policy degree_aware` gives a small F1/recall lift on Small-HI (−0.2 AUROC vs baseline). Do **not** combine with `--false_neg_filter_mode same_pair` — 2-seed mean **0.939 AUROC / 0.168 F1** ([`results.md`](results.md)).
 - Adding back `queue=32768` with false-negative filtering still hurt, so keep `queue=0` unless explicitly testing queues.
 
 ### False-negative filtering and multi-positive InfoNCE
@@ -122,7 +128,7 @@ Implementation notes:
 - Logs include before/after candidate counts for filtering, fallback rows, identity positives, weak positives, average positives per anchor, and fraction of anchors without weak positives.
 - KNN filter (when enabled): per-epoch `anchors_with_knn_in_pool`, `removed`, and `fallback_rows` — see [`knn-precompute-reference.md`](knn-precompute-reference.md).
 - KNN soft positives (when enabled): per-epoch anchor coverage, injected unique ids, similarity min/mean/max, endpoint overlap, identity vs KNN numerator contribution, and drop reasons — see [`knn-precompute-reference.md`](knn-precompute-reference.md).
-- Small-HI follow-up: `--false_neg_filter_mode same_pair` is the leading F1/recall candidate across seeds. `same_endpoint` and `same_receiver` were less stable. Default remains `none`.
+- Small-HI follow-up: `--false_neg_filter_mode same_pair` is the leading F1/recall candidate across seeds. `same_endpoint` and `same_receiver` were less stable. Default remains `none`. Do **not** stack with `--edge_drop_policy degree_aware` — see [`results.md`](results.md).
 - Multi-positive runs so far underperform exclusion-only filtering. Lower `same_pair` weight `0.05` helped relative to `0.1`, but still did not beat no-filter or `same_pair` false-negative filtering.
 
 ### Offline feature-KNN negative filtering

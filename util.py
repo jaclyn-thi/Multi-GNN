@@ -252,6 +252,43 @@ def create_parser():
         default=128,
         help="Output width for --contrast_projection_head (default 128).",
     )
+    parser.add_argument(
+        "--edge_drop_policy",
+        type=str,
+        default="random",
+        choices=["random", "degree_aware", "degree_flow_aware"],
+        help="Edge-drop augmentation policy for contrastive views (default random = legacy uniform drop).",
+    )
+    parser.add_argument(
+        "--edge_drop_target_rate",
+        type=float,
+        default=0.1,
+        help="Target mean edge-drop rate for contrastive views (default 0.1, matching legacy behavior).",
+    )
+    parser.add_argument(
+        "--edge_drop_min_prob",
+        type=float,
+        default=0.01,
+        help="Minimum per-edge drop probability when using degree-aware policies.",
+    )
+    parser.add_argument(
+        "--edge_drop_max_prob",
+        type=float,
+        default=0.95,
+        help="Maximum per-edge drop probability when using degree-aware policies.",
+    )
+    parser.add_argument(
+        "--edge_drop_importance_alpha",
+        type=float,
+        default=2.0,
+        help="Strength of nonuniform edge dropping (higher = stronger preference to keep important edges).",
+    )
+    parser.add_argument(
+        "--edge_drop_score_cache_path",
+        type=str,
+        default=None,
+        help="Optional .npz cache of precomputed train-split edge-drop probabilities.",
+    )
 
     # Morphology expert head (contrastive pretrain, Phase M1)
     parser.add_argument(

@@ -22,6 +22,8 @@ Quick-run numbers for internal comparison while configs and code still change. *
 
 **Multi-positive InfoNCE:** endpoint weak-positive runs underperformed exclusion-only filtering. `same_pair` weak positives at weight `0.1` averaged **0.938 AUROC / 0.153 F1**; lowering the weight to `0.05` helped but still did not beat no-filter or `same_pair` exclusion.
 
+**Edge-drop augmentations:** label-free **`degree_aware`** edge drop gives a small **F1/recall** lift (−0.2 AUROC); **`degree_flow_aware`** ≈ baseline. **Do not** combine **`degree_aware`** with **`same_pair` FNF** — they interfere (mean **0.939 / 0.168** over 2 seeds) — see [edge-drop augmentations](#edge-drop-augmentations-small-hi) and [degree_aware + same_pair FNF](#degree_aware-edge-drop--same_pair-fnf-small-hi).
+
 ---
 
 ## Small-HI SSL benchmark (linear probe, val-tuned F1, GIN hetero)
@@ -29,6 +31,9 @@ Quick-run numbers for internal comparison while configs and code still change. *
 | Run | Config | Epochs | Test AUROC | Test F1 |
 |-----|--------|--------|------------|---------|
 | Contrastive + proj, **8192 negs, no queue** | asym; `queue=0`; `bs=8192 accum=4` | 20 → **ep 19** | **0.951** | **0.233** |
+| Contrastive + proj, **`degree_aware` edge drop** | asym; 8192 negs; `queue=0`; `--edge_drop_policy degree_aware` | 20 → **ep 18** | 0.949 | **0.237** |
+| Contrastive + proj, **`degree_aware` + same-pair FNF** | asym; 8192 negs; `queue=0`; mean over 2 seeds | 20 | 0.939 | 0.168 |
+| Contrastive + proj, **`degree_flow_aware` edge drop** | asym; 8192 negs; `queue=0`; `--edge_drop_policy degree_flow_aware` | 20 → **ep 20** | 0.947 | 0.234 |
 | Contrastive + proj, **KNN exclusion k=5** | asym; 8192 negs; `queue=0`; feature-KNN filter | 20 | 0.947 | 0.209 |
 | Contrastive + proj, **KNN exclusion k=15** | asym; 8192 negs; `queue=0`; feature-KNN filter | 20 | 0.928 | 0.176 |
 | Contrastive + proj, **KNN soft-pos m=1** | asym; 8192 negs; `queue=0`; `w=0.025` | 20 → **ep 19** | 0.849 | 0.067 |
@@ -272,6 +277,79 @@ embeddings toward superficial transaction similarity. Pause this path unless
 neighbor design changes (sparser/diverse positives, much lower weight, or
 structure-based similarity — not raw feature KNN). Audit:
 `python scripts/audit_transaction_knn_cache.py --data Small-HI --max_rows 50000`.
+
+### Edge-drop augmentations (Small-HI)
+
+Label-free, train-split-only edge-drop policies for contrastive views (default
+`--edge_drop_policy random` unchanged). Precompute:
+`scripts/precompute_edge_drop_scores.py` · audit:
+`scripts/audit_edge_drop_scores.py` · flags: [`cli-reference.md`](cli-reference.md).
+
+#### Training ablation (Jun 24)
+
+Same backbone as no-filter baseline: asym + projection, 8192 negs, `queue=0`,
+`bs=8192 accum=4`, temp 0.5, seed 1, 20 ep, `--edge_drop_target_rate 0.1`,
+`--edge_drop_importance_alpha 2.0`. Slurm:
+`slurm/ablation_degree_aware_edgedrop_asym_proj_8192neg_queue0_20ep.sh`,
+`slurm/ablation_degree_flow_aware_edgedrop_asym_proj_8192neg_queue0_20ep.sh`
+(jobs 16455755 / 16455756).
+
+| Run | Best ep | Test AUROC | Test F1 | Prec | Recall | Note |
+|-----|---------|------------|---------|------|--------|------|
+| Random drop (baseline) | 19 | **0.951** | 0.233 | 0.209 | 0.263 | — |
+| **`degree_aware`** | 18 | 0.949 | **0.237** | 0.198 | **0.297** | +F1/recall, −AUROC |
+| **`degree_flow_aware`** | 20 | 0.947 | 0.234 | 0.207 | 0.269 | ≈ baseline |
+| FNF `same_pair` seed 1 (ref) | — | 0.946 | 0.240 | 0.175 | 0.383 | stronger F1/recall tradeoff |
+
+**Policy telemetry (epoch 1 buckets, stable across training):** global cache mean
+drop prob **≈ 0.10** as intended. Per-batch realized drops were nonuniform:
+
+- **`degree_aware`:** low-degree p0–20 **~1%** drop; high-degree p80–100 **~32%** drop.
+- **`degree_flow_aware`:** high-amount p80–100 **~7%** drop (preserved); low-amount
+  p0–20 **~23%** drop.
+
+Training loss at best (**~7.06**) matched random-drop / KNN-filter runs. Wall clock
+**~1.5 h** per job (incl. precompute + extract + probe).
+
+**Takeaway:** do **not** replace the AUROC baseline — neither policy beats **0.951**.
+**`degree_aware`** is the only promising variant here: small **F1 +0.004** and
+**recall +0.034** with **AUROC −0.002** (mild FNF-like tradeoff). **`degree_flow_aware`**
+did not improve on degree-only. Combining **`degree_aware`** with **`same_pair` FNF**
+was tested and **failed** — see [below](#degree_aware-edge-drop--same_pair-fnf-small-hi).
+Per-view realized drop in epoch logs is **~0.16** on sampled batches (fixed Jun 24;
+old headline `realized_v1≈0.58` was a logging bug). Bucket logs above are authoritative.
+
+#### `degree_aware` edge drop + `same_pair` FNF (Small-HI)
+
+Stack test: nonuniform **view corruption** (`degree_aware`) plus **negative-pool
+hygiene** (`--false_neg_filter_mode same_pair`). Same backbone otherwise: asym +
+projection, 8192 negs, `queue=0`, `bs=8192 accum=4`, temp 0.5, 20 ep,
+`--edge_drop_target_rate 0.1`, `--edge_drop_importance_alpha 2.0`. Slurm:
+`slurm/ablation_degree_aware_edgedrop_samepair_fnf_asym_proj_8192neg_queue0_20ep.sh`
+(seed 1),
+`slurm/ablation_degree_aware_edgedrop_samepair_fnf_seed2_asym_proj_8192neg_queue0_20ep.sh`
+(seed 2).
+
+| Run | Best ep | Test AUROC | Test F1 | Prec | Recall | Note |
+|-----|---------|------------|---------|------|--------|------|
+| Random drop (baseline, seed 1) | 19 | **0.951** | 0.233 | **0.209** | 0.263 | AUROC ref |
+| **`degree_aware`** only (seed 1) | 18 | 0.949 | **0.237** | 0.198 | 0.297 | parent |
+| **`same_pair` FNF** only (seed 1) | — | 0.946 | 0.240 | 0.175 | **0.383** | parent |
+| **`same_pair` FNF** only (seed 2) | — | 0.949 | **0.255** | 0.189 | **0.394** | parent |
+| **Combined** (seed 1) | 20 | 0.933 | 0.119 | 0.079 | 0.235 | large val→test F1 gap |
+| **Combined** (seed 2) | 16 | 0.945 | 0.217 | 0.172 | 0.294 | below both parents |
+| **Combined mean** (seeds 1–2) | — | 0.939 | 0.168 | 0.126 | 0.265 | — |
+
+Training telemetry looked normal: contrastive loss **~7.056** at best (same as
+degree-aware-only), FNF removal **~0.01%** with `fallback_rows=0`, degree buckets
+unchanged (p0–20 **~1%** drop, p80–100 **~32%**). Problem is downstream embedding
+geometry, not misconfigured flags.
+
+**Stack takeaway:** interventions **do not combine**. Seed 1 collapsed (precision
+**0.079**); seed 2 was more stable but still below both parents on every metric.
+Use **`degree_aware`** or **`same_pair` FNF** alone — not both. High seed variance
+on the combined recipe; no further combined seeds unless the design changes (e.g.
+weaker drop policy or softer FNF).
 
 ### Multi-positive InfoNCE scouts
 

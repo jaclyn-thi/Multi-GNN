@@ -3,12 +3,23 @@ Graph augmentations for contrastive learning on edge-level embeddings.
 
 Supports independent random edge dropping per view (different edge counts /
 ordering). Identity contrastive pairs are matched via ``edge_id``, not row index.
+
+When ``edge_drop_policy`` is ``degree_aware`` or ``degree_flow_aware``, per-edge
+drop probabilities come from a precomputed train-split cache (see
+``edge_drop_scores``). Default ``random`` preserves the legacy uniform policy.
 """
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Dict, Optional
 
 import torch
 from torch_geometric.data import Data, HeteroData
 
 from train_util import FORWARD_EDGE_TYPE, REVERSE_EDGE_TYPE
+
+if TYPE_CHECKING:
+    from edge_drop_scores import EdgeDropScoreCache
 
 
 def _edge_keep_mask(num_edges: int, drop_rate: float, device: torch.device) -> torch.Tensor:
@@ -23,6 +34,82 @@ def _edge_keep_mask(num_edges: int, drop_rate: float, device: torch.device) -> t
     if not keep.any():
         keep[torch.randint(0, num_edges, (1,), device=device)] = True
     return keep
+
+
+def _policy_edge_keep_mask(drop_probs: torch.Tensor) -> torch.Tensor:
+    """Bernoulli keep mask from per-edge drop probabilities."""
+    num_edges = int(drop_probs.numel())
+    if num_edges == 0:
+        return torch.ones(0, dtype=torch.bool, device=drop_probs.device)
+    drop_probs = drop_probs.clamp(0.0, 1.0)
+    keep = torch.rand(num_edges, device=drop_probs.device) > drop_probs
+    if not keep.any():
+        keep[torch.randint(0, num_edges, (1,), device=drop_probs.device)] = True
+    return keep
+
+
+def _accumulate_edge_drop_stats(
+    stats: Optional[Dict[str, float]],
+    *,
+    edges_before: int,
+    keep_mask: torch.Tensor,
+    drop_probs: torch.Tensor,
+    edge_ids: Optional[torch.Tensor],
+    edge_drop_cache: Optional["EdgeDropScoreCache"],
+    view_tag: str,
+) -> None:
+    if stats is None:
+        return
+    kept = int(keep_mask.sum().item())
+    dropped = edges_before - kept
+    stats["edges_before"] = stats.get("edges_before", 0.0) + float(edges_before)
+    stats[f"edges_kept_{view_tag}"] = stats.get(f"edges_kept_{view_tag}", 0.0) + float(kept)
+    stats[f"edges_dropped_{view_tag}"] = stats.get(f"edges_dropped_{view_tag}", 0.0) + float(dropped)
+    stats["drop_prob_sum"] = stats.get("drop_prob_sum", 0.0) + float(drop_probs.sum().item())
+    stats["drop_prob_count"] = stats.get("drop_prob_count", 0.0) + float(drop_probs.numel())
+    stats["drop_prob_min"] = min(float(stats.get("drop_prob_min", float("inf"))), float(drop_probs.min().item()))
+    stats["drop_prob_max"] = max(float(stats.get("drop_prob_max", float("-inf"))), float(drop_probs.max().item()))
+
+    if edge_ids is None or edge_drop_cache is None:
+        return
+
+    ids_cpu = edge_ids.detach().long().cpu().numpy()
+    deg_pct = edge_drop_cache.lookup_bucket_values(edge_ids, "degree_pct")
+    if deg_pct is not None:
+        for lo, hi, label in ((0.0, 0.2, "p0_20"), (0.2, 0.4, "p20_40"), (0.4, 0.6, "p40_60"), (0.6, 0.8, "p60_80"), (0.8, 1.01, "p80_100")):
+            m = (deg_pct >= lo) & (deg_pct < hi)
+            if m.any():
+                drop_rate = float((~keep_mask.detach().cpu().numpy()[m]).mean())
+                key = f"drop_rate_degree_{label}_{view_tag}"
+                stats[key] = stats.get(key, 0.0) + drop_rate
+                cnt_key = f"drop_rate_degree_{label}_{view_tag}_count"
+                stats[cnt_key] = stats.get(cnt_key, 0.0) + 1.0
+
+    if edge_drop_cache.amount_pct is not None:
+        amt_pct = edge_drop_cache.lookup_bucket_values(edge_ids, "amount_pct")
+        if amt_pct is not None:
+            for lo, hi, label in ((0.0, 0.2, "p0_20"), (0.2, 0.4, "p20_40"), (0.4, 0.6, "p40_60"), (0.6, 0.8, "p60_80"), (0.8, 1.01, "p80_100")):
+                m = (amt_pct >= lo) & (amt_pct < hi)
+                if m.any():
+                    drop_rate = float((~keep_mask.detach().cpu().numpy()[m]).mean())
+                    key = f"drop_rate_amount_{label}_{view_tag}"
+                    stats[key] = stats.get(key, 0.0) + drop_rate
+                    cnt_key = f"drop_rate_amount_{label}_{view_tag}_count"
+                    stats[cnt_key] = stats.get(cnt_key, 0.0) + 1.0
+
+    if edge_drop_cache.flow_imbalance_pct is not None:
+        flow_pct = edge_drop_cache.lookup_bucket_values(edge_ids, "flow_imbalance_pct")
+        if flow_pct is not None:
+            for lo, hi, label in ((0.0, 0.2, "p0_20"), (0.2, 0.4, "p20_40"), (0.4, 0.6, "p40_60"), (0.6, 0.8, "p60_80"), (0.8, 1.01, "p80_100")):
+                m = (flow_pct >= lo) & (flow_pct < hi)
+                if m.any():
+                    drop_rate = float((~keep_mask.detach().cpu().numpy()[m]).mean())
+                    key = f"drop_rate_flow_{label}_{view_tag}"
+                    stats[key] = stats.get(key, 0.0) + drop_rate
+                    cnt_key = f"drop_rate_flow_{label}_{view_tag}_count"
+                    stats[cnt_key] = stats.get(cnt_key, 0.0) + 1.0
+
+    del ids_cpu
 
 
 def random_edge_drop(edge_index, edge_attr, drop_rate):
@@ -128,6 +215,81 @@ def _hetero_random_edge_drop_view(
     return out
 
 
+def _hetero_policy_edge_drop_view(
+    batch: HeteroData,
+    edge_drop_cache: "EdgeDropScoreCache",
+    forward_et=FORWARD_EDGE_TYPE,
+    reverse_et=REVERSE_EDGE_TYPE,
+    edge_drop_stats: Optional[Dict[str, float]] = None,
+    view_tag: str = "v1",
+) -> HeteroData:
+    """Independent policy-weighted edge drop on forward transactions."""
+    out = batch.clone()
+    fwd = out[forward_et]
+    E = fwd.edge_index.size(1)
+    if E == 0:
+        return out
+
+    if getattr(fwd, "edge_id", None) is None:
+        raise ValueError(
+            "edge_id is required on forward edges for policy edge drop; "
+            "use train_util.attach_edge_id_from_batch before augmentations."
+        )
+
+    drop_probs = edge_drop_cache.lookup_drop_prob(fwd.edge_id, fwd.edge_index.device)
+    keep_fwd = _policy_edge_keep_mask(drop_probs)
+    _accumulate_edge_drop_stats(
+        edge_drop_stats,
+        edges_before=E,
+        keep_mask=keep_fwd,
+        drop_probs=drop_probs,
+        edge_ids=fwd.edge_id,
+        edge_drop_cache=edge_drop_cache,
+        view_tag=view_tag,
+    )
+    _slice_hetero_edge_store(fwd, keep_fwd)
+    kept_txn = fwd.edge_id
+
+    rev = out[reverse_et]
+    if getattr(rev, "edge_id", None) is None:
+        raise ValueError("edge_id is required on reverse edges for synchronized hetero augmentation.")
+    rev_keep = torch.isin(rev.edge_id, kept_txn)
+    _slice_hetero_edge_store(rev, rev_keep)
+    return out
+
+
+def _policy_edge_drop_view(
+    data: Data,
+    edge_drop_cache: "EdgeDropScoreCache",
+    edge_drop_stats: Optional[Dict[str, float]] = None,
+    view_tag: str = "v1",
+) -> Data:
+    out = data.clone()
+    E = out.edge_index.size(1)
+    if E == 0:
+        return out
+
+    if getattr(out, "edge_id", None) is None:
+        raise ValueError(
+            "edge_id is required on the batch for policy edge drop; "
+            "use train_util.attach_edge_id_from_batch before augmentations."
+        )
+
+    drop_probs = edge_drop_cache.lookup_drop_prob(out.edge_id, out.edge_index.device)
+    keep = _policy_edge_keep_mask(drop_probs)
+    _accumulate_edge_drop_stats(
+        edge_drop_stats,
+        edges_before=E,
+        keep_mask=keep,
+        drop_probs=drop_probs,
+        edge_ids=out.edge_id,
+        edge_drop_cache=edge_drop_cache,
+        view_tag=view_tag,
+    )
+    _slice_edge_aligned_fields(out, keep)
+    return out
+
+
 def mask_edge_attr(
     edge_attr,
     mask_rate=0.1,
@@ -189,13 +351,19 @@ def generate_views(
     mask_value=0.0,
     mask_cols=None,
     exclude_last_column=False,
+    edge_drop_policy: str = "random",
+    edge_drop_cache: Optional["EdgeDropScoreCache"] = None,
+    edge_drop_stats: Optional[Dict[str, float]] = None,
 ):
     """
     Two augmented views for edge-level contrastive learning.
 
-    - If ``edge_drop_rate > 0``: independent random edge dropping per view
+    - If ``edge_drop_rate > 0``: independent edge dropping per view
       (same ``keep_mask`` applied to ``edge_index``, ``edge_attr``, ``edge_id``,
       ``y``, and ``timestamps`` when their first dim matches the edge count).
+      Default ``edge_drop_policy='random'`` uses uniform ``edge_drop_rate``.
+      ``degree_aware`` / ``degree_flow_aware`` use calibrated per-edge
+      probabilities from ``edge_drop_cache``.
     - If ``edge_attr_mask_rate > 0``: independent edge-attribute masking on the
       surviving edges of each view.
 
@@ -204,10 +372,38 @@ def generate_views(
     For ``HeteroData``, edge drops are synchronized across forward and reverse edge
     types by transaction ``edge_id``; attribute masking is applied independently per
     view on both edge types.
+
+    Seed/anchor edges are **not** protected: if a seed edge is dropped from one view,
+    ``select_shared_seed_edge_embeddings`` excludes it from the contrastive loss
+    (same semantics as uniform random drop).
     """
+    use_policy = edge_drop_policy != "random"
+    if use_policy and edge_drop_cache is None:
+        raise ValueError(f"edge_drop_policy={edge_drop_policy!r} requires edge_drop_cache")
+
+    if edge_drop_stats is not None:
+        edge_drop_stats["target_drop_rate"] = float(
+            edge_drop_cache.target_drop_rate if edge_drop_cache is not None else edge_drop_rate
+        )
+        edge_drop_stats["edge_drop_policy"] = edge_drop_policy
+
     if isinstance(data, HeteroData):
-        view1 = _hetero_random_edge_drop_view(data, edge_drop_rate)
-        view2 = _hetero_random_edge_drop_view(data, edge_drop_rate)
+        if use_policy:
+            view1 = _hetero_policy_edge_drop_view(
+                data, edge_drop_cache, edge_drop_stats=edge_drop_stats, view_tag="v1"
+            )
+            view2 = _hetero_policy_edge_drop_view(
+                data, edge_drop_cache, edge_drop_stats=edge_drop_stats, view_tag="v2"
+            )
+        else:
+            view1 = _hetero_random_edge_drop_view(data, edge_drop_rate)
+            view2 = _hetero_random_edge_drop_view(data, edge_drop_rate)
+        if edge_drop_stats is not None and edge_drop_rate > 0 or use_policy:
+            eid1 = view1[FORWARD_EDGE_TYPE].edge_id
+            eid2 = view2[FORWARD_EDGE_TYPE].edge_id
+            overlap = int(torch.isin(eid1, eid2).sum().item())
+            edge_drop_stats["two_view_edge_overlap"] = edge_drop_stats.get("two_view_edge_overlap", 0.0) + float(overlap)
+            edge_drop_stats["two_view_overlap_batches"] = edge_drop_stats.get("two_view_overlap_batches", 0.0) + 1.0
         if edge_attr_mask_rate > 0:
             for et in (FORWARD_EDGE_TYPE, REVERSE_EDGE_TYPE):
                 store1, store2 = view1[et], view2[et]
@@ -228,8 +424,19 @@ def generate_views(
                     )
         return view1, view2
 
-    view1 = _random_edge_drop_view(data, edge_drop_rate)
-    view2 = _random_edge_drop_view(data, edge_drop_rate)
+    if use_policy:
+        view1 = _policy_edge_drop_view(data, edge_drop_cache, edge_drop_stats=edge_drop_stats, view_tag="v1")
+        view2 = _policy_edge_drop_view(data, edge_drop_cache, edge_drop_stats=edge_drop_stats, view_tag="v2")
+    else:
+        view1 = _random_edge_drop_view(data, edge_drop_rate)
+        view2 = _random_edge_drop_view(data, edge_drop_rate)
+
+    if edge_drop_stats is not None and (edge_drop_rate > 0 or use_policy):
+        eid1 = view1.edge_id
+        eid2 = view2.edge_id
+        overlap = int(torch.isin(eid1, eid2).sum().item())
+        edge_drop_stats["two_view_edge_overlap"] = edge_drop_stats.get("two_view_edge_overlap", 0.0) + float(overlap)
+        edge_drop_stats["two_view_overlap_batches"] = edge_drop_stats.get("two_view_overlap_batches", 0.0) + 1.0
 
     if edge_attr_mask_rate > 0 and view1.edge_attr is not None:
         view1.edge_attr = mask_edge_attr(

@@ -11,6 +11,7 @@ Supervised paths retain original in-graph CE + F1 evaluation.
 
 import torch
 import tqdm
+from typing import Optional
 from torch.cuda.amp import GradScaler, autocast
 from sklearn.metrics import f1_score
 from train_util import (
@@ -40,6 +41,7 @@ from torch_geometric.nn import to_hetero, summary
 from torch_geometric.utils import degree
 from pytorch_metric_learning.losses import NTXentLoss
 from graph_augmentations import generate_views
+from edge_drop_scores import load_or_build_edge_drop_cache
 from contrastive_loss import EdgeMemoryQueue, edge_identity_infonce_loss
 from contrastive_projection import project_seed_pair, project_seeds, setup_contrastive_projection
 from knn_filter import load_transaction_knn_filter
@@ -177,6 +179,66 @@ def _log_knn_soft_pos_stats(prefix: str, stats: dict) -> None:
     )
 
 
+def _contrastive_view_kwargs(args, edge_drop_stats: Optional[dict] = None) -> dict:
+    return {
+        "edge_attr_mask_rate": 0.1,
+        "edge_drop_rate": float(getattr(args, "edge_drop_target_rate", 0.1)),
+        "mask_value": 0.0,
+        "mask_cols": None,
+        "exclude_last_column": (args.model == "rgcn"),
+        "edge_drop_policy": getattr(args, "edge_drop_policy", "random"),
+        "edge_drop_cache": getattr(args, "edge_drop_cache", None),
+        "edge_drop_stats": edge_drop_stats,
+    }
+
+
+def _log_edge_drop_stats(prefix: str, stats: dict) -> None:
+    v1_kept = float(stats.get("edges_kept_v1", 0.0))
+    v2_kept = float(stats.get("edges_kept_v2", 0.0))
+    v1_dropped = float(stats.get("edges_dropped_v1", 0.0))
+    v2_dropped = float(stats.get("edges_dropped_v2", 0.0))
+    v1_total = v1_kept + v1_dropped
+    v2_total = v2_kept + v2_dropped
+    if v1_total <= 0 and v2_total <= 0:
+        return
+    target = float(stats.get("target_drop_rate", float("nan")))
+    policy = stats.get("edge_drop_policy", "random")
+    prob_count = float(stats.get("drop_prob_count", 0.0))
+    prob_mean = float(stats.get("drop_prob_sum", 0.0)) / prob_count if prob_count > 0 else float("nan")
+    overlap_batches = float(stats.get("two_view_overlap_batches", 0.0))
+    overlap = float(stats.get("two_view_edge_overlap", 0.0)) / overlap_batches if overlap_batches > 0 else float("nan")
+    realized_v1 = v1_dropped / v1_total if v1_total > 0 else float("nan")
+    realized_v2 = v2_dropped / v2_total if v2_total > 0 else float("nan")
+    logging.info(
+        "%s edge drop (%s): target=%.4f realized_v1=%.4f realized_v2=%.4f overlap=%.1f "
+        "drop_prob_min/mean/max=%.4f/%.4f/%.4f labels_used=[]",
+        prefix,
+        policy,
+        target,
+        realized_v1,
+        realized_v2,
+        overlap,
+        float(stats.get("drop_prob_min", float("nan"))),
+        prob_mean,
+        float(stats.get("drop_prob_max", float("nan"))),
+    )
+    for bucket_prefix in ("drop_rate_degree", "drop_rate_amount", "drop_rate_flow"):
+        for view_tag in ("v1", "v2"):
+            for label in ("p0_20", "p20_40", "p40_60", "p60_80", "p80_100"):
+                key = f"{bucket_prefix}_{label}_{view_tag}"
+                cnt_key = f"{key}_count"
+                cnt = float(stats.get(cnt_key, 0.0))
+                if cnt > 0:
+                    logging.info(
+                        "%s %s %s: mean_drop_rate=%.4f (batches=%.0f)",
+                        prefix,
+                        bucket_prefix,
+                        f"{label}_{view_tag}",
+                        float(stats.get(key, 0.0)) / cnt,
+                        cnt,
+                    )
+
+
 def _prepare_knn_soft_positives(
     *,
     knn_soft_cache,
@@ -308,6 +370,7 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
         false_neg_stats = dict()
         multi_pos_stats = dict()
         knn_filter_stats = dict()
+        edge_drop_stats = dict()
         optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(tqdm.tqdm(tr_loader, disable=not args.tqdm)):
             seed_edge_ids = get_homo_seed_edge_ids(batch, tr_loader.data)
@@ -334,11 +397,7 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
             # Two views: independent edge drops (pair by batch.edge_id) + optional attr mask
             view1, view2 = generate_views(
                 batch,
-                edge_attr_mask_rate=0.1,
-                edge_drop_rate=0.1,
-                mask_value=0.0,
-                mask_cols=None,
-                exclude_last_column=(args.model == "rgcn"),
+                **_contrastive_view_kwargs(args, edge_drop_stats),
             )
 
             with autocast(enabled=use_amp):
@@ -474,6 +533,7 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
         _log_false_neg_filter_stats("homo/train", false_neg_stats, false_neg_filter_mode)
         _log_multi_positive_stats("homo/train", multi_pos_stats, multi_positive_mode, multi_positive_weight)
         _log_knn_filter_stats("homo/train", knn_filter_stats)
+        _log_edge_drop_stats("homo/train", edge_drop_stats)
         if (
             morph_contrast_cfg is not None
             and val_loader is not None
@@ -725,6 +785,7 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
         multi_pos_stats = dict()
         knn_filter_stats = dict()
         knn_soft_pos_stats = dict()
+        edge_drop_stats = dict()
         optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(tqdm.tqdm(tr_loader, disable=not args.tqdm)):
             seed_edge_ids = get_hetero_seed_edge_ids(batch, tr_loader.data)
@@ -746,11 +807,7 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
 
             view1, view2 = generate_views(
                 batch,
-                edge_attr_mask_rate=0.1,
-                edge_drop_rate=0.1,
-                mask_value=0.0,
-                mask_cols=None,
-                exclude_last_column=(args.model == "rgcn"),
+                **_contrastive_view_kwargs(args, edge_drop_stats),
             )
 
             with autocast(enabled=use_amp):
@@ -929,6 +986,7 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
         _log_multi_positive_stats("hetero/train", multi_pos_stats, multi_positive_mode, multi_positive_weight)
         _log_knn_filter_stats("hetero/train", knn_filter_stats)
         _log_knn_soft_pos_stats("hetero/train", knn_soft_pos_stats)
+        _log_edge_drop_stats("hetero/train", edge_drop_stats)
         if (
             morph_contrast_cfg is not None
             and val_loader is not None
@@ -1161,6 +1219,16 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
     model.to(device)
     if morph_contrast_cfg is not None and setup.is_contrastive:
         setup_morph_contrast_bin_edges(args, tr_loader, model, device, setup.is_hetero)
+
+    args.edge_drop_cache = None
+    if setup.is_contrastive and getattr(args, "edge_drop_policy", "random") != "random":
+        args.edge_drop_cache = load_or_build_edge_drop_cache(args, "data_config.json")
+        logging.info(
+            "Edge-drop policy=%s target_rate=%.4f cache_edges=%d",
+            args.edge_drop_policy,
+            float(args.edge_drop_target_rate),
+            int(args.edge_drop_cache.drop_prob.shape[0]),
+        )
 
     sample_batch.to(device)
     sample_x = sample_batch.x if not isinstance(sample_batch, HeteroData) else sample_batch.x_dict
