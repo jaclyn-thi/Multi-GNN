@@ -14,6 +14,8 @@ Navigation hub for all project docs. Start here to find the right file instead o
 
 > **Results caveat:** all benchmark numbers in this folder are **development sanity checks**, not a frozen evaluation protocol. **Fair-comparison probe policy:** `--class_weight model --model gin`, C=1.0, val-tuned F1 threshold. Rows using other `cw`/C are exploratory and flagged as such.
 
+> **Local-only tooling:** command examples across these docs that reference `sbatch slurm/*.sh` or `tests/` are maintainer convenience wrappers — `slurm/` and `tests/` are gitignored and **not in a public clone**. The canonical, runnable path is always the `python main.py …` / `python scripts/…` command each wrapper invokes.
+
 ---
 
 ## Start here

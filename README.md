@@ -9,6 +9,8 @@ This repository extends [IBM Multi-GNN](https://github.com/IBM/Multi-GNN) for an
 
 The original **supervised** path (`--objective supervised`) remains as a baseline (~0.97 test AUROC in-GNN on Small-HI). Downstream evaluation uses **frozen embeddings + linear probe** (Papagei-style), not end-to-end finetune, unless you explicitly use `--finetune`.
 
+> **Repo scope:** Active thesis research code. Some tooling is intentionally local-only and gitignored — notably `slurm/` (cluster-specific job scripts) and `tests/`. Commands anywhere in these docs that reference `sbatch slurm/*.sh` or `tests/` are maintainer convenience wrappers and **won't exist in a fresh clone**; the canonical, runnable path is always the `python main.py …` / `python scripts/…` commands they wrap. Data and artifact directories (`aml-data/`, `embeddings/`, `saved-models/`, `morphology_cache/`, …) are likewise gitignored and generated locally.
+
 ---
 
 ## Documentation map
@@ -218,7 +220,7 @@ Full CLI flag list: [`notes/cli-reference.md`](notes/cli-reference.md).
 
 ## Slurm
 
-Scripts in [`slurm/`](slurm/) (local-only). Submit from repo root. **Current-protocol comparison** (Jun–Jul 2026): GPU `slurm/comparison_gin_emlps_tds_*_40ep_seed*.sh`, CPU ablations `slurm/run_probe_feature_ablation_current_protocol_baselines.sh`, **40 ep probe sweep** `slurm/run_probe_sweep_40ep_seeds_checkpointed.sh`, **Small-LI scout** `slurm/scout_small_li_gin_emlps_tds_asym_proj_8192neg_queue0_20ep_seed1.sh` — see [`notes/results.md`](notes/results.md#current-protocol-comparison-batch-jun-2829), [probe sweep](notes/results.md#40-ep-targeted-probe-sweep-jul-2), and [Small-LI scout](notes/results.md#small-li-current-protocol-scout-jul-2).
+`slurm/` scripts are **local-only / gitignored (not in a public clone)** — thin cluster wrappers around the `python main.py …` commands documented above. Submit from repo root. **Current-protocol comparison** (Jun–Jul 2026): GPU `slurm/comparison_gin_emlps_tds_*_40ep_seed*.sh`, CPU ablations `slurm/run_probe_feature_ablation_current_protocol_baselines.sh`, **40 ep probe sweep** `slurm/run_probe_sweep_40ep_seeds_checkpointed.sh`, **Small-LI scout** `slurm/scout_small_li_gin_emlps_tds_asym_proj_8192neg_queue0_20ep_seed1.sh` — see [`notes/results.md`](notes/results.md#current-protocol-comparison-batch-jun-2829), [probe sweep](notes/results.md#40-ep-targeted-probe-sweep-jul-2), and [Small-LI scout](notes/results.md#small-li-current-protocol-scout-jul-2).
 
 ```bash
 sbatch slurm/ablation_contrastive_proj_sym_8192neg_20ep.sh
@@ -262,7 +264,10 @@ formatted_transactions.csv
 | `format_*.py` | Kaggle, PaySim, SAML-D formatters |
 | `scripts/` | Precompute, validation, label-efficiency, diagnostics |
 | `notes/` | Design docs, datasets, results, CLI reference |
-| `tests/` | Unit tests |
+| `slurm/` | Cluster job scripts (local-only, gitignored) |
+| `tests/` | Unit tests (local-only, gitignored) |
+
+Tests are part of the local tree only (see the **Repo scope** note near the top); this runs from a checkout that has them:
 
 ```bash
 python -m pytest tests/ -q
