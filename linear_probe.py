@@ -1,8 +1,9 @@
 """
 Phase 5b: Papagei-style linear probing on frozen embeddings (Phase 5a ``.npz`` files).
 
-Fits sklearn logistic regression on train embeddings and reports AUROC (threshold-free)
-plus F1 / precision / recall at a validation-selected threshold (max F1 on val by default).
+Fits sklearn logistic regression on train embeddings and reports AUROC and AUPRC
+(threshold-free) plus F1 / precision / recall at a validation-selected threshold
+(max F1 on val by default).
 When the selected threshold is not 0.5, also writes ``splits_at_threshold_0.5`` for comparison.
 
 ``probe_results.json`` structure:
@@ -27,6 +28,7 @@ import numpy as np
 import wandb
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
+    average_precision_score,
     f1_score,
     precision_recall_curve,
     precision_score,
@@ -64,6 +66,11 @@ def resolve_class_weight(args) -> Optional[Any]:
         w0 = float(extract_param("w_ce1", args))
         w1 = float(extract_param("w_ce2", args))
         return {0: w0, 1: w1}
+    if mode == "explicit":
+        pos = getattr(args, "class_weight_pos", None)
+        if pos is None:
+            raise ValueError("--class_weight explicit requires --class_weight_pos.")
+        return {0: 1.0, 1: float(pos)}
     raise ValueError(f"Unsupported --class_weight {args.class_weight!r}")
 
 
@@ -106,6 +113,7 @@ def fit_logistic_probe(
     max_iter: int,
     seed: int,
     n_jobs: int = -1,
+    C: float = 1.0,
 ) -> LogisticRegression:
     clf = LogisticRegression(
         class_weight=class_weight,
@@ -113,6 +121,7 @@ def fit_logistic_probe(
         random_state=seed,
         solver="lbfgs",
         n_jobs=n_jobs,
+        C=float(C),
     )
     clf.fit(z_train, y_train)
     return clf
@@ -129,6 +138,7 @@ def evaluate_probe(
         logging.warning("linear probe %s: empty split", split_name)
         return {
             "auroc": float("nan"),
+            "auprc": float("nan"),
             "f1": float("nan"),
             "precision": float("nan"),
             "recall": float("nan"),
@@ -149,11 +159,13 @@ def evaluate_probe(
     }
     if len(np.unique(y)) < 2:
         logging.warning(
-            "linear probe %s: only one class present; AUROC undefined", split_name
+            "linear probe %s: only one class present; AUROC/AUPRC undefined", split_name
         )
         metrics["auroc"] = float("nan")
+        metrics["auprc"] = float("nan")
     else:
         metrics["auroc"] = float(roc_auc_score(y, proba))
+        metrics["auprc"] = float(average_precision_score(y, proba))
     return metrics
 
 
@@ -227,10 +239,11 @@ def run_linear_probe(embeddings_root: Path, args) -> Dict[str, Any]:
         )
         results["splits_at_selected_threshold"][split_name] = metrics_selected
         logging.info(
-            "aml_probe/linear/%s @ selected threshold %.4f: AUROC=%.4f F1=%.4f precision=%.4f recall=%.4f (n=%d)",
+            "aml_probe/linear/%s @ selected threshold %.4f: AUROC=%.4f AUPRC=%.4f F1=%.4f precision=%.4f recall=%.4f (n=%d)",
             split_name,
             selected_threshold,
             metrics_selected["auroc"],
+            metrics_selected["auprc"],
             metrics_selected["f1"],
             metrics_selected["precision"],
             metrics_selected["recall"],
@@ -247,7 +260,9 @@ def run_linear_probe(embeddings_root: Path, args) -> Dict[str, Any]:
                 metrics_default["recall"],
             )
 
-    out_path = embeddings_root / "probe_results.json"
+    probe_output = getattr(args, "probe_output", None)
+    out_path = Path(probe_output) if probe_output else embeddings_root / "probe_results.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
     logging.info("Wrote probe results to %s", out_path)
@@ -278,8 +293,14 @@ def main() -> None:
         "--class_weight",
         type=str,
         default="balanced",
-        choices=["balanced", "none", "model"],
+        choices=["balanced", "none", "model", "explicit"],
         help="Logistic regression class weights (default balanced, Papagei-style).",
+    )
+    parser.add_argument(
+        "--class_weight_pos",
+        type=float,
+        default=None,
+        help="Positive class weight for --class_weight explicit; resolves to {0: 1.0, 1: value}.",
     )
     parser.add_argument("--probe_max_iter", type=int, default=1000)
     parser.add_argument(
@@ -290,6 +311,12 @@ def main() -> None:
         help="Set classification threshold for F1/precision/recall: tune on val (default) or fixed 0.5.",
     )
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument(
+        "--probe_output",
+        type=str,
+        default=None,
+        help="Optional path for probe_results.json (default: embeddings/{unique_name}/probe_results.json).",
+    )
     parser.add_argument("--testing", action="store_true", help="Disable wandb.")
     args = parser.parse_args()
 

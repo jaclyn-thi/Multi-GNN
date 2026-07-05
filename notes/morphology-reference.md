@@ -76,7 +76,7 @@ semantic groups with the same shared expert head. Examples:
 `all` preserves the full historical target vector.
 
 **Targeted group scouts (Small-HI):** full tables in
-[`results.md` § Morphology target-group scouts](results.md#morphology-target-group-scouts-small-hi).
+[`results-archive.md` § Morphology target-group scouts](results-archive.md#morphology-target-group-scouts-small-hi).
 Best morphology **F1:** `degree_fan` @ 10 ep, w=1.0 (0.208). Best morphology
 **AUROC** in targeted scouts: `degree_fan` 20 ep w=0.05 **last epoch** (0.943)
 or `motif_participation` @ w=0.05 (0.937). Prefer **`motif_participation` /

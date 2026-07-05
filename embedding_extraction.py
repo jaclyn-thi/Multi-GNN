@@ -107,13 +107,18 @@ def run_embedding_extraction(
         )
     else:
         ckpt_epoch = load_checkpoint_weights(model, device, args, data_config)
-        ckpt_path = checkpoint_path(data_config, args.unique_name, finetuned=finetuned)
-        ckpt_label = f"checkpoint_{args.unique_name}{'_finetuned' if finetuned else ''}.tar"
+        suffix = str(getattr(args, "checkpoint_suffix", "") or "")
+        ckpt_path = checkpoint_path(data_config, args.unique_name, finetuned=finetuned, suffix=suffix)
+        ckpt_label = (
+            f"checkpoint_{args.unique_name}{'_finetuned' if finetuned else ''}{suffix}.tar"
+        )
         logging.info("Loaded %s (epoch=%s)", ckpt_label, ckpt_epoch)
 
     model.eval()
 
-    embed_name = f"{args.unique_name}_finetuned" if finetuned else args.unique_name
+    embed_name = getattr(args, "embeddings_subdir", None) or args.unique_name
+    if finetuned and embed_name == args.unique_name:
+        embed_name = f"{args.unique_name}_finetuned"
     out_dir = Path(args.embeddings_dir) / embed_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -187,6 +192,18 @@ def main() -> None:
         action="store_true",
         help="Skip checkpoint load; extract with randomly initialized encoder weights "
         "(transfer baseline). --unique_name names the output folder only.",
+    )
+    parser.add_argument(
+        "--checkpoint_suffix",
+        type=str,
+        default="",
+        help="Checkpoint filename suffix after unique_name (e.g. _last for checkpoint_{name}_last.tar).",
+    )
+    parser.add_argument(
+        "--embeddings_subdir",
+        type=str,
+        default=None,
+        help="Override output folder name under --embeddings_dir (default: --unique_name).",
     )
     args = parser.parse_args()
 

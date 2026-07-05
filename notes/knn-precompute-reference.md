@@ -6,7 +6,7 @@ Does **not** build a dense KNN graph view or change the GNN message-passing grap
 
 **Training integration:** [`cli-reference.md`](cli-reference.md) · design context:
 [`contrastive-learning-plan.md`](contrastive-learning-plan.md). **Benchmark results:**
-[`results.md` § Feature-KNN](results.md#feature-knn-small-hi).
+[`results-archive.md` § Feature-KNN](results-archive.md#feature-knn-small-hi).
 
 **Outcome (Jun 2026):** precompute works. With random 8192 negs, **exclusion does not
 help** and **soft positives hurt** (0.849 / 0.067 vs baseline 0.951 / 0.233) — neighbors

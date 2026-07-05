@@ -45,18 +45,46 @@ class TrainingSetup:
     def is_contrastive(self) -> bool:
         return self.objective == "contrastive"
 
+    @property
+    def is_masked_edge(self) -> bool:
+        return self.objective == "masked_edge"
+
 
 def resolve_training_setup(args) -> TrainingSetup:
     objective = str(getattr(args, "objective", "contrastive")).lower()
-    if objective not in ("contrastive", "supervised"):
-        raise ValueError(f"Unsupported --objective {objective!r}; use 'contrastive' or 'supervised'.")
+    if objective not in ("contrastive", "supervised", "masked_edge"):
+        raise ValueError(
+            f"Unsupported --objective {objective!r}; use 'contrastive', 'supervised', or 'masked_edge'."
+        )
     graph_form = "hetero" if bool(getattr(args, "reverse_mp", False)) else "homo"
     return TrainingSetup(graph_form=graph_form, objective=objective)
 
 
 def validate_training_setup(setup: TrainingSetup) -> None:
-    """Reserved for future incompatible flag combinations."""
+    """Reserved for incompatible flag combinations."""
     del setup
+
+
+def validate_masked_edge_args(args, setup: TrainingSetup) -> None:
+    if not setup.is_masked_edge:
+        return
+    blocked = []
+    if bool(getattr(args, "morph_expert", False)):
+        blocked.append("--morph_expert")
+    if bool(getattr(args, "morph_contrast", False)):
+        blocked.append("--morph_contrast")
+    if bool(getattr(args, "contrast_projection_head", False)):
+        blocked.append("--contrast_projection_head")
+    if bool(getattr(args, "enable_knn_negative_filter", False)):
+        blocked.append("--enable_knn_negative_filter")
+    if bool(getattr(args, "enable_knn_soft_positives", False)):
+        blocked.append("--enable_knn_soft_positives")
+    if getattr(args, "false_neg_filter_mode", "none") != "none":
+        blocked.append("--false_neg_filter_mode")
+    if blocked:
+        raise ValueError(
+            "masked_edge objective is incompatible with: " + ", ".join(blocked)
+        )
 
 
 def log_training_setup(setup: TrainingSetup, args) -> None:
@@ -95,6 +123,9 @@ def extract_param(parameter_name: str, args) -> float:
     """
     Extract the value of the specified parameter for the given model.
 
+    Per-run CLI overrides (when set) take precedence over model_settings.json:
+    ``--override_lr``, ``--override_n_hidden``, ``--override_final_dropout``.
+
     Args:
     - parameter_name (str): Name of the parameter (e.g., "lr").
     - args (argparser): Arguments given to this specific run.
@@ -102,6 +133,19 @@ def extract_param(parameter_name: str, args) -> float:
     Returns:
     - float: Value of the specified parameter.
     """
+    if parameter_name == "lr":
+        override = getattr(args, "override_lr", None)
+        if override is not None:
+            return float(override)
+    if parameter_name == "n_hidden":
+        override = getattr(args, "override_n_hidden", None)
+        if override is not None:
+            return float(override)
+    if parameter_name == "final_dropout":
+        override = getattr(args, "override_final_dropout", None)
+        if override is not None:
+            return float(override)
+
     file_path = './model_settings.json'
     with open(file_path, "r") as file:
         data = json.load(file)
@@ -481,6 +525,9 @@ def save_model(model, optimizer, epoch, args, data_config, *, suffix: str = ""):
     proj_head = getattr(args, "contrast_projection_module", None)
     if proj_head is not None:
         payload["contrast_projection_state_dict"] = proj_head.state_dict()
+    masked_decoder = getattr(args, "masked_edge_decoder", None)
+    if masked_decoder is not None:
+        payload["masked_edge_decoder_state_dict"] = masked_decoder.state_dict()
     finetune_suffix = "_finetuned" if getattr(args, "finetune", False) else ""
     path = (
         Path(data_config["paths"]["model_to_save"])
@@ -492,7 +539,8 @@ def save_model(model, optimizer, epoch, args, data_config, *, suffix: str = ""):
 def load_checkpoint_weights(model, device, args, data_config) -> int:
     """Load ``model_state_dict`` from a pretrain/adapt checkpoint (no optimizer)."""
     finetuned = bool(getattr(args, "finetune", False))
-    path = checkpoint_path(data_config, args.unique_name, finetuned=finetuned)
+    suffix = str(getattr(args, "checkpoint_suffix", "") or "")
+    path = checkpoint_path(data_config, args.unique_name, finetuned=finetuned, suffix=suffix)
     if not path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
     checkpoint = torch.load(path, map_location=device)
@@ -807,3 +855,6 @@ def load_checkpoint_auxiliary_modules(args, data_config, device) -> None:
     proj_head = getattr(args, "contrast_projection_module", None)
     if proj_head is not None and "contrast_projection_state_dict" in checkpoint:
         proj_head.load_state_dict(checkpoint["contrast_projection_state_dict"])
+    masked_decoder = getattr(args, "masked_edge_decoder", None)
+    if masked_decoder is not None and "masked_edge_decoder_state_dict" in checkpoint:
+        masked_decoder.load_state_dict(checkpoint["masked_edge_decoder_state_dict"])

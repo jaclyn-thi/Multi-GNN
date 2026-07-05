@@ -29,9 +29,10 @@ def create_parser():
     parser.add_argument(
         "--objective",
         type=str,
-        choices=["contrastive", "supervised"],
+        choices=["contrastive", "supervised", "masked_edge"],
         default="contrastive",
-        help="Training objective: contrastive pretraining (default) or supervised AML edge classification.",
+        help="Training objective: contrastive pretraining (default), supervised AML edge "
+        "classification, or masked edge-attribute reconstruction (GraphMAE-style).",
     )
     parser.add_argument("--ports", action='store_true', help="Use port numberings in GNN training")
     parser.add_argument("--tds", action='store_true', help="Use time deltas (i.e. the time between subsequent transactions) in GNN training")
@@ -66,6 +67,24 @@ def create_parser():
         help="Override path to laundering_attempt_metadata.csv (implies load when set).",
     )
     parser.add_argument("--model", default=None, type=str, help="Select the model architecture. Needs to be one of [gin, gat, rgcn, pna]", required=True)
+    parser.add_argument(
+        "--override_lr",
+        type=float,
+        default=None,
+        help="Optional per-run learning rate override (else model_settings.json for --model).",
+    )
+    parser.add_argument(
+        "--override_n_hidden",
+        type=int,
+        default=None,
+        help="Optional per-run GNN hidden width override (else model_settings.json for --model).",
+    )
+    parser.add_argument(
+        "--override_final_dropout",
+        type=float,
+        default=None,
+        help="Optional per-run final dropout override before the readout MLP (else model_settings.json).",
+    )
     parser.add_argument("--testing", action='store_true', help="Disable wandb logging while running the script in 'testing' mode.")
     parser.add_argument("--save_model", action='store_true', help="Save training checkpoints to saved-models/.")
     parser.add_argument(
@@ -288,6 +307,58 @@ def create_parser():
         type=str,
         default=None,
         help="Optional .npz cache of precomputed train-split edge-drop probabilities.",
+    )
+
+    # Masked edge-attribute reconstruction (GraphMAE-style SSL)
+    parser.add_argument(
+        "--mask_edge_attr_rate",
+        type=float,
+        default=0.15,
+        help="Per-field Bernoulli mask probability on seed train edges for --objective masked_edge.",
+    )
+    parser.add_argument(
+        "--mask_edge_attr_fields",
+        type=str,
+        default="amount,currency,payment_format",
+        help="Comma-separated fields to mask/reconstruct: amount,currency,payment_format[,timestamp].",
+    )
+    parser.add_argument(
+        "--mask_edge_attr_token_strategy",
+        type=str,
+        default="zero",
+        choices=["zero", "mean", "learned"],
+        help="Input replacement token for masked edge attributes.",
+    )
+    parser.add_argument(
+        "--masked_edge_loss_weights",
+        type=str,
+        default="amount=1.0,currency=1.0,payment_format=1.0",
+        help="Comma-separated per-field loss weights, e.g. amount=1.0,currency=1.0,payment_format=1.0.",
+    )
+    parser.add_argument(
+        "--masked_edge_decoder_hidden_dim",
+        type=int,
+        default=128,
+        help="Hidden width for masked-edge reconstruction decoder MLP.",
+    )
+    parser.add_argument(
+        "--masked_edge_seed",
+        type=int,
+        default=1,
+        help="Base RNG seed for masked-edge field sampling (independent of --seed).",
+    )
+    parser.add_argument(
+        "--masked_edge_amount_loss",
+        type=str,
+        default="smooth_l1",
+        choices=["mse", "smooth_l1"],
+        help="Regression loss for log1p amount reconstruction.",
+    )
+    parser.add_argument(
+        "--masked_edge_aux_weight",
+        type=float,
+        default=0.0,
+        help="Optional auxiliary masked-edge loss weight during contrastive training (0 disables).",
     )
 
     # Morphology expert head (contrastive pretrain, Phase M1)

@@ -159,7 +159,7 @@ Queue KNN filtering is intentionally deferred.
 
 **Jun 2026 ablation:** with random 8192 negatives, exclusion did not beat the
 no-filter baseline (k=5: 0.947 / 0.209; k=15: 0.928 / 0.176 vs 0.951 / 0.233).
-See [`results.md` § Feature-KNN](results.md#feature-knn-small-hi).
+See [`results-archive.md` § Feature-KNN](results-archive.md#feature-knn-small-hi).
 
 **KNN soft positives:** `--enable_knn_soft_positives` adds low-weight cached
 neighbors to the InfoNCE numerator via an auxiliary seed forward pass. Requires

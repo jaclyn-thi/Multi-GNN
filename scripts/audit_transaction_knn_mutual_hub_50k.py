@@ -153,7 +153,7 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=15)
     parser.add_argument("--max_rows", type=int, default=50000)
     parser.add_argument("--output_json", default="logs/knn_mutual_hub_audit_50k.json")
-    parser.add_argument("--output_md", default="notes/knn_mutual_hub_audit_50k.md")
+    parser.add_argument("--output_md", default="notes/experiments/knn-audits/knn_mutual_hub_audit_50k.md")
     args = parser.parse_args()
 
     _, df_train, _, spec = load_train_frame(args.data, args.data_config, max_rows=args.max_rows)

@@ -4,7 +4,13 @@ import torch
 import logging
 from pathlib import Path
 
-from data_util import GraphData, HeteroData, z_norm, create_hetero_obj
+from data_util import (
+    GraphData,
+    HeteroData,
+    append_rgcn_relation_type,
+    create_hetero_obj,
+    z_norm,
+)
 from dataset_specs import get_dataset_spec, spec_summary
 from dataset_splits import log_split_label_stats, temporal_edge_split
 from pattern_metadata import (
@@ -162,18 +168,11 @@ def get_data(args, data_config):
     val_data.x = tr_data.x.clone()
     te_data.x = tr_data.x.clone()
 
-    if not args.model == "rgcn":
-        tr_data.edge_attr, val_data.edge_attr, te_data.edge_attr = (
-            z_norm(tr_data.edge_attr),
-            z_norm(val_data.edge_attr),
-            z_norm(te_data.edge_attr),
-        )
-    else:
-        tr_data.edge_attr[:, :-1], val_data.edge_attr[:, :-1], te_data.edge_attr[:, :-1] = (
-            z_norm(tr_data.edge_attr[:, :-1]),
-            z_norm(val_data.edge_attr[:, :-1]),
-            z_norm(te_data.edge_attr[:, :-1]),
-        )
+    tr_data.edge_attr, val_data.edge_attr, te_data.edge_attr = (
+        z_norm(tr_data.edge_attr),
+        z_norm(val_data.edge_attr),
+        z_norm(te_data.edge_attr),
+    )
 
     if args.reverse_mp:
         tr_data = create_hetero_obj(
@@ -190,6 +189,11 @@ def get_data(args, data_config):
         te_data = create_hetero_obj(
             te_data.x, te_data.y, te_data.edge_index, te_data.edge_attr, te_data.timestamps, args
         )
+
+    if args.model == "rgcn":
+        append_rgcn_relation_type(tr_data, args.reverse_mp)
+        append_rgcn_relation_type(val_data, args.reverse_mp)
+        append_rgcn_relation_type(te_data, args.reverse_mp)
 
     logging.info(f"train data object: {tr_data}")
     logging.info(f"validation data object: {val_data}")

@@ -262,7 +262,7 @@ def main() -> None:
         help="richer_v1 compares baseline vs richer_v1 variants; legacy runs older flow_balance ablations.",
     )
     parser.add_argument("--output_json", default="logs/knn_feature_audit_richer_v1_50k.json")
-    parser.add_argument("--output_md", default="notes/knn_feature_audit_richer_v1_50k.md")
+    parser.add_argument("--output_md", default="notes/experiments/knn-audits/knn_feature_audit_richer_v1_50k.md")
     parser.add_argument(
         "--baseline_key",
         default="edge_native+degree_fan|ordinal|legacy_standard",

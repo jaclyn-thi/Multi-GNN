@@ -13,18 +13,24 @@ The original **supervised** path (`--objective supervised`) remains as a baselin
 
 ## Documentation map
 
+**All docs are indexed in [`notes/README.md`](notes/README.md)** — start there when a link below isn't enough.
+
 | If you want to… | Start here |
 | ---------------- | ---------- |
+| **Browse all docs** | [`notes/README.md`](notes/README.md) (documentation index + status legend) |
 | **Get running** | [Quick start](#quick-start) below |
 | **Prepare data** (IBM, PaySim, SAML-D) | [`notes/datasets.md`](notes/datasets.md) |
 | **Train / extract / probe** | [Workflows](#workflows) · [`notes/cli-reference.md`](notes/cli-reference.md) |
 | **Morphology SSL** (M1/M2, flags, metrics) | [`notes/morphology-reference.md`](notes/morphology-reference.md) · [`notes/morphology-metrics-plan.md`](notes/morphology-metrics-plan.md) |
-| **Dev benchmark numbers** | [`notes/results.md`](notes/results.md) |
+| **Latest results & thesis-safe claims** | [`notes/current_protocol_recent_runs_summary.md`](notes/current_protocol_recent_runs_summary.md) |
+| **Dev benchmark numbers** | [`notes/results.md`](notes/results.md) (start at [Recommended configs](notes/results.md#recommended-configs-jun-2026)) · feature ablation: [`notes/probe_feature_ablation_current_protocol_comparison.md`](notes/probe_feature_ablation_current_protocol_comparison.md) · **40 ep probe sweep:** [`notes/probe_sweep_40ep_current_protocol.md`](notes/probe_sweep_40ep_current_protocol.md) · **Small-LI scout:** [`notes/small_li_current_protocol_comparison.md`](notes/small_li_current_protocol_comparison.md) |
 | **Downstream eval strategy** (PaySim, SAML-D, typology) | [`notes/downstream-eval-plan.md`](notes/downstream-eval-plan.md) |
 | **Contrastive design & protocol** | [`notes/contrastive-learning-plan.md`](notes/contrastive-learning-plan.md) |
-| **Feature-KNN cache** (precompute; exclusion / soft positives) | [`notes/knn-precompute-reference.md`](notes/knn-precompute-reference.md) · results: [`notes/results.md`](notes/results.md#feature-knn-small-hi) (neither helps with current recipe) |
+| **Feature-KNN cache** (precompute; exclusion / soft positives) | [`notes/knn-precompute-reference.md`](notes/knn-precompute-reference.md) · results: [`notes/results-archive.md`](notes/results-archive.md#feature-knn-small-hi) (neither helps with current recipe) |
 | **Run on Slurm** | [Slurm](#slurm) |
 | **Understand the codebase** | [Repo overview](#repo-overview) |
+
+> **Fair-comparison probe policy:** benchmark numbers are development sanity checks (not frozen). Compare runs at `--class_weight model --model gin`, C=1.0, val-tuned F1; other `cw`/C rows are exploratory.
 
 ---
 
@@ -75,9 +81,9 @@ python embedding_extraction.py \
 python linear_probe.py --unique_name my_pretrain --testing
 ```
 
-Writes `embeddings/{unique_name}/probe_results.json`. Report **AUROC** (primary) and F1 (secondary). AML labels are not used for SSL checkpoint selection; use `--checkpoint_policy best` for morph/projection runs.
+Writes `embeddings/{unique_name}/probe_results.json`. Report **AUROC**, **AUPRC** (important for rare positives), and **F1** (val-tuned threshold). AML labels are not used for SSL checkpoint selection; use `--checkpoint_policy best` for morph/projection runs.
 
-**Recommended pure-SSL add-on:** `--contrast_projection_head` (see [Workflows](#workflows)). Current best dev Small-HI asym AUROC recipe uses 8192 negatives with the queue disabled: test AUROC **0.951**, F1 **0.233**. Across seeds, `same_pair` false-negative filtering is the leading F1/recall variant ([`notes/results.md`](notes/results.md)).
+**Current best dev recipes** ([`notes/results.md`](notes/results.md)): AUROC → baseline contrastive (**0.951**). SSL embedding-only → **emlps+tds 40 ep seed2** (**0.307 F1**). Best **`embedding+raw` scout** → GIN 40 ep seed2 (**0.346 F1** @ shared probe `cw=model`, C=1.0; robust across probe settings but **not cross-seed stable**). Best **full stack** → **FNF + emlps+tds seed1 + `embedding+raw+morph`** (**0.319 F1**). Use **`cw=model --model gin`** for comparable probes. Small-LI dataset comparison is weaker than Small-HI; see [Small-LI scout](notes/results.md#small-li-current-protocol-scout-jul-2).
 
 ---
 
@@ -105,7 +111,7 @@ python main.py \
   --tqdm --testing
 ```
 
-Then extract → probe as above. For the current asym + projection recipe, queue ablations found `--contrastive_memory_bank_size 0` strongest on Small-HI; larger queues reduced downstream AUROC/F1 despite adding more negatives. `--contrastive_temperature` controls the InfoNCE logit temperature; default `0.5` preserves prior runs. See [`notes/results.md`](notes/results.md#queue-and-negative-ablations-small-hi).
+Then extract → probe as above. For the current asym + projection recipe, queue ablations found `--contrastive_memory_bank_size 0` strongest on Small-HI; larger queues reduced downstream AUROC/F1 despite adding more negatives. `--contrastive_temperature` controls the InfoNCE logit temperature; default `0.5` preserves prior runs. See [`notes/results-archive.md`](notes/results-archive.md#queue-and-negative-ablations-small-hi).
 
 Optional false-negative filtering can exclude likely related transactions from
 the contrastive negative pool without adding new positives:
@@ -200,6 +206,8 @@ See [`notes/cli-reference.md`](notes/cli-reference.md) and [`notes/results.md`](
 | Embeddings | `embeddings/{unique_name}/{train,val,test}.npz` |
 | Extraction metadata | `embeddings/{unique_name}/meta.json` |
 | Probe results | `embeddings/{unique_name}/probe_results.json` |
+| Probe sweep (40 ep) | `results/diagnostics/probe_sweep_40ep_current_protocol.json` · per-seed partials `probe_sweep_40ep_seed{N}_partial.json` |
+| Small-LI scout | `results/diagnostics/small_li_dataset_audit.json` · `results/diagnostics/probe_feature_ablation_small_li_current_protocol_seed1.json` |
 | Morphology cache | `morphology_cache/{data}/{split}_node_morphology.csv`, `{split}_node_tier2.csv` |
 
 `--unique_name` is required for `--save_model`, `--finetune`, extraction, and probing.
@@ -210,7 +218,7 @@ Full CLI flag list: [`notes/cli-reference.md`](notes/cli-reference.md).
 
 ## Slurm
 
-Scripts in [`slurm/`](slurm/) (local-only). Submit from repo root:
+Scripts in [`slurm/`](slurm/) (local-only). Submit from repo root. **Current-protocol comparison** (Jun–Jul 2026): GPU `slurm/comparison_gin_emlps_tds_*_40ep_seed*.sh`, CPU ablations `slurm/run_probe_feature_ablation_current_protocol_baselines.sh`, **40 ep probe sweep** `slurm/run_probe_sweep_40ep_seeds_checkpointed.sh`, **Small-LI scout** `slurm/scout_small_li_gin_emlps_tds_asym_proj_8192neg_queue0_20ep_seed1.sh` — see [`notes/results.md`](notes/results.md#current-protocol-comparison-batch-jun-2829), [probe sweep](notes/results.md#40-ep-targeted-probe-sweep-jul-2), and [Small-LI scout](notes/results.md#small-li-current-protocol-scout-jul-2).
 
 ```bash
 sbatch slurm/ablation_contrastive_proj_sym_8192neg_20ep.sh

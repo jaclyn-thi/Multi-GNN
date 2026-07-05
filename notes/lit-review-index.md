@@ -60,7 +60,7 @@ Companion to [`contrastive-learning-plan.md`](contrastive-learning-plan.md) and 
 | Tier-0 global degree precompute | This repo (M1b) | ✅ | `scripts/precompute_morphology_tier0.py` |
 | Morph val throttling | This repo | ✅ | `--morph_val_every`, `--morph_val_max_batches` |
 | Third **KNN view** | GCPAL | ❌ | Documented divergence in contrastive plan |
-| **Projection head** for contrast only | GraphCL, GCPAL | ✅ | `--contrast_projection_head` — InfoNCE only; extract uses encoder `z`; see [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md) |
+| **Projection head** for contrast only | GraphCL, GCPAL | ✅ | `--contrast_projection_head` — InfoNCE only; extract uses encoder `z`; see [`projection-head-ablation-jun2026.md`](archive/projection-head-ablation-jun2026.md) |
 | **Neighbor / KNN soft positives** (non-morph) | GCPAL | ❌ | M2 uses morphology bins instead |
 | **Label-efficiency** probe (10/25/50% train labels) | GCPAL, Papagei, RWTH | ✅ | `scripts/label_efficiency_probe.py` |
 | **Disjoint** morph dims for contrast vs expert | Papagei | ❌ | Default overlap `local_ego,local_degree` |
@@ -144,7 +144,7 @@ GIN, hetero, full-train linear probe, val max-F1 threshold. Full table in [`morp
 **High-value future work:**
 1. ~~**Label-efficiency probes**~~ — nine-encoder batch done: contrastive+proj leads vs M1b at all fractions; M1b+proj best @ 10% (0.918 AUROC).
 2. **KNN or similarity view** — mitigate link sparsity (GCPAL motivation); engineering cost non-trivial on edge/batch sampling path.
-3. ~~**Contrast projection head**~~ — done (Jun 4): contrastive+proj **0.927** test AUROC; M1b+proj 0.924 AUROC / 0.096 F1. **Relax grid (Jun 11):** 8192 negs **0.930** AUROC; sym **0.929** / **0.222** F1; asym@16384 confound **0.920**/0.206. See [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md).
+3. ~~**Contrast projection head**~~ — done (Jun 4): contrastive+proj **0.927** test AUROC; M1b+proj 0.924 AUROC / 0.096 F1. **Relax grid (Jun 11):** 8192 negs **0.930** AUROC; sym **0.929** / **0.222** F1; asym@16384 confound **0.920**/0.206. See [`projection-head-ablation-jun2026.md`](archive/projection-head-ablation-jun2026.md).
 
 ---
 
@@ -280,7 +280,7 @@ Add PDFs to `lit review/` and extend this table if those become relevant.
 |-------|-----------------|
 | Contrastive workflow & Phase history | [`contrastive-learning-plan.md`](contrastive-learning-plan.md) |
 | Morphology phases M0–M5 | [`morphology-metrics-plan.md`](morphology-metrics-plan.md) |
-| Projection head ablation (Jun 2026) | [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md) |
+| Projection head ablation (Jun 2026) | [`projection-head-ablation-jun2026.md`](archive/projection-head-ablation-jun2026.md) |
 | CLI & benchmarks | [`cli-reference.md`](cli-reference.md) · [`results.md`](results.md) · [`../README.md`](../README.md) |
 | Augmentations | [`graph_augmentations.py`](../graph_augmentations.py) |
 | InfoNCE + M2 soft positives | [`contrastive_loss.py`](../contrastive_loss.py) |

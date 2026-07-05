@@ -1,36 +1,285 @@
 # Development results (not frozen benchmarks)
 
-Quick-run numbers for internal comparison while configs and code still change. **Not** a formal evaluation protocol — use fixed recipes for papers and PI updates once the stack stabilizes.
+Quick-run numbers for internal comparison while configs and code still change. **Not** a formal evaluation protocol — numbers may change as the PI refines the stack.
 
-**Outputs:** `embeddings/{unique_name}/probe_results.json` · PaySim: `embeddings/paysim/{unique_name}/probe_results*.json`
+**New to the repo?** Start with [Recommended configs](#recommended-configs-jun-2026), the [key runs leaderboard](#key-runs-leaderboard-jun-26--jul-2), and the [Small-LI scout](#small-li-current-protocol-scout-jul-2) if you care about dataset transfer. Deeper history is in sections below (not all runs use the same protocol).
+
+**Outputs:** `embeddings/{unique_name}/probe_results.json` · PaySim: `embeddings/paysim/{unique_name}/probe_results*.json` · AUPRC summary: `results/diagnostics/linear_probe_auprc_summary.json` · Feature ablation: `results/diagnostics/probe_feature_ablation_current_protocol_comparison.json` · Stack focus: [`probe_feature_ablation_current_protocol_stack_comparison.md`](probe_feature_ablation_current_protocol_stack_comparison.md) · **40 ep probe sweep:** [`probe_sweep_40ep_current_protocol.md`](probe_sweep_40ep_current_protocol.md) · JSON: `results/diagnostics/probe_sweep_40ep_current_protocol.json` · **Small-LI scout:** [`small_li_current_protocol_comparison.md`](small_li_current_protocol_comparison.md)
+
+**Metrics (linear probe, test split):** **AUROC** — overall ranking. **AUPRC** (average precision) — better for rare positives (~0.19% test edges on Small-HI). **F1** — val-tuned threshold (primary operational metric in this doc). **F1@0.5** — fixed 0.5 threshold when reported. All from `linear_probe.py` unless noted (feature ablation uses same probe protocol).
 
 ---
 
 ## Recommended configs (Jun 2026)
 
-**Full-label frozen probe (AUROC):** **8192neg + projection with queue disabled** is the current strongest asym AUROC recipe (**0.951 AUROC**, **0.233 F1**). Across seeds, `same_pair` false-negative filtering is the leading F1/recall variant (**0.236 mean F1**, **0.359 mean recall**) with a small AUROC tradeoff.
+**Current comparison-protocol backbone:** asym contrastive + projection, 8192 negs, `queue=0`, `bs=8192 accum=4`, 20 ep, seed 1, GINe, **`--reverse_mp --ego --ports --emlps --tds`**. No morphology expert, KNN, or multi-positive unless explicitly testing those. (Protocol may still change — treat numbers as dev comparisons, not frozen benchmarks.)
 
-**Label-efficiency:** sym+proj best @ **10%** labels (0.924 AUROC); 8192neg+proj best @ **50–100%** (0.931). See [label-efficiency](#label-efficiency-small-hi) below.
+**Fair-comparison probe policy:** headline rows use **`--class_weight model --model gin`, C=1.0, val-tuned F1**. Rows at other `cw`/C (e.g. `cw=none`, `pos_3`) are exploratory operating-point tuning and can inflate F1 via extreme thresholds — check F1@0.5 before trusting them. Thesis-safe synthesis: [`current_protocol_recent_runs_summary.md`](current_protocol_recent_runs_summary.md).
 
-**Morphology expert:** **M1b** @ 20 ep — best full-expert morph-only (0.920 AUROC). Targeted group scouts: best morphology **F1** still **`degree_fan` 10 ep, w=1.0** (0.208); best morphology **AUROC** is **`degree_fan` 20 ep, w=0.05, last epoch** (0.943) or **`motif_participation` 10 ep, w=0.05** (0.937). Use **`motif_participation` / `flow_balance` @ w=0.05**; avoid **motif @ w=1.0** with morph-val best (probe last epoch if needed). See [morphology target-group scouts](#morphology-target-group-scouts-small-hi). **Feature-KNN:** negative exclusion **did not help**; soft positives **hurt** (0.849 / 0.067) — see [feature-KNN](#feature-knn-small-hi). MAE expert loss did not beat MSE. Stacking BC on M1b hurts; M5a grouped heads did not fix interference (0.887 AUROC).
+| Goal | Recipe | Test metrics |
+|------|--------|--------------|
+| Best **AUROC** | Baseline (`ports` only, no emlps/tds) | **0.951** AUROC · 0.120 AUPRC · 0.236 F1 |
+| Best **embedding-only AUPRC** | **emlps+tds** (seed 1, 20 ep) | 0.944 AUROC · **0.213 AUPRC** · 0.259 F1 |
+| Best **embedding-only F1** | **emlps+tds** (seed 2, **40 ep**) | 0.949 AUROC · 0.245 AUPRC · **0.307 F1** |
+| Best **`embedding+raw`** (scout) | **emlps+tds 40 ep seed2** @ `cw=model`, C=1.0 | 0.955 AUROC · 0.288 AUPRC · **0.346 F1** (F1@0.5 **0.339**) |
+| Best **full stack (`embedding+raw+morph`)** | **FNF + emlps+tds seed1** | **0.959** AUROC · **0.276 AUPRC** · **0.319 F1** |
 
-**Projection ablation:** [`projection-head-ablation-jun2026.md`](projection-head-ablation-jun2026.md). Earlier best contrastive+proj AUROC before the queue sweep: asym + 8192 negs (**0.930**). Earlier best F1: sym + 1024 @ `bs=16384` (**0.222**).
+**Current protocol (Jun 26 – Jul 2):** **`same_pair` FNF** and **`degree_aware` edge drop** do **not** beat plain emlps+tds on **embedding-only** probes. **FNF seed1** still wins the standard full stack. **40 ep** improves mean embedding-only F1 (+0.5 pp vs 20 ep seed1) but **high seed variance** (seeds 3–4 weak). **`embedding+raw`** beats **`embedding+raw+morph`** on 3/4 GIN 40 ep seeds at shared probe settings (`cw=model`, C=1.0); mean F1 **0.273 ± 0.048** vs **0.248 ± 0.036** for full stack — but only seed2 reaches **0.35+ F1**. Details: [Jun 28–29 batch](#current-protocol-comparison-batch-jun-2829) · [40 ep probe sweep](#40-ep-targeted-probe-sweep-jul-2).
 
-**Queue / negative ablations:** for asym + projection + 8192 negatives + `bs=8192 accum=4`, disabling the queue is best. Larger queues reduced AUROC/F1; increasing negatives beyond 8192 did not improve AUROC, even with false-negative filtering. See [queue and negative ablations](#queue-and-negative-ablations-small-hi) below.
+**Dataset transfer scout (Small-LI, Jul 2):** current GINe emlps+tds 20 ep seed1 is much weaker on Small-LI than Small-HI. Best shared-policy Small-LI F1 is **0.076** with `embedding+raw`; full stack gets better AUPRC (**0.039**) but lower F1 (**0.056**). Treat this as evidence that the Small-HI recipe does not transfer cleanly without dataset-specific tuning. Details: [Small-LI scout](#small-li-current-protocol-scout-jul-2).
 
-**Temperature:** lower InfoNCE temperatures (`0.05`, `0.10`, `0.20`) underperformed the prior default `0.5`; keep `--contrastive_temperature 0.5` for the current recipe.
+**Do not use alone:** `--emlps` without `--tds` (0.915 / 0.093 AUPRC / 0.186 F1). **`--tds` alone** matches baseline F1 (0.233) with recall-heavy profile (0.395 recall), not the emlps+tds lift. **emlps+tds is seed-sensitive** — seeds 1–3 @ 20 ep embedding-only: mean **0.208 F1** / **0.160 AUPRC** (seed 1 best, seed 3 worst: 0.157 / 0.124).
 
-**Multi-positive InfoNCE:** endpoint weak-positive runs underperformed exclusion-only filtering. `same_pair` weak positives at weight `0.1` averaged **0.938 AUROC / 0.153 F1**; lowering the weight to `0.05` helped but still did not beat no-filter or `same_pair` exclusion.
+**Label-efficiency:** sym+proj best @ **10%** labels (0.924 AUROC); 8192neg+proj best @ **50–100%** (0.931). See [label-efficiency](results-archive.md#label-efficiency-small-hi).
 
-**Edge-drop augmentations:** label-free **`degree_aware`** edge drop gives a small **F1/recall** lift (−0.2 AUROC); **`degree_flow_aware`** ≈ baseline. **Do not** combine **`degree_aware`** with **`same_pair` FNF** — they interfere (mean **0.939 / 0.168** over 2 seeds) — see [edge-drop augmentations](#edge-drop-augmentations-small-hi) and [degree_aware + same_pair FNF](#degree_aware-edge-drop--same_pair-fnf-small-hi).
+**Morphology:** two distinct paths — (1) **probe-time** morph on frozen emlps+tds/FNF embeddings (**helps** FNF full stack up to 0.319 F1; **can hurt** GIN 40 ep full stack vs embedding-only); (2) **SSL morphology expert** during contrastive (**unreliable** with morph-val best ckpt; use last epoch if reporting). Legacy scouts: [`morphology scouts`](results-archive.md#morphology-target-group-scouts-small-hi).
+
+**Closed / negative results:** feature-KNN; multi-positive InfoNCE; PNA/RGCN encoder swap (emlps+tds); symmetric contrastive scout (emlps+tds); SSL hyper sweep; `degree_aware` + FNF stack; degree-aware on emlps+tds (embedding-only); morph-expert SSL @ morph-val best. Details in linked sections.
+
+**Pointers:** projection [`projection-head-ablation-jun2026.md`](archive/projection-head-ablation-jun2026.md) · queue/negs [archive](results-archive.md#queue-and-negative-ablations-small-hi) · masked-edge [archive](results-archive.md#masked-edge-attribute-reconstruction-small-hi)
+
+---
+
+## Key runs leaderboard (Jun 26 – Jul 2)
+
+Frozen linear probe unless noted. Probes use `--class_weight model --model gin` unless stated. Feature-ablation rows: `scripts/probe_feature_ablation.py`.
+
+| Run | AUROC | AUPRC | F1 | F1@0.5 | Note |
+|-----|------:|------:|---:|-------:|------|
+| Baseline (no emlps/tds) | **0.951** | 0.120 | 0.236 | 0.215 | AUROC reference |
+| **emlps+tds** (seed 1, 20 ep) | 0.944 | **0.213** | 0.259 | 0.257 | best AUPRC @ 20 ep |
+| **emlps+tds** (seed 1, **40 ep**) | 0.949 | 0.201 | 0.292 | 0.295 | embedding-only; best ckpt ep 40 |
+| **emlps+tds** (seed 2, **40 ep**) | 0.949 | **0.245** | **0.307** | 0.312 | best embedding-only F1; best ckpt ep 36 |
+| emlps+tds (seed 3, **40 ep**) | 0.938 | 0.176 | 0.228 | 0.226 | weak replicate |
+| emlps+tds (seed 4, **40 ep**) | 0.932 | 0.148 | 0.239 | 0.236 | weak replicate |
+| emlps+tds (seed 3, 20 ep) | 0.921 | 0.124 | 0.157 | 0.160 | worst 20 ep replicate |
+| **FNF + emlps+tds + emb+raw+morph** (s1) | **0.959** | **0.276** | **0.319** | 0.303 | **best full stack** |
+| emlps+tds + emb+raw+morph (s1, 20 ep) | 0.945 | 0.276 | 0.298 | 0.327 | strong without FNF |
+| emlps+tds + emb+raw+morph (s1, **40 ep**) | 0.945 | 0.264 | 0.262 | 0.248 | 40 ep **hurts** full stack |
+| **emlps+tds + emb+raw** (s2, **40 ep**) | 0.955 | 0.288 | **0.346** | 0.339 | sweep-verified @ `cw=model`, C=1.0 |
+| FNF + emlps+tds (embedding-only s1) | 0.942 | 0.178 | 0.236 | 0.239 | wins only with full probe |
+| FNF + emlps+tds (embedding-only **s2**) | 0.926 | 0.137 | 0.206 | 0.218 | seed replicate weak |
+| FNF + emlps+tds + emb+raw+morph (**s2**) | 0.955 | 0.243 | 0.262 | 0.170 | high thr (0.74); poor F1@0.5 |
+| sym scout (emlps+tds, 20 ep) | 0.936 | 0.176 | 0.230 | 0.225 | negative vs asym |
+| degree-aware + emlps+tds | 0.926 | 0.152 | 0.240 | 0.244 | weak vs emlps+tds |
+| morph expert + emlps+tds (**last ep**) | 0.947 | 0.184 | 0.288 | 0.283 | fair morph-SSL read |
+| morph expert + emlps+tds (morph-val best) | 0.927 | 0.104 | 0.187 | 0.213 | **misleading** (ep 1) |
+| Masked-edge GINE 20 ep | 0.932 | 0.232 | 0.247 | 0.272 | best non-contrastive AUPRC |
+
+Diagnostics: `results/diagnostics/linear_probe_auprc_summary.json` · Feature ablation (6 modes): [`probe_feature_ablation_current_protocol_comparison.md`](probe_feature_ablation_current_protocol_comparison.md) · Stack focus: [`probe_feature_ablation_current_protocol_stack_comparison.md`](probe_feature_ablation_current_protocol_stack_comparison.md) · **40 ep probe sweep:** [`probe_sweep_40ep_current_protocol.md`](probe_sweep_40ep_current_protocol.md) · Architecture sweep: `results/diagnostics/architecture_sweep_shared_probe_weights.md`
+
+---
+
+## Current-protocol comparison batch (Jun 28–29)
+
+Follow-up on the [current-protocol backbone](#recommended-configs-jun-2026). Slurm: `slurm/comparison_*`, `slurm/scout_*`, `slurm/run_probe_feature_ablation_current_protocol_baselines.sh`, `slurm/comparison_gin_emlps_tds_asym_proj_8192neg_queue0_40ep_seed{2,3,4}.sh`, `slurm/run_probe_sweep_40ep_seeds_checkpointed.sh`.
+
+### Embedding-only linear probe
+
+| Run | `unique_name` | Ep | AUROC | AUPRC | F1 | Δ F1 vs 20ep s1 |
+|-----|---------------|---:|------:|------:|---:|-----------------|
+| emlps+tds s1 (ref) | `hi_contrastive_gin_emlps_tds_proj_asym_8192neg_queue0_accum4_20ep` | 19 | 0.944 | **0.213** | 0.259 | — |
+| **emlps+tds 40 ep** | `gin_emlps_tds_asym_proj_8192neg_queue0_40ep_seed1` | 40 | 0.949 | 0.201 | **0.292** | **+3.3 pp** |
+| FNF seed2 | `fnf_emlps_tds_asym_proj_8192neg_queue0_20ep_seed2` | 19 | 0.926 | 0.139 | 0.209 | −5.0 pp |
+| **sym scout** | `gin_emlps_tds_sym_proj_8192neg_queue0_20ep_bs4096_accum8_seed1` | 20 | 0.936 | 0.176 | 0.230 | −2.9 pp |
+
+**40 ep embedding-only takeaway (seed1):** train loss still improved through ep 40; best ckpt = last epoch (ep 40). **F1 +3.3 pp** (0.259 → 0.292) with **AUPRC −1.4 pp** (0.213 → 0.201) vs 20 ep seed1.
+
+**40 ep seed2 replicate:** best ckpt **ep 36** (not ep 40); last-epoch embeddings much weaker (0.124 F1 / 0.075 AUPRC). Embedding-only probe: **0.307 F1 / 0.245 AUPRC** — stronger than seed1 40 ep on both metrics. Slurm: `slurm/comparison_gin_emlps_tds_asym_proj_8192neg_queue0_40ep_seed2.sh` (job 16822378).
+
+**FNF seed2 takeaway:** does not replicate seed1 (embedding-only **0.206** F1; full stack **0.262** F1 with thr **0.74**). Do not treat FNF downstream win as seed-stable.
+
+**Symmetric scout:** ran cleanly at `bs=4096 accum=8` with emlps+tds and 8192 negs (no OOM). Underperforms asymmetric GIN on F1/AUPRC — closed unless revisited with matched seed replicates.
+
+### 40 ep full-stack & seed replicate (Jun 29)
+
+CPU ablations on frozen 40 ep embeddings (`slurm/run_probe_feature_ablation_current_protocol_gin_40ep_seed1.sh`, job 16822377; seed2 ablation inline in GPU job 16822378). Focus table: [`probe_feature_ablation_current_protocol_stack_comparison.md`](probe_feature_ablation_current_protocol_stack_comparison.md).
+
+#### Stack comparison (test F1 / AUPRC)
+
+| Run | `raw+morph` | `embedding` | `embedding+raw+morph` |
+|-----|------------:|------------:|----------------------:|
+| GIN 20 ep seed1 | 0.136 / 0.066 | 0.259 / 0.213 | **0.298 / 0.276** |
+| GIN 40 ep seed1 | 0.136 / 0.066 | **0.292 / 0.199** | 0.262 / 0.264 |
+| GIN 40 ep seed2 | 0.135 / 0.065 | **0.300 / 0.242** | 0.275 / 0.219 |
+| GIN 40 ep seed3 | — | 0.228 / 0.176 | 0.187 / 0.196 |
+| GIN 40 ep seed4 | — | 0.239 / 0.148 | 0.271 / 0.246 |
+| FNF 20 ep seed1 | 0.136 / 0.066 | 0.236 / 0.179 | **0.319 / 0.276** |
+| FNF 20 ep seed2 | 0.135 / 0.065 | 0.206 / 0.137 | 0.262 / 0.243 |
+
+(`raw+morph` is identical across runs — no SSL embedding.)
+
+**Q1 — Does 40 ep improve the full downstream stack?** **No.** GIN 40 ep seed1 **`embedding+raw+morph` drops −3.6 pp F1** vs 20 ep (0.298 → 0.262) despite **+3.3 pp** on embedding-only. Morph/raw features do not compose cleanly with the longer-trained embedding (seed1 full stack becomes recall-heavy: 0.484 recall, thr 0.54).
+
+**Q2 — Is the 40 ep embedding gain seed-stable?** **Mixed.** Seeds 1–2 beat 20 ep seed1 on embedding-only; **seeds 3–4 are weak** (0.228 / 0.239 F1). Four-seed GPU replicates (jobs 16882364–16882365) + [Jul 2 probe sweep](#40-ep-targeted-probe-sweep-jul-2) confirm high variance. **Checkpoint caveat:** best ckpt ≠ last epoch for seeds 2–3.
+
+#### `embedding+raw` scout (40 ep, `cw=model`, C=1.0)
+
+| Seed | F1 | AUPRC | vs `embedding+raw+morph` |
+|------|---:|------:|--------------------------|
+| 1 | 0.269 | **0.316** | raw +0.7 pp F1 |
+| 2 | **0.346** | 0.288 | raw +7.0 pp F1 |
+| 3 | 0.214 | 0.236 | raw +2.7 pp F1 |
+| 4 | 0.263 | 0.228 | morph +0.3 pp F1 (tie) |
+| **Mean ± std** | **0.273 ± 0.048** | **0.267 ± 0.037** | raw wins F1 on 3/4 seeds |
+
+40 ep **`embedding+raw`** is the best **average** downstream stack for GIN, but **not a reliable default** — seed2 drives most gains. FNF seed1 full stack (**0.319 F1**) still leads for balanced end-to-end comparison.
+
+JSON (single-setting ablations): `results/diagnostics/probe_feature_ablation_current_protocol_gin_40ep_seed{1,2,3,4}.json`
+
+### 40 ep targeted probe sweep (Jul 2)
+
+Checkpointed CPU sweep over GIN 40 ep **seeds 1–4** — tests whether strong **`embedding+raw`** results are robust to probe hyperparameters. **Frozen embeddings only** (no SSL retrain). Slurm: `slurm/run_probe_sweep_40ep_seeds_checkpointed.sh` (array job 16983960; ~4.2 h/task).
+
+**Grid:** feature modes `embedding`, `embedding+raw`, `embedding+raw+morph` · class weights **`model`** (shared GIN `{0: ~1.0, 1: ~6.275}`) and **`none`** · C **`{0.1, 1.0, 10.0}`** · 78 cells total.
+
+**Infrastructure:** incremental checkpoint JSON per seed (`probe_sweep_40ep_seed{N}_partial.json`); feature-matrix cache under `results/cache/probe_features_current_protocol/`. Script: `scripts/probe_sweep_40ep_current_protocol.py`.
+
+#### Shared probe policy (`cw=model`, C=1.0) — mean ± std over 4 seeds
+
+| Feature mode | F1 | AUPRC | F1@0.5 |
+|--------------|---:|------:|-------:|
+| `embedding` | 0.264 ± 0.032 | 0.192 ± 0.035 | 0.265 ± 0.034 |
+| **`embedding+raw`** | **0.273 ± 0.048** | **0.267 ± 0.037** | 0.190 ± 0.089 |
+| `embedding+raw+morph` | 0.248 ± 0.036 | 0.229 ± 0.026 | 0.239 ± 0.065 |
+
+#### Key answers (Jul 2 sweep)
+
+1. **`embedding+raw` vs full stack:** raw wins F1 on **3/4 seeds** at `cw=model`, C=1.0; wins AUPRC on **21/24** cw×C pairs.
+2. **Seed2 `embedding+raw` robustness:** F1 stays **0.35–0.37** across all cw/C (not a threshold artifact; F1@0.5 ≈ 0.33–0.36 with `cw=model`).
+3. **Cross-seed stability:** **No** — seeds 3–4 stay ~0.21–0.27 on `embedding+raw` regardless of probe settings.
+4. **vs references @ `cw=model`, C=1.0:** below GIN 20 ep full stack (0.298) and FNF seed1 (0.319) on mean; seed2 scout peaks above both.
+
+**Probe policy note:** `cw=none` can inflate val-tuned F1 via extreme thresholds (e.g. seed1 `embedding` hits 0.318 F1 but F1@0.5 **0.13**). Prefer **`cw=model`** for fair comparisons.
+
+Consolidated: [`probe_sweep_40ep_current_protocol.md`](probe_sweep_40ep_current_protocol.md) · `results/diagnostics/probe_sweep_40ep_current_protocol.json`
+
+### Small-LI current-protocol scout (Jul 2)
+
+Dataset comparison using the same simple current-protocol SSL recipe as the Small-HI 20 ep reference: GINe, asym contrastive + projection, `--emlps --tds`, 8192 negs, `queue=0`, `bs=8192 accum=4`, 20 ep, seed1. Slurm: `slurm/scout_small_li_gin_emlps_tds_asym_proj_8192neg_queue0_20ep_seed1.sh` (job 17031798; completed in 3:56:52).
+
+**Audit:** `Small-LI` is supported as an AMLWorld dataset key. `aml-data/Small-LI/formatted_transactions.csv` has the same label/edge schema as Small-HI. Splits are calendar-day temporal splits with lower test prevalence than Small-HI: **0.0683%** positives (Small-HI reference ≈ **0.1867%**). Pattern metadata was not present; raw/morph feature generation worked.
+
+#### Small-LI probes (`cw=model --model gin`, best ckpt ep 19)
+
+| Features | AUROC | AUPRC | F1 | F1@0.5 | Note |
+|----------|------:|------:|---:|-------:|------|
+| `raw+morph` | 0.858 | 0.016 | 0.057 | 0.050 | label-free baseline |
+| `embedding` | 0.899 | 0.017 | 0.052 | 0.052 | SSL embedding alone weak |
+| **`embedding+raw`** | 0.909 | 0.027 | **0.076** | **0.081** | best F1 |
+| `embedding+raw+morph` | **0.925** | **0.039** | 0.056 | 0.073 | best ranking/AP; recall-heavy |
+
+**Takeaway:** Small-LI is harder for this recipe. Compared with Small-HI GINe emlps+tds seed1 (embedding-only **0.259 F1 / 0.213 AUPRC**, full stack **0.298 / 0.276**), Small-LI drops sharply. `embedding+raw` is the best Small-LI F1 stack, while morphology on top improves AUROC/AUPRC but hurts val-tuned F1. The last epoch checkpoint (ep 20) is worse than best ckpt on embedding-only (**0.029 F1 / 0.008 AUPRC**), so keep reporting best ckpt for this scout.
+
+Detailed note: [`small_li_current_protocol_comparison.md`](small_li_current_protocol_comparison.md) · Audit: `results/diagnostics/small_li_dataset_audit.json` · Feature ablation: `results/diagnostics/probe_feature_ablation_small_li_current_protocol_seed1.json`
+
+### Probe feature ablation — label-free vs learned (CPU)
+
+Six modes (`raw`, `morph`, `raw+morph`, `embedding`, `embedding+raw`, `embedding+raw+morph`); shared GIN class weights. JSON: `results/diagnostics/probe_feature_ablation_current_protocol_comparison.json`.
+
+| Features | GIN 20ep s1 | GIN 40ep s1 | FNF s1 | FNF s2 |
+|----------|------------:|------------:|-------:|-------:|
+| raw only | 0.009 / 0.009 | (same) | (same) | (same) |
+| morph only | 0.114 / 0.064 | (same) | (same) | (same) |
+| **raw+morph** | 0.136 / 0.066 | (same) | (same) | (same) |
+| embedding only | 0.259 / 0.213 | **0.292 / 0.199** | 0.236 / 0.179 | 0.206 / 0.137 |
+| embedding+raw | 0.274 / 0.244 | 0.269 / **0.316** | 0.256 / 0.223 | 0.230 / 0.221 |
+| **embedding+raw+morph** | 0.298 / 0.276 | 0.262 / 0.264 | **0.319 / 0.276** | 0.262 / 0.243 |
+
+(F1 / AUPRC per cell; val-tuned threshold.)
+
+**Takeaway:** engineered **raw+morph alone caps ~0.14 F1**; SSL embeddings are necessary for strong probes. **FNF seed1** remains best on the standard full stack. GIN **40 ep + `embedding+raw`** is a **seed-sensitive scout** (seed2 **0.346 F1** @ `cw=model`, C=1.0; see [Jul 2 sweep](#40-ep-targeted-probe-sweep-jul-2)).
+
+### Architecture sweep (emlps+tds, shared probe weights)
+
+GIN / GAT / PNA / RGCN @ 20 ep, seed 1; apples-to-apples reprobe with `--class_weight model --model gin`. **GIN best on AUPRC** (0.213); GAT closest on F1 (0.264); PNA/RGCN weaker on F1 despite competitive AUROC.
+
+`results/diagnostics/architecture_sweep_shared_probe_weights.json` · Does not overwrite `embeddings/*/probe_results.json`.
+
+---
+
+## Current protocol: emlps + tds + interventions (Jun 26)
+
+Fair comparison: same recipe as emlps+tds baseline, plus **one** intervention. GPU Slurm: `slurm/ablation_same_pair_fnf_emlps_tds_asym_proj_8192neg_queue0_20ep.sh`, `slurm/ablation_degree_aware_edgedrop_emlps_tds_asym_proj_8192neg_queue0_20ep.sh`.
+
+### Embedding-only linear probe
+
+| Run | `unique_name` | AUROC | AUPRC | F1 | Δ vs emlps+tds s1 |
+|-----|---------------|------:|------:|---:|-------------------|
+| emlps+tds s1 (reference) | `hi_contrastive_gin_emlps_tds_proj_asym_8192neg_queue0_accum4_20ep` | 0.944 | 0.213 | 0.259 | — |
+| + `same_pair` FNF | `same_pair_fnf_emlps_tds_asym_proj_8192neg_queue0_20ep` | 0.942 | 0.178 | 0.241 | −0.002 / −0.035 / −0.019 |
+| + `degree_aware` edge drop | `degree_aware_edgedrop_emlps_tds_asym_proj_8192neg_queue0_20ep` | 0.926 | 0.152 | 0.240 | −0.018 / −0.061 / −0.019 |
+
+**Embedding-only takeaway:** plain emlps+tds seed 1 wins. Interventions that helped on the legacy stack do not add value here.
+
+### Current-protocol probe feature ablation (Jun 27, refreshed Jun 29)
+
+CPU ablation on frozen embeddings (`slurm/run_probe_feature_ablation_final_protocol_new_embeddings.sh`). Compares `embedding`, `embedding+raw`, `embedding+raw+morph`:
+
+| Run | embedding | embedding+raw | embedding+raw+morph |
+|-----|----------:|--------------:|--------------------:|
+| emlps+tds baseline | 0.259 / 0.213 AUPRC | 0.274 / 0.244 | 0.298 / **0.276** |
+| **FNF + emlps+tds** | 0.236 / 0.179 | 0.256 / 0.223 | **0.319 / 0.276** |
+| degree-aware + emlps+tds | 0.240 / 0.153 | 0.238 / 0.238 | 0.291 / 0.253 |
+
+(F1 / AUPRC per cell; val-tuned threshold.)
+
+**Full-stack takeaway:** **FNF + emlps+tds + `embedding+raw+morph`** is the current best downstream recipe (**0.319 F1**, **0.959 AUROC**, AUPRC tied with emlps+tds full stack). Degree-aware full stack has weak calibration (thr **0.70**, F1@0.5 **0.207**).
+
+JSON: `results/diagnostics/probe_feature_ablation_final_protocol_comparison.json` (legacy name) · Current 6-mode table: [`probe_feature_ablation_current_protocol_comparison.md`](probe_feature_ablation_current_protocol_comparison.md)
+
+### emlps+tds seed replicates (Jun 27)
+
+Plain emlps+tds baseline, embedding-only probe (`slurm/ablation_emlps_tds_asym_proj_8192neg_queue0_20ep_seed3.sh`):
+
+| Seed | AUROC | AUPRC | F1 | F1@0.5 | Best ep |
+|------|------:|------:|---:|-------:|--------|
+| 1 | 0.944 | **0.213** | **0.259** | 0.257 | 19 |
+| 2 | 0.925 | 0.142 | 0.208 | 0.226 | 14 |
+| 3 | 0.921 | 0.124 | 0.157 | 0.160 | 18 |
+| **mean ± range** | 0.930 | 0.160 | 0.208 | — | — |
+
+Report seed 1 as best case; cite variance when generalizing emlps+tds embedding-only numbers.
+
+### Morphology expert + emlps+tds (current protocol, Jun 27)
+
+`degree_fan` only, `--morph_expert_weight 0.05`, emlps+tds graph stack (`slurm/ablation_morph_expert_emlps_tds_asym_proj_8192neg_queue0_20ep.sh`). Probes **morph-val best** and **last epoch**:
+
+| Checkpoint | Ep | AUROC | AUPRC | F1 | F1@0.5 | Note |
+|------------|---:|------:|------:|---:|-------:|------|
+| morph-val best | **1** | 0.927 | 0.104 | 0.187 | 0.213 | **do not report** |
+| **last epoch** | 20 | 0.947 | 0.184 | **0.288** | 0.283 | fair SSL morph read |
+
+Last-epoch morph SSL (0.288 F1) **beats** emlps+tds seed-1 embedding-only on F1 but **loses** to probe-time morph on plain emlps+tds (0.298) or FNF (0.319). Morph-val `best` checkpoint policy remains misleading at w=0.05.
+
+Artifacts: `embeddings/morph_expert_emlps_tds_asym_proj_8192neg_queue0_20ep/probe_results.json` (best) · `embeddings/morph_expert_emlps_tds_asym_proj_8192neg_queue0_20ep_lastckpt_probe/probe_results_lastckpt.json` (last)
 
 ---
 
 ## Small-HI SSL benchmark (linear probe, val-tuned F1, GIN hetero)
 
+For **AUPRC** on headline runs, see [key runs leaderboard](#key-runs-leaderboard-jun-26--jul-2). Table below is AUROC / F1 unless noted.
+
 | Run | Config | Epochs | Test AUROC | Test F1 |
 |-----|--------|--------|------------|---------|
-| Contrastive + proj, **8192 negs, no queue** | asym; `queue=0`; `bs=8192 accum=4` | 20 → **ep 19** | **0.951** | **0.233** |
+| Contrastive + proj, **8192 negs, no queue** | asym; `queue=0`; `bs=8192 accum=4`; **GINe**; `--reverse_mp --ego --ports` | 20 → **ep 19** | **0.951** | **0.233** |
+| Contrastive + proj, **`--emlps --tds` (seed 1)** | full Multi-GNN stack; else same | 20 → **ep 19** | 0.944 | **0.259** |
+| Contrastive + proj, **`--emlps --tds` (seed 3)** | final-protocol replicate | 20 → **ep 18** | 0.921 | 0.157 |
+| Contrastive + proj, **`--emlps --tds` + same_pair FNF** | final protocol; FNF only | 20 → **ep 19** | 0.942 | 0.241 |
+| Contrastive + proj, **`--emlps --tds` + degree_aware** | final protocol; edge drop only | 20 → **ep 20** | 0.926 | 0.240 |
+| Contrastive + proj, **morph expert + emlps+tds** | `degree_fan` w=0.05; **last ep** probe | 20 → **ep 20** | 0.947 | **0.288** |
+| Contrastive + proj, **`--emlps --tds` (seed 2)** | same; `--seed 2` | 20 → **ep 14** | 0.925 | 0.209 |
+| Contrastive + proj, **`--tds` only** | `+tds`; no `--emlps` | 20 → **ep 20** | 0.940 | 0.233 |
+| Contrastive + proj, **`--emlps` only** | `+emlps`; no `--tds` | 20 → **ep 20** | 0.915 | 0.188 |
+| Contrastive + proj, **baseline LR, h=128** | `--override_n_hidden 128`; else baseline | 20 → **ep 20** | 0.939 | 0.153 |
+| Contrastive + proj, **baseline LR, final_dropout=0** | `--override_final_dropout 0.0`; else baseline | 20 → **ep 18** | 0.945 | 0.213 |
+| Contrastive + proj, **LR 0.003, h=66** | `--override_lr 0.003 --override_n_hidden 66`; else same | 20 → **ep 20** | 0.932 | 0.212 |
+| Contrastive + proj, **LR 0.003, h=128** | `--override_lr 0.003 --override_n_hidden 128`; else same | 20 → **ep 19** | 0.940 | 0.205 |
+| Contrastive + proj, **PNA encoder** | same recipe; `--model pna`; `mit_preemptable` | 20 → **ep 20** | 0.942 | 0.186 |
+| **Masked edge reconstruction (seed 1)** | `--objective masked_edge`; GINe; mask rate 0.15; zero tokens | 20 → **ep 20** | 0.932 | **0.241** |
+| Masked edge reconstruction (seed 2) | same; `--seed 2` | 20 → **ep 14** | 0.943 | 0.131 |
+| Masked edge reconstruction (40 ep, seed 1) | same; 40 ep | 40 → **ep 29** | 0.925 | 0.166 |
+| Contrastive + proj + **masked-edge aux** | asym; 8192 negs; `queue=0`; `masked_edge_aux_weight=0.1` | 20 → **ep 20** | 0.951 | 0.239 |
 | Contrastive + proj, **`degree_aware` edge drop** | asym; 8192 negs; `queue=0`; `--edge_drop_policy degree_aware` | 20 → **ep 18** | 0.949 | **0.237** |
 | Contrastive + proj, **`degree_aware` + same-pair FNF** | asym; 8192 negs; `queue=0`; mean over 2 seeds | 20 | 0.939 | 0.168 |
 | Contrastive + proj, **`degree_flow_aware` edge drop** | asym; 8192 negs; `queue=0`; `--edge_drop_policy degree_flow_aware` | 20 → **ep 20** | 0.947 | 0.234 |
@@ -68,333 +317,7 @@ More detail: [`morphology-metrics-plan.md`](morphology-metrics-plan.md) · typol
 
 ---
 
-## Queue and negative ablations (Small-HI)
+## Historical ablations (archived)
 
-Frozen linear probe after asym contrastive + projection, 8192 negatives, `bs=8192`, `accum=4`, 20 epochs.
+Older ablations that predate the current comparison protocol — queue/negative sweeps, feature-KNN, edge-drop, PNA/RGCN swaps, masked-edge reconstruction, morphology target-group scouts, label-efficiency, and PaySim transfer — now live in [`results-archive.md`](results-archive.md). Kept for provenance and negative-result history.
 
-| Queue size | Test AUROC | Test F1 | Precision | Recall |
-|------------|------------|---------|-----------|--------|
-| `0` | **0.951** | **0.233** | **0.209** | 0.263 |
-| `8192` | 0.923 | 0.167 | 0.110 | **0.348** |
-| `16384` | 0.930 | 0.165 | 0.117 | 0.282 |
-| `32768` | 0.929 | 0.179 | 0.123 | 0.330 |
-| `65536` | 0.922 | 0.143 | 0.102 | 0.238 |
-| `131072` | 0.915 | 0.148 | 0.119 | 0.194 |
-
-Interpretation: the queue increases contrastive difficulty but does not improve downstream probe quality in this setup. Prefer `--contrastive_memory_bank_size 0` for the current asym + projection recipe unless explicitly testing queue behavior.
-
-### No-queue seed averages
-
-| Mode | Mean AUROC | Mean F1 | Mean precision | Mean recall | Note |
-|------|------------|---------|----------------|-------------|------|
-| no filter | **0.946** | 0.216 | 0.168 | 0.319 | AUROC baseline |
-| `same_pair` | 0.942 | **0.236** | **0.176** | **0.359** | leading filter candidate |
-| `same_receiver` | 0.944 | 0.193 | 0.147 | 0.349 | unstable across seeds |
-| `same_endpoint` | 0.938 | 0.240 | 0.203 | 0.297 | mixed replication; seed 1 was high |
-
-`same_pair` is the cleanest false-negative filter so far: it improves mean F1/recall over no-filter while preserving most AUROC. `same_receiver` produced one strong AUROC run but was unstable; `same_endpoint` improved precision/F1 on average but did not cleanly replicate the seed-1 jump.
-
-### Larger negative / queue scouts with filtering
-
-| Run | Test AUROC | Test F1 | Precision | Recall | Interpretation |
-|-----|------------|---------|-----------|--------|----------------|
-| `same_pair`, `queue=32768` | 0.935 | 0.185 | 0.142 | 0.266 | queue still hurts |
-| `same_receiver`, `queue=32768` | 0.916 | 0.108 | 0.066 | 0.284 | queue hurts strongly |
-| `same_pair`, `10240` negs, `queue=0` | 0.938 | 0.156 | 0.105 | 0.309 | more negatives hurt |
-| `same_receiver`, `10240` negs, `queue=0` | 0.929 | 0.213 | 0.192 | 0.239 | no clear benefit |
-
-The direct `12288` run at `bs=8192 accum=4` OOMed even with `queue=0`; reducing to `bs=4096 accum=8` made it fit but did not improve metrics. Current evidence favors `8192` negatives, `queue=0`, and optional `same_pair` filtering.
-
-### Temperature sweep
-
-All runs use asym contrastive + projection, 8192 negatives, `queue=0`,
-`bs=8192`, `accum=4`, seed 1.
-
-| Temperature | Test AUROC | Test F1 | Precision | Recall | Interpretation |
-|-------------|------------|---------|-----------|--------|----------------|
-| `0.05` | 0.898 | 0.103 | 0.070 | 0.189 | too sharp |
-| `0.10` | 0.933 | 0.139 | 0.092 | 0.289 | below baseline |
-| `0.20` | 0.942 | 0.198 | 0.149 | 0.299 | closest lower-temp run |
-| `0.50` | **0.951** | **0.233** | **0.209** | 0.263 | current default/best |
-
-Lower temperatures improved neither AUROC nor F1. Retain
-`--contrastive_temperature 0.5` for the current best recipe.
-
-### Symmetric memory rescue
-
-Symmetric + projection with `8192` negatives, `queue=0`, `bs=4096`, and
-`accum=8` fit without OOM, but underperformed the asym baseline
-(0.931 AUROC / 0.161 F1). This is a viable fit recipe, not a current winner.
-
-### Morphology target-group scouts (Small-HI)
-
-Targeted morphology runs keep the current **asym contrastive + projection**
-backbone (8192 negs, `queue=0`, `bs=8192 accum=4`, temp 0.5) and restrict the
-shared expert head with `--morph_target_groups`. Default training uses
-`--checkpoint_policy best` on morphology val loss (not AML probe). Artifacts:
-`embeddings/{unique_name}/probe_results.json` (morph-val best checkpoint).
-
-**No-morph references:** no filter **0.951 / 0.233** · `same_pair` filter
-**~0.949 / 0.255** (best seed).
-
-**Last-epoch reprobe:** CPU jobs copy `checkpoint_{run}_last.tar` and extract
-under `{run}_lastckpt_probe` (`slurm/run_morph_lastckpt_extract_probe.sh`).
-Summary: `python scripts/summarize_morph_ckpt_probe_comparison.py`.
-
-#### Semantic groups @ w=0.05 (Jun 22, morph-val best checkpoint)
-
-Slurm: `slurm/ablation_morph_degree_fan_only_asym_proj_20ep.sh`,
-`slurm/ablation_morph_semantic_group_scout_10ep.sh`.
-
-| Run | Groups | Ep | Weight | Test AUROC | Test F1 | Prec | Recall | Note |
-|-----|--------|----|--------|------------|---------|------|--------|------|
-| `motif_participation` only | 3 triangle targets | 9 | 0.05 | **0.937** | **0.190** | **0.173** | 0.211 | best AUROC among semantic scouts |
-| `flow_balance` only | 10 amount targets | 9 | 0.05 | 0.930 | 0.157 | 0.109 | 0.279 | viable; recall-leaning |
-| `degree_fan` only | degrees + global lift | 11 | 1.0 | 0.929 | 0.149 | 0.097 | 0.325 | 20 ep; F1 below 10 ep scout |
-| `degree_fan` only | degrees + global lift | 1 | 0.05 | 0.902 | 0.090 | 0.055 | 0.238 | morph-val best ep 1; see last-epoch row |
-
-#### w=1.0 scouts @ 10 ep (Jun 22–23)
-
-| Run | Ckpt | Ep | Test AUROC | Test F1 | Note |
-|-----|------|----|------------|---------|------|
-| `motif_participation` | morph-val best | 3 | 0.894 | 0.044 | misleading; use last epoch |
-| `motif_participation` | **last** | 10 | 0.925 | 0.128 | +0.084 F1 vs best; still below w=0.05 |
-| `flow_balance` | best = last | 10 | 0.929 | 0.183 | same weights at final epoch |
-| `flow_balance` | last reprobe | 10 | 0.929 | 0.183 | confirms best = last |
-
-**Prefer w=0.05** for both groups. **Motif @ w=1.0:** morph-val best is unusable;
-last epoch is recoverable but still trails **motif @ w=0.05 last** (0.937 / 0.198).
-**Flow @ w=1.0:** viable when best equals final epoch; similar to w=0.05.
-
-#### Morph-val best vs last epoch (Jun 22–23 reprobe)
-
-`--checkpoint_policy best` minimizes morphology expert val MSE, not AML probe
-quality. Low `morph_expert_weight` can lock to early epochs when morph val is
-low but the encoder is under-trained.
-
-| Run | Morph-val best (ep) | AUROC / F1 | Last epoch (ep) | AUROC / F1 | Δ F1 |
-|-----|---------------------|------------|-----------------|------------|------|
-| `degree_fan` 20 ep, w=0.05 | ep 1 | 0.902 / 0.090 | ep 20 | **0.943 / 0.199** | **+0.110** |
-| `degree_fan` 20 ep, w=1.0 | ep 11 | **0.929** / 0.149 | ep 20 | 0.915 / 0.150 | +0.001 |
-| `motif_participation` 10 ep, w=0.05 | ep 9 | 0.937 / 0.190 | ep 10 | 0.937 / **0.198** | +0.008 |
-| `motif_participation` 10 ep, w=1.0 | ep 3 | 0.894 / 0.044 | ep 10 | **0.925 / 0.128** | **+0.084** |
-| `flow_balance` 10 ep, w=0.05 | ep 9 | 0.930 / 0.157 | ep 10 | **0.932 / 0.174** | +0.017 |
-| `flow_balance` 10 ep, w=1.0 | ep 10 | 0.929 / 0.183 | ep 10 | 0.929 / 0.183 | ~0 |
-
-Last-epoch probes: `embeddings/{run}_lastckpt_probe/probe_results_lastckpt.json`.
-
-**Takeaways:**
-
-1. **Checkpoint policy matters** — for w=0.05 scouts, last epoch is as good or
-   better on downstream F1; `degree_fan` 20 ep w=0.05 morph-val best (ep 1)
-   is misleading (+0.11 F1 at last epoch).
-2. **`motif_participation` @ w=0.05** — strongest semantic-group scout
-   (0.937–0.938 AUROC, ~0.19–0.20 F1). **Motif @ w=1.0** morph-val best fails
-   (ep 3); last epoch (0.925 / 0.128) is better but still below w=0.05.
-3. **`flow_balance` @ w=0.05** — learnable; last epoch 0.932 / 0.174. **Flow @
-   w=1.0** matches final epoch (0.929 / 0.183); similar to w=0.05.
-4. **Best morphology F1** remains **`degree_fan` 10 ep, w=1.0** (0.208). Best
-   morphology **AUROC** in targeted scouts is **`degree_fan` 20 ep w=0.05 last**
-   (0.943) — still below no-morph baseline (0.951).
-5. **All targeted morphology runs remain below** no-morph baseline and
-   `same_pair` filtering on headline metrics.
-
-#### Coarse grouping (Jun 2026, 10 ep, w=1.0)
-
-Earlier scouts used legacy group names before the semantic registry split:
-
-| Target groups | Test AUROC | Test F1 | Precision | Recall | Note |
-|---------------|------------|---------|-----------|--------|------|
-| `degree_fan` | 0.921 | **0.208** | 0.151 | 0.333 | **best morphology F1** |
-| `local_motif` (legacy) | 0.909 | 0.105 | 0.067 | 0.243 | weak coarse bucket |
-| `degree_fan,local_motif` | 0.922 | 0.049 | 0.027 | 0.253 | AUROC ok; F1 collapse |
-
-#### Group loss diagnostics
-
-`morph_group_diag_full_10ep` verified per-group MSE logging on the full M1b
-expert (0.934 AUROC / 0.079 F1 — logging check only). Final group MSEs were
-lowest for temporal/other and highest for the legacy `local_motif` bucket.
-
-Group registry and flags: [`morphology-reference.md`](morphology-reference.md).
-
-### Feature-KNN (Small-HI)
-
-Offline sparse caches from `scripts/precompute_transaction_knn.py` support
-**negative exclusion** (`--enable_knn_negative_filter`) or **soft positives**
-(`--enable_knn_soft_positives`). How-to: [`knn-precompute-reference.md`](knn-precompute-reference.md).
-
-#### Precompute
-
-| Stage | Status | Note |
-|-------|--------|------|
-| CPU sklearn (full train) | too slow | ~70h estimate; 6h Slurm insufficient |
-| GPU smoke 100k rows | **done** | `torch_gpu`, ~21s |
-| GPU full train k=15 | **done** | ~8m; 3,248,921 rows; 0 self-neighbors; mean sim **0.991** |
-
-Full cache: `morphology_cache/Small-HI/transaction_knn_edge_native_degree_fan_k15.npz`
-
-#### Training ablation (Jun 23)
-
-Same backbone as no-filter baseline: asym + projection, 8192 negs, `queue=0`,
-`bs=8192 accum=4`, temp 0.5, seed 1, 20 ep. Slurm:
-`slurm/ablation_knn_filter_k5_asym_proj_8192neg_queue0_20ep.sh`,
-`slurm/ablation_knn_filter_k15_asym_proj_8192neg_queue0_20ep.sh`.
-
-| Run | `--knn_filter_k` | Test AUROC | Test F1 | Prec | Recall |
-|-----|------------------|------------|---------|------|--------|
-| No filter (baseline) | — | **0.951** | **0.233** | 0.209 | 0.263 |
-| KNN exclusion | 5 | 0.947 | 0.209 | 0.171 | 0.268 |
-| KNN exclusion | 15 | 0.928 | 0.176 | 0.132 | 0.264 |
-
-**Why it barely bites:** with 8192 negatives sampled from ~3.25M train edges, only
-**~1%** (k=5) or **~3%** (k=15) of anchors had any cached neighbor in the sampled
-pool per epoch; `fallback_rows=0`. Exclusion removes at most ~0.0005% of candidate
-slots — too sparse to help, and may drop useful hard negatives when it fires.
-
-**Exclusion takeaway:** do **not** adopt random-sampling + feature-KNN exclusion for the
-current best recipe. Prefer `--false_neg_filter_mode same_pair` for F1/recall.
-Revisit exclusion only with structured negative pools where overlap is guaranteed.
-
-#### KNN soft positives (Jun 24)
-
-GCPAL-style **low-weight KNN positives** in the InfoNCE numerator (identity stays
-weight `1.0`). Positives are injected via an auxiliary seed forward pass — not
-batch-overlap-only. Slurm: `slurm/ablation_knn_softpos_m1_w0025_asym_proj_8192neg_queue0_20ep.sh`
-(`m=1`, `w=0.025`, job 16426890). `m=3` script exists but was **not** run.
-
-| Run | Test AUROC | Test F1 | Prec | Recall | Note |
-|-----|------------|---------|------|--------|------|
-| No filter (baseline) | **0.951** | **0.233** | 0.209 | 0.263 | — |
-| Soft-pos `m=1`, `w=0.025` | 0.849 | 0.067 | 0.041 | 0.182 | best ep 19 |
-
-Training logs showed **~99% mean similarity** to injected neighbors (saturated
-`edge_native+degree_fan` cache) and ~50% slower epochs vs no-KNN runs. Loss fell
-to ~1.2 (vs ~7.0 on comparable runs) without better probe geometry.
-
-**Soft-positive takeaway:** do **not** use feature-KNN soft positives with the
-current cache. Neighbors are near-duplicates in raw feature space and pull
-embeddings toward superficial transaction similarity. Pause this path unless
-neighbor design changes (sparser/diverse positives, much lower weight, or
-structure-based similarity — not raw feature KNN). Audit:
-`python scripts/audit_transaction_knn_cache.py --data Small-HI --max_rows 50000`.
-
-### Edge-drop augmentations (Small-HI)
-
-Label-free, train-split-only edge-drop policies for contrastive views (default
-`--edge_drop_policy random` unchanged). Precompute:
-`scripts/precompute_edge_drop_scores.py` · audit:
-`scripts/audit_edge_drop_scores.py` · flags: [`cli-reference.md`](cli-reference.md).
-
-#### Training ablation (Jun 24)
-
-Same backbone as no-filter baseline: asym + projection, 8192 negs, `queue=0`,
-`bs=8192 accum=4`, temp 0.5, seed 1, 20 ep, `--edge_drop_target_rate 0.1`,
-`--edge_drop_importance_alpha 2.0`. Slurm:
-`slurm/ablation_degree_aware_edgedrop_asym_proj_8192neg_queue0_20ep.sh`,
-`slurm/ablation_degree_flow_aware_edgedrop_asym_proj_8192neg_queue0_20ep.sh`
-(jobs 16455755 / 16455756).
-
-| Run | Best ep | Test AUROC | Test F1 | Prec | Recall | Note |
-|-----|---------|------------|---------|------|--------|------|
-| Random drop (baseline) | 19 | **0.951** | 0.233 | 0.209 | 0.263 | — |
-| **`degree_aware`** | 18 | 0.949 | **0.237** | 0.198 | **0.297** | +F1/recall, −AUROC |
-| **`degree_flow_aware`** | 20 | 0.947 | 0.234 | 0.207 | 0.269 | ≈ baseline |
-| FNF `same_pair` seed 1 (ref) | — | 0.946 | 0.240 | 0.175 | 0.383 | stronger F1/recall tradeoff |
-
-**Policy telemetry (epoch 1 buckets, stable across training):** global cache mean
-drop prob **≈ 0.10** as intended. Per-batch realized drops were nonuniform:
-
-- **`degree_aware`:** low-degree p0–20 **~1%** drop; high-degree p80–100 **~32%** drop.
-- **`degree_flow_aware`:** high-amount p80–100 **~7%** drop (preserved); low-amount
-  p0–20 **~23%** drop.
-
-Training loss at best (**~7.06**) matched random-drop / KNN-filter runs. Wall clock
-**~1.5 h** per job (incl. precompute + extract + probe).
-
-**Takeaway:** do **not** replace the AUROC baseline — neither policy beats **0.951**.
-**`degree_aware`** is the only promising variant here: small **F1 +0.004** and
-**recall +0.034** with **AUROC −0.002** (mild FNF-like tradeoff). **`degree_flow_aware`**
-did not improve on degree-only. Combining **`degree_aware`** with **`same_pair` FNF**
-was tested and **failed** — see [below](#degree_aware-edge-drop--same_pair-fnf-small-hi).
-Per-view realized drop in epoch logs is **~0.16** on sampled batches (fixed Jun 24;
-old headline `realized_v1≈0.58` was a logging bug). Bucket logs above are authoritative.
-
-#### `degree_aware` edge drop + `same_pair` FNF (Small-HI)
-
-Stack test: nonuniform **view corruption** (`degree_aware`) plus **negative-pool
-hygiene** (`--false_neg_filter_mode same_pair`). Same backbone otherwise: asym +
-projection, 8192 negs, `queue=0`, `bs=8192 accum=4`, temp 0.5, 20 ep,
-`--edge_drop_target_rate 0.1`, `--edge_drop_importance_alpha 2.0`. Slurm:
-`slurm/ablation_degree_aware_edgedrop_samepair_fnf_asym_proj_8192neg_queue0_20ep.sh`
-(seed 1),
-`slurm/ablation_degree_aware_edgedrop_samepair_fnf_seed2_asym_proj_8192neg_queue0_20ep.sh`
-(seed 2).
-
-| Run | Best ep | Test AUROC | Test F1 | Prec | Recall | Note |
-|-----|---------|------------|---------|------|--------|------|
-| Random drop (baseline, seed 1) | 19 | **0.951** | 0.233 | **0.209** | 0.263 | AUROC ref |
-| **`degree_aware`** only (seed 1) | 18 | 0.949 | **0.237** | 0.198 | 0.297 | parent |
-| **`same_pair` FNF** only (seed 1) | — | 0.946 | 0.240 | 0.175 | **0.383** | parent |
-| **`same_pair` FNF** only (seed 2) | — | 0.949 | **0.255** | 0.189 | **0.394** | parent |
-| **Combined** (seed 1) | 20 | 0.933 | 0.119 | 0.079 | 0.235 | large val→test F1 gap |
-| **Combined** (seed 2) | 16 | 0.945 | 0.217 | 0.172 | 0.294 | below both parents |
-| **Combined mean** (seeds 1–2) | — | 0.939 | 0.168 | 0.126 | 0.265 | — |
-
-Training telemetry looked normal: contrastive loss **~7.056** at best (same as
-degree-aware-only), FNF removal **~0.01%** with `fallback_rows=0`, degree buckets
-unchanged (p0–20 **~1%** drop, p80–100 **~32%**). Problem is downstream embedding
-geometry, not misconfigured flags.
-
-**Stack takeaway:** interventions **do not combine**. Seed 1 collapsed (precision
-**0.079**); seed 2 was more stable but still below both parents on every metric.
-Use **`degree_aware`** or **`same_pair` FNF** alone — not both. High seed variance
-on the combined recipe; no further combined seeds unless the design changes (e.g.
-weaker drop policy or softer FNF).
-
-### Multi-positive InfoNCE scouts
-
-Multi-positive runs use weak endpoint/pair positives in the InfoNCE numerator;
-identity positives remain weight `1.0`.
-
-| Run | Test AUROC | Test F1 | Precision | Recall | Interpretation |
-|-----|------------|---------|-----------|--------|----------------|
-| `same_pair`, weight `0.1`, mean seeds 1–3 | 0.938 | 0.153 | 0.114 | 0.236 | weak |
-| `same_pair`, weight `0.02`, seed 1 | 0.943 | 0.108 | 0.066 | 0.292 | too weak/noisy |
-| `same_pair`, weight `0.05`, seed 1 | 0.944 | 0.224 | 0.183 | 0.287 | improved, still below filter |
-| `same_receiver`, weight `0.1`, mean seeds 1–3 | 0.940 | 0.203 | 0.156 | 0.298 | below no-filter |
-
-Endpoint/pair relationships appear more useful as **negative-exclusion rules**
-than as weak positives in the numerator. If revisiting multi-positive InfoNCE,
-start from a smaller and more targeted design rather than combining it with
-queues or larger negative counts.
-
----
-
-## Label-efficiency (Small-HI)
-
-Stratified train-label fractions; threshold tuned on full val. Source: `embeddings/label_efficiency_summary.json`.
-
-| Train labels | sym+proj | 8192neg+proj | clustering+proj | M1b+proj | Contrastive+proj |
-|--------------|----------|--------------|-----------------|----------|------------------|
-| 10% | **0.924** | 0.917 | 0.916 | 0.918 | 0.906 |
-| 25% | **0.926** | 0.922 | **0.926** | 0.922 | 0.918 |
-| 50% | 0.929 | **0.931** | 0.930 | 0.919 | 0.925 |
-| 100% | 0.929 | **0.931** | 0.929 | 0.922 | 0.928 |
-
-Full tables: [`morphology-metrics-plan.md` § Label-efficiency](morphology-metrics-plan.md).
-
----
-
-## PaySim transfer (external fraud)
-
-Frozen GIN extract + linear probe on ~6.36M edges. Canonical probe: `--class_weight model`.
-
-| Encoder | Threshold | Test AUROC | Test F1 |
-| ------- | --------- | ---------- | ------- |
-| `hi_contrastive_proj_sym_20ep_bestckpt` | val-tuned | **0.866** | 0.089 |
-| `hi_contrastive_proj_sym_20ep_bestckpt` | fixed 0.5 | **0.864** | **0.127** |
-| `random_init_gin` | val-tuned / 0.5 | 0.730 | 0.135–0.143 |
-
-In-domain Small-HI (same encoder): AUROC **0.929**, F1 **0.222** @ val-tuned.
-
-Full tables and probe variants: [`downstream-eval-plan.md` § PaySim](downstream-eval-plan.md#paysim--status-jun-2026).

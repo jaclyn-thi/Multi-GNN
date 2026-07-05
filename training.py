@@ -11,7 +11,7 @@ Supervised paths retain original in-graph CE + F1 evaluation.
 
 import torch
 import tqdm
-from typing import Optional
+from typing import Dict, Optional
 from torch.cuda.amp import GradScaler, autocast
 from sklearn.metrics import f1_score
 from train_util import (
@@ -34,6 +34,7 @@ from train_util import (
     load_model,
     load_checkpoint_auxiliary_modules,
     validate_training_setup,
+    validate_masked_edge_args,
 )
 from models import GINe, PNA, GATe, RGCN
 from torch_geometric.data import Data, HeteroData
@@ -68,6 +69,12 @@ from morphology.expert import (
     setup_morph_tier0_contexts,
     setup_morph_tier0_flow_contexts,
     setup_morphology_expert,
+)
+from masked_edge import (
+    build_masked_edge_spec,
+    compute_masked_edge_loss,
+    prepare_masked_edge_batch,
+    setup_masked_edge_decoder,
 )
 import wandb
 import logging
@@ -935,6 +942,36 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                     )
                     loss_raw = loss_raw + morph_loss
                     morph_loss_sum = morph_loss_sum + morph_loss.detach()
+                aux_weight = float(getattr(args, "masked_edge_aux_weight", 0.0))
+                masked_decoder = getattr(args, "masked_edge_decoder", None)
+                masked_spec = getattr(args, "masked_edge_spec", None)
+                if aux_weight > 0.0 and masked_decoder is not None and masked_spec is not None:
+                    aux_batch = batch.clone()
+                    aux_gen = _masked_edge_generator(
+                        device, int(getattr(args, "masked_edge_seed", 1)), epoch, step
+                    )
+                    aux_batch, aux_state = prepare_masked_edge_batch(
+                        aux_batch,
+                        spec=masked_spec,
+                        seed_edge_ids=seed_edge_ids,
+                        is_hetero=True,
+                        generator=aux_gen,
+                        loader_data=tr_loader.data,
+                    )
+                    attach_edge_id_from_batch(aux_batch, tr_loader.data)
+                    with autocast(enabled=use_amp):
+                        aux_out = model(
+                            aux_batch.x_dict,
+                            aux_batch.edge_index_dict,
+                            aux_batch.edge_attr_dict,
+                        )
+                        z_aux = aux_out[FORWARD_EDGE_TYPE]
+                        z_aux_seed = z_aux[aux_state.seed_mask_fwd]
+                    with autocast(enabled=False):
+                        aux_loss, _ = compute_masked_edge_loss(
+                            z_aux_seed, aux_state, masked_decoder, masked_spec
+                        )
+                    loss_raw = loss_raw + aux_weight * aux_loss
             loss = loss_raw / float(accum_steps)
 
             if use_amp:
@@ -1007,6 +1044,193 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
     return model
 
 
+def _masked_edge_generator(device: torch.device, base_seed: int, epoch: int, step: int) -> torch.Generator:
+    gen = torch.Generator(device=device)
+    gen.manual_seed(int(base_seed) + epoch * 1_000_003 + step * 9_173)
+    return gen
+
+
+def _accumulate_masked_edge_logs(
+    accum: Dict[str, float],
+    loss_logs: Dict[str, float],
+    weight: int,
+) -> None:
+    for key, val in loss_logs.items():
+        accum[key] = accum.get(key, 0.0) + float(val) * weight
+
+
+def train_hetero_masked_edge(
+    tr_loader,
+    val_loader,
+    te_loader,
+    tr_inds,
+    val_inds,
+    te_inds,
+    model,
+    optimizer,
+    loss_fn,
+    args,
+    config,
+    device,
+    val_data,
+    te_data,
+    data_config,
+):
+    """Masked edge-attribute reconstruction on heterogeneous transaction graphs."""
+    del te_loader, tr_inds, val_inds, te_inds, loss_fn, te_data, val_loader, val_data
+    use_amp = bool(getattr(args, "amp", False)) and device.type == "cuda"
+    spec = args.masked_edge_spec
+    decoder = args.masked_edge_decoder
+    mask_seed = int(getattr(args, "masked_edge_seed", 1))
+    ckpt_tracker = CheckpointTracker(getattr(args, "checkpoint_policy", "last"))
+    if ckpt_tracker.policy == "best":
+        logging.info("Checkpoint policy: best (lowest loss/train)")
+
+    for epoch in range(config.epochs):
+        loss_sum = 0.0
+        total_seed_edges = 0
+        mask_rate_sum = {field: 0.0 for field in spec.fields}
+        loss_accum: Dict[str, float] = {}
+        n_batches = 0
+        for step, batch in enumerate(tqdm.tqdm(tr_loader, disable=not args.tqdm)):
+            optimizer.zero_grad(set_to_none=True)
+            seed_edge_ids = get_hetero_seed_edge_ids(batch, tr_loader.data)
+            batch.to(device, non_blocking=True)
+            gen = _masked_edge_generator(device, mask_seed, epoch, step)
+            batch, mstate = prepare_masked_edge_batch(
+                batch,
+                spec=spec,
+                seed_edge_ids=seed_edge_ids,
+                is_hetero=True,
+                generator=gen,
+                loader_data=tr_loader.data,
+            )
+            attach_edge_id_from_batch(batch, tr_loader.data)
+
+            with autocast(enabled=use_amp):
+                out = model(
+                    batch.x_dict,
+                    batch.edge_index_dict,
+                    batch.edge_attr_dict,
+                )
+                z = out[FORWARD_EDGE_TYPE]
+                z_seed = z[mstate.seed_mask_fwd]
+
+            with autocast(enabled=False):
+                loss, loss_logs = compute_masked_edge_loss(z_seed, mstate, decoder, spec)
+
+            loss.backward()
+            optimizer.step()
+
+            n_seed = int(mstate.seed_mask_fwd.sum().item())
+            if n_seed > 0:
+                loss_sum += float(loss.detach()) * n_seed
+                total_seed_edges += n_seed
+                _accumulate_masked_edge_logs(loss_accum, loss_logs, n_seed)
+            for field in spec.fields:
+                mask_rate_sum[field] += mstate.stats.get(f"mask_rate_{field}", 0.0)
+            n_batches += 1
+
+        avg_loss = loss_sum / max(total_seed_edges, 1)
+        log_payload = {
+            "loss/train": avg_loss,
+            "masked_edge/total": loss_accum.get("masked_edge/total", 0.0) / max(total_seed_edges, 1),
+        }
+        for field in spec.fields:
+            log_payload[f"masked_edge/{field}"] = (
+                loss_accum.get(f"masked_edge/{field}", 0.0) / max(total_seed_edges, 1)
+            )
+            log_payload[f"masked_edge/mask_rate_{field}"] = mask_rate_sum[field] / max(n_batches, 1)
+        logging.info(
+            "Epoch %s masked_edge loss/train=%.4f seed_edges=%s",
+            epoch + 1,
+            avg_loss,
+            total_seed_edges,
+        )
+        ckpt_tracker.on_epoch_end(epoch, log_payload, model, optimizer, args, data_config)
+        if ckpt_tracker.policy == "best":
+            log_payload["checkpoint/best_epoch"] = ckpt_tracker.best_epoch
+            log_payload["checkpoint/best_score"] = (
+                ckpt_tracker.best_score if ckpt_tracker.best_epoch >= 0 else float("nan")
+            )
+        wandb.log(log_payload, step=epoch)
+
+    ckpt_tracker.finalize(config.epochs - 1, model, optimizer, args, data_config)
+    return model
+
+
+def train_homo_masked_edge(
+    tr_loader,
+    val_loader,
+    te_loader,
+    tr_inds,
+    val_inds,
+    te_inds,
+    model,
+    optimizer,
+    loss_fn,
+    args,
+    config,
+    device,
+    val_data,
+    te_data,
+    data_config,
+):
+    """Masked edge-attribute reconstruction on homogeneous graphs."""
+    del te_loader, tr_inds, val_inds, te_inds, loss_fn, te_data, val_loader, val_data
+    use_amp = bool(getattr(args, "amp", False)) and device.type == "cuda"
+    spec = args.masked_edge_spec
+    decoder = args.masked_edge_decoder
+    mask_seed = int(getattr(args, "masked_edge_seed", 1))
+    ckpt_tracker = CheckpointTracker(getattr(args, "checkpoint_policy", "last"))
+
+    for epoch in range(config.epochs):
+        loss_sum = 0.0
+        total_seed_edges = 0
+        mask_rate_sum = {field: 0.0 for field in spec.fields}
+        loss_accum: Dict[str, float] = {}
+        n_batches = 0
+        for step, batch in enumerate(tqdm.tqdm(tr_loader, disable=not args.tqdm)):
+            optimizer.zero_grad(set_to_none=True)
+            seed_edge_ids = get_homo_seed_edge_ids(batch, tr_loader.data)
+            batch.to(device, non_blocking=True)
+            gen = _masked_edge_generator(device, mask_seed, epoch, step)
+            batch, mstate = prepare_masked_edge_batch(
+                batch,
+                spec=spec,
+                seed_edge_ids=seed_edge_ids,
+                is_hetero=False,
+                generator=gen,
+            )
+            attach_edge_id_from_batch(batch)
+            with autocast(enabled=use_amp):
+                z = model(batch.x, batch.edge_index, batch.edge_attr)
+                z_seed = z[mstate.seed_mask_fwd]
+            with autocast(enabled=False):
+                loss, loss_logs = compute_masked_edge_loss(z_seed, mstate, decoder, spec)
+            loss.backward()
+            optimizer.step()
+
+            n_seed = int(mstate.seed_mask_fwd.sum().item())
+            if n_seed > 0:
+                loss_sum += float(loss.detach()) * n_seed
+                total_seed_edges += n_seed
+                _accumulate_masked_edge_logs(loss_accum, loss_logs, n_seed)
+            for field in spec.fields:
+                mask_rate_sum[field] += mstate.stats.get(f"mask_rate_{field}", 0.0)
+            n_batches += 1
+
+        avg_loss = loss_sum / max(total_seed_edges, 1)
+        log_payload = {"loss/train": avg_loss}
+        for field in spec.fields:
+            log_payload[f"masked_edge/mask_rate_{field}"] = mask_rate_sum[field] / max(n_batches, 1)
+        ckpt_tracker.on_epoch_end(epoch, log_payload, model, optimizer, args, data_config)
+        wandb.log(log_payload, step=epoch)
+
+    ckpt_tracker.finalize(config.epochs - 1, model, optimizer, args, data_config)
+    return model
+
+
 def build_edge_adjacency(edge_index):
     """
     Builds edge-level adjacency matrix:
@@ -1063,11 +1287,13 @@ def get_model(sample_batch, config, args):
             n_hidden=round(config.n_hidden), edge_updates=args.emlps, edge_dim=e_dim,
             dropout=config.dropout, deg=deg, final_dropout=config.final_dropout
             )
-    elif config.model == "rgcn":
+    elif args.model == "rgcn":
+        num_relations = 2 if args.reverse_mp else 1
         model = RGCN(
-            num_features=n_feats, edge_dim=e_dim, num_relations=8, num_gnn_layers=round(config.n_gnn_layers),
+            num_features=n_feats, edge_dim=e_dim, num_relations=num_relations,
+            num_gnn_layers=round(config.n_gnn_layers),
             n_classes=2, n_hidden=round(config.n_hidden),
-            edge_update=args.emlps, dropout=config.dropout, final_dropout=config.final_dropout, n_bases=None #(maybe)
+            edge_update=args.emlps, dropout=config.dropout, final_dropout=config.final_dropout, n_bases=None
         )
 
     return model
@@ -1076,6 +1302,7 @@ def get_model(sample_batch, config, args):
 def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data_config):
     setup = resolve_training_setup(args)
     validate_training_setup(setup)
+    validate_masked_edge_args(args, setup)
     log_training_setup(setup, args)
 
     #set device
@@ -1099,7 +1326,11 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
             "lr": extract_param("lr", args),
             "n_hidden": extract_param("n_hidden", args),
             "n_gnn_layers": extract_param("n_gnn_layers", args),
-            "loss": "infonce" if setup.is_contrastive else "ce",
+            "loss": (
+                "infonce"
+                if setup.is_contrastive
+                else ("masked_edge" if setup.is_masked_edge else "ce")
+            ),
             "w_ce1": extract_param("w_ce1", args),
             "w_ce2": extract_param("w_ce2", args),
             "dropout": extract_param("dropout", args),
@@ -1141,6 +1372,12 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
             ),
             "morph_val_every": int(getattr(args, "morph_val_every", 1)),
             "morph_val_max_batches": int(getattr(args, "morph_val_max_batches", 0)),
+            "mask_edge_attr_rate": float(getattr(args, "mask_edge_attr_rate", 0.15)),
+            "mask_edge_attr_fields": getattr(args, "mask_edge_attr_fields", "amount,currency,payment_format"),
+            "mask_edge_attr_token_strategy": getattr(args, "mask_edge_attr_token_strategy", "zero"),
+            "masked_edge_decoder_hidden_dim": int(getattr(args, "masked_edge_decoder_hidden_dim", 128)),
+            "masked_edge_seed": int(getattr(args, "masked_edge_seed", 1)),
+            "masked_edge_aux_weight": float(getattr(args, "masked_edge_aux_weight", 0.0)),
         }
     )
 
@@ -1173,6 +1410,16 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
     proj_head = setup_contrastive_projection(args, device)
     args.contrast_projection_module = proj_head
     args._val_data_for_morph = val_data
+
+    args.masked_edge_spec = None
+    args.masked_edge_decoder = None
+    masked_edge_aux_weight = float(getattr(args, "masked_edge_aux_weight", 0.0))
+    if setup.is_masked_edge or masked_edge_aux_weight > 0.0:
+        spec = build_masked_edge_spec(tr_data, args, device=device)
+        args.masked_edge_spec = spec
+        embed_dim = int(getattr(model, "embedding_dim", 128))
+        decoder = setup_masked_edge_decoder(args, spec, device, embed_dim=embed_dim)
+        args.masked_edge_decoder = decoder
 
     need_tier0 = (
         (morph_cfg is not None and morph_cfg.include_global)
@@ -1207,6 +1454,12 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
             opt_params += list(morph_head.parameters())
         if proj_head is not None:
             opt_params += list(proj_head.parameters())
+        masked_decoder = getattr(args, "masked_edge_decoder", None)
+        if masked_decoder is not None:
+            opt_params += list(masked_decoder.parameters())
+        masked_spec = getattr(args, "masked_edge_spec", None)
+        if masked_spec is not None and masked_spec.learned_mask_tokens is not None:
+            opt_params += list(masked_spec.learned_mask_tokens.parameters())
         optimizer = torch.optim.Adam(opt_params, lr=config.lr)
     else:
         opt_params = list(model.parameters())
@@ -1214,6 +1467,12 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
             opt_params += list(morph_head.parameters())
         if proj_head is not None:
             opt_params += list(proj_head.parameters())
+        masked_decoder = getattr(args, "masked_edge_decoder", None)
+        if masked_decoder is not None:
+            opt_params += list(masked_decoder.parameters())
+        masked_spec = getattr(args, "masked_edge_spec", None)
+        if masked_spec is not None and masked_spec.learned_mask_tokens is not None:
+            opt_params += list(masked_spec.learned_mask_tokens.parameters())
         optimizer = torch.optim.Adam(opt_params, lr=config.lr)
 
     model.to(device)
@@ -1263,10 +1522,14 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
 
     if setup.is_hetero and setup.is_contrastive:
         model = train_hetero_contrastive(*train_kwargs)
+    elif setup.is_hetero and setup.is_masked_edge:
+        model = train_hetero_masked_edge(*train_kwargs)
     elif setup.is_hetero:
         model = train_hetero_supervised(*train_kwargs)
     elif setup.is_contrastive:
         model = train_homo_contrastive(*train_kwargs)
+    elif setup.is_masked_edge:
+        model = train_homo_masked_edge(*train_kwargs)
     else:
         model = train_homo_supervised(*train_kwargs)
 

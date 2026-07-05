@@ -154,3 +154,37 @@ def create_hetero_obj(x,  y,  edge_index,  edge_attr, timestamps, args):
     data['node', 'to', 'node'].timestamps = timestamps
     
     return data
+
+
+RGCN_REL_FORWARD = 0.0
+RGCN_REL_REVERSE = 1.0
+
+
+def rgcn_num_relations(reverse_mp: bool) -> int:
+    return 2 if reverse_mp else 1
+
+
+def _append_relation_column(edge_attr: torch.Tensor, relation_id: float) -> torch.Tensor:
+    col = torch.full(
+        (edge_attr.shape[0], 1),
+        relation_id,
+        dtype=edge_attr.dtype,
+        device=edge_attr.device,
+    )
+    return torch.cat([edge_attr, col], dim=1)
+
+
+def append_rgcn_relation_type(data, reverse_mp: bool):
+    """Append relation ids as the final edge feature column (not z-normalized)."""
+    if reverse_mp:
+        data['node', 'to', 'node'].edge_attr = _append_relation_column(
+            data['node', 'to', 'node'].edge_attr,
+            RGCN_REL_FORWARD,
+        )
+        data['node', 'rev_to', 'node'].edge_attr = _append_relation_column(
+            data['node', 'rev_to', 'node'].edge_attr,
+            RGCN_REL_REVERSE,
+        )
+    else:
+        data.edge_attr = _append_relation_column(data.edge_attr, RGCN_REL_FORWARD)
+    return data
