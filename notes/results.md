@@ -1,6 +1,6 @@
 # Development results (not frozen benchmarks)
 
-Quick-run numbers for internal comparison while configs and code still change. **Not** a formal evaluation protocol — numbers may change as the PI refines the stack.
+Quick-run numbers for internal comparison while configs and code still change. **Not** a formal evaluation protocol — numbers may change we refine the stack.
 
 **New to the repo?** Start with [Recommended configs](#recommended-configs-jun-2026), the [key runs leaderboard](#key-runs-leaderboard-jun-26--jul-2), and the [Small-LI scout](#small-li-current-protocol-scout-jul-2) if you care about dataset transfer. Deeper history is in sections below (not all runs use the same protocol).
 
@@ -23,6 +23,8 @@ Quick-run numbers for internal comparison while configs and code still change. *
 | Best **embedding-only F1** | **emlps+tds** (seed 2, **40 ep**) | 0.949 AUROC · 0.245 AUPRC · **0.307 F1** |
 | Best **`embedding+raw`** (scout) | **emlps+tds 40 ep seed2** @ `cw=model`, C=1.0 | 0.955 AUROC · 0.288 AUPRC · **0.346 F1** (F1@0.5 **0.339**) |
 | Best **full stack (`embedding+raw+morph`)** | **FNF + emlps+tds seed1** | **0.959** AUROC · **0.276 AUPRC** · **0.319 F1** |
+| Best **AUPRC (representation lever)** | **emlps+tds 40ep s2 + `raw`, `pre_embedding_3h`** | 0.960 AUROC · **0.321 AUPRC** · 0.344 F1 (extraction-only; see master note) |
+| Best **Small-LI legacy supervised** (paper_argmax) | **legacy head, 100 ep, seed 1** @ best-val ep 35 | 0.959 AUROC · **0.292 AUPRC** · **0.357 F1** (in-GNN; not frozen probe) |
 
 **Current protocol (Jun 26 – Jul 2):** **`same_pair` FNF** and **`degree_aware` edge drop** do **not** beat plain emlps+tds on **embedding-only** probes. **FNF seed1** still wins the standard full stack. **40 ep** improves mean embedding-only F1 (+0.5 pp vs 20 ep seed1) but **high seed variance** (seeds 3–4 weak). **`embedding+raw`** beats **`embedding+raw+morph`** on 3/4 GIN 40 ep seeds at shared probe settings (`cw=model`, C=1.0); mean F1 **0.273 ± 0.048** vs **0.248 ± 0.036** for full stack — but only seed2 reaches **0.35+ F1**. Details: [Jun 28–29 batch](#current-protocol-comparison-batch-jun-2829) · [40 ep probe sweep](#40-ep-targeted-probe-sweep-jul-2).
 
@@ -33,6 +35,10 @@ Quick-run numbers for internal comparison while configs and code still change. *
 **Label-efficiency:** sym+proj best @ **10%** labels (0.924 AUROC); 8192neg+proj best @ **50–100%** (0.931). See [label-efficiency](results-archive.md#label-efficiency-small-hi).
 
 **Morphology:** two distinct paths — (1) **probe-time** morph on frozen emlps+tds/FNF embeddings (**helps** FNF full stack up to 0.319 F1; **can hurt** GIN 40 ep full stack vs embedding-only); (2) **SSL morphology expert** during contrastive (**unreliable** with morph-val best ckpt; use last epoch if reporting). Legacy scouts: [`morphology scouts`](results-archive.md#morphology-target-group-scouts-small-hi).
+
+**Representation extraction lever (`pre_embedding_3h`):** every row in this doc probes the exported 128-d `post_embedding`. Probing the 198-d (`3×n_hidden`) tensor fed *into* `embedding_head` instead — same frozen checkpoint, `--representation_source pre_embedding_3h`, no retraining — is a **free ranking/alert-budget upgrade** for `embedding` and `embedding+raw` stacks. On **plain Small-LI SSL**, pre-3h wins AUPRC in **3/3 seeds** (mean ΔAUPRC +0.025 embedding-only, +0.029 +raw; see [`pre_embedding_3h_vs_post_embedding_small_li_multiseed.md`](pre_embedding_3h_vs_post_embedding_small_li_multiseed.md)). HI champion remains **40ep s2 + raw + pre-3h = 0.321 AUPRC**. Side-by-side: **[`strongest_runs_master_comparison.md`](strongest_runs_master_comparison.md)**.
+
+**Legacy supervised Small-LI (Jul 9):** formal 100-ep reproduction with Egressy `3h→50→25→2` head reaches test **paper_argmax F1 0.357** / AUPRC **0.292** at best-val epoch 35 (~2× the 20-ep scout). Final epoch collapses (F1=0) — use `checkpoint_best_val_f1.tar` only. Details: [`supervised_Small-LI_small_li_legacy_supervised_gin_emlps_tds_100ep_seed1_summary.md`](supervised_Small-LI_small_li_legacy_supervised_gin_emlps_tds_100ep_seed1_summary.md).
 
 **Closed / negative results:** feature-KNN; multi-positive InfoNCE; PNA/RGCN encoder swap (emlps+tds); symmetric contrastive scout (emlps+tds); SSL hyper sweep; `degree_aware` + FNF stack; degree-aware on emlps+tds (embedding-only); morph-expert SSL @ morph-val best. Details in linked sections.
 
@@ -65,8 +71,36 @@ Frozen linear probe unless noted. Probes use `--class_weight model --model gin` 
 | morph expert + emlps+tds (**last ep**) | 0.947 | 0.184 | 0.288 | 0.283 | fair morph-SSL read |
 | morph expert + emlps+tds (morph-val best) | 0.927 | 0.104 | 0.187 | 0.213 | **misleading** (ep 1) |
 | Masked-edge GINE 20 ep | 0.932 | 0.232 | 0.247 | 0.272 | best non-contrastive AUPRC |
+| **Legacy supervised LI** (100 ep, paper_argmax) | **0.959** | **0.292** | **0.357** | — | in-GNN; best-val ep 35; not frozen probe |
+| Legacy supervised LI scout (20 ep) | 0.944 | 0.191 | ~0.18–0.20 | — | scout only; superseded by 100 ep formal |
 
-Diagnostics: `results/diagnostics/linear_probe_auprc_summary.json` · Feature ablation (6 modes): [`probe_feature_ablation_current_protocol_comparison.md`](probe_feature_ablation_current_protocol_comparison.md) · Stack focus: [`probe_feature_ablation_current_protocol_stack_comparison.md`](probe_feature_ablation_current_protocol_stack_comparison.md) · **40 ep probe sweep:** [`probe_sweep_40ep_current_protocol.md`](probe_sweep_40ep_current_protocol.md) · Architecture sweep: `results/diagnostics/architecture_sweep_shared_probe_weights.md`
+Diagnostics: `results/diagnostics/linear_probe_auprc_summary.json` · Feature ablation (6 modes): [`probe_feature_ablation_current_protocol_comparison.md`](probe_feature_ablation_current_protocol_comparison.md) · Stack focus: [`probe_feature_ablation_current_protocol_stack_comparison.md`](probe_feature_ablation_current_protocol_stack_comparison.md) · **40 ep probe sweep:** [`probe_sweep_40ep_current_protocol.md`](probe_sweep_40ep_current_protocol.md) · **Small-LI pre-3h multiseed:** [`pre_embedding_3h_vs_post_embedding_small_li_multiseed.md`](pre_embedding_3h_vs_post_embedding_small_li_multiseed.md) · Architecture sweep: `results/diagnostics/architecture_sweep_shared_probe_weights.md`
+
+### Representation-source variants (`pre_embedding_3h`, same checkpoints/policy)
+
+Same frozen checkpoints and fair policy as above; only the extracted representation differs (198-d pre-`embedding_head` vs 128-d export). Full table + Small-LI: [`strongest_runs_master_comparison.md`](strongest_runs_master_comparison.md).
+
+| Run (Small-HI, best stack) | AUPRC post→pre | F1 post→pre | lift@100 post→pre |
+|-----|------:|------:|------:|
+| **emlps+tds 40ep s2, `+raw`** | 0.288 → **0.321** | 0.346 → 0.344 | 423 → **450** |
+| emlps+tds 40ep s2, `embedding` | 0.245 → **0.295** | 0.304 → **0.340** | 429 → 445 |
+| FNF s1, `+raw+morph` | 0.277 → **0.291** | 0.320 → 0.314 | 429 → 391 |
+| emlps+tds 40ep s1, `+raw` | **0.318** → 0.274 | 0.276 → 0.305 | 429 → 429 |
+
+(pre-3h wins AUPRC in 3/4 HI cells above; the 40ep s1 +raw cell is the exception. pre-3h is 198-d vs 128-d — a dimensionality confounder; read alongside AUROC/alert-budget.)
+
+**Small-LI plain GINe multiseed (seeds 1–3, paired pre vs post):**
+
+| Seed | stack | AUPRC post→pre | lift@100 post→pre |
+|-----:|-------|---------------:|------------------:|
+| 1 | embedding_only | 0.013 → **0.046** | 176 → **351** |
+| 1 | +raw | 0.024 → **0.082** | 293 → **644** |
+| 2 | embedding_only | 0.005 → **0.020** | 88 → **190** |
+| 2 | +raw | 0.016 → **0.022** | 176 → **234** |
+| 3 | embedding_only | 0.024 → **0.050** | 263 → **424** |
+| 3 | +raw | 0.056 → **0.079** | 527 → **629** |
+
+Pre-3h wins AUPRC **3/3 seeds** in both stacks. Full tables: [`pre_embedding_3h_vs_post_embedding_small_li_multiseed.md`](pre_embedding_3h_vs_post_embedding_small_li_multiseed.md).
 
 ---
 
@@ -320,4 +354,3 @@ More detail: [`morphology-metrics-plan.md`](morphology-metrics-plan.md) · typol
 ## Historical ablations (archived)
 
 Older ablations that predate the current comparison protocol — queue/negative sweeps, feature-KNN, edge-drop, PNA/RGCN swaps, masked-edge reconstruction, morphology target-group scouts, label-efficiency, and PaySim transfer — now live in [`results-archive.md`](results-archive.md). Kept for provenance and negative-result history.
-
