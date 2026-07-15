@@ -1,0 +1,22 @@
+\begin{table}[t]
+\centering
+\caption{Table 5 — Temporal-flow ablation}
+\begin{tabular}{lrrrrrrrrr}
+\toprule
+Dataset / run & Comparison & Feature stack & AUPRC & Δ AUPRC vs pre-3h + raw & F1 & P@100 & R@100 & Lift@100 & Validation status \\
+\midrule
+Small-HI 40ep seed2 & pre-3h only & embedding & 0.295 & --- & 0.336 & 0.830 & 0.052 & 445 & validated \\
+Small-HI 40ep seed2 & pre-3h + raw & embedding+raw & 0.320 & --- & 0.344 & 0.830 & 0.052 & 445 & validated \\
+Small-HI 40ep seed2 & pre-3h + temporal-flow & embedding+temporal\_flow\_causal & 0.473 & --- & 0.475 & 0.910 & 0.056 & 488 & validated \\
+Small-HI 40ep seed2 & pre-3h + raw + temporal-flow & embedding+raw+temporal\_flow\_causal & 0.501 & +0.180 & 0.465 & 0.940 & 0.058 & 504 & validated \\
+Small-LI multiseed & pre-3h + raw & embedding+raw & 0.061 ± 0.033 & --- & 0.056 ± 0.006 & 0.337 ± 0.153 & 0.042 ± 0.019 & 492 ± 224 & validated \\
+Small-LI multiseed & pre-3h + raw + temporal-flow & embedding+raw+temporal\_flow\_causal & 0.128 ± 0.027 & +0.067 ± 0.010 & 0.092 ± 0.029 & 0.600 ± 0.056 & 0.075 ± 0.007 & 878 ± 81 & validated \\
+\bottomrule
+\end{tabular}
+\footnotetext[1]{Primary comparison: pre-3h + raw + temporal-flow versus pre-3h + raw.}
+\footnotetext[2]{Provisional rows shown only with --include\_provisional until validation summary passes.}
+\footnotetext[3]{Validated max\_iter=5000 JSONs preferred when validation summary passes.}
+\footnotetext[4]{P@100 = precision among the top 100 scored test transactions.}
+\footnotetext[5]{R@100 = fraction of all positive test transactions recovered in the top 100 scored test transactions.}
+\footnotetext[6]{Lift@100 = P@100 divided by the test-set positive rate for that dataset.}
+\end{table}

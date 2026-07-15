@@ -36,9 +36,12 @@ from train_util import (
     extract_seed_embeddings_hetero,
     extract_seed_embeddings_homo,
     get_loaders,
+    infer_pre_embedding_dim,
     load_checkpoint_weights,
     log_seed_coverage,
+    resolve_embedding_head_linear,
     save_embedding_split_npz,
+    REPRESENTATION_SOURCES,
 )
 from training import get_model
 from util import create_parser, logger_setup, set_seed
@@ -89,6 +92,27 @@ def run_embedding_extraction(
 
     sample_batch = next(iter(tr_loader))
     model = get_model(sample_batch, config, args)
+
+    representation_source = getattr(args, "representation_source", "post_embedding")
+    # Locate the embedding head on the homogeneous model (before to_hetero replicates it).
+    emb_dim = int(getattr(model, "embedding_dim", 128))
+    actual_n_hidden = int(getattr(model, "n_hidden", round(float(config.n_hidden))))
+    head_spec = None
+    if representation_source == "pre_embedding_3h":
+        head_spec = resolve_embedding_head_linear(model, emb_dim)
+        pre_dim = head_spec.in_features
+        logging.info(
+            "Resolved pre_embedding_3h head: module=%s in_features=%d out_features=%d "
+            "(model n_hidden=%d, requested n_hidden=%s)",
+            head_spec.module_name,
+            head_spec.in_features,
+            head_spec.out_features,
+            actual_n_hidden,
+            config.n_hidden,
+        )
+    else:
+        pre_dim = 3 * actual_n_hidden
+
     if hetero:
         model = to_hetero(model, te_data.metadata(), aggr="mean")
 
@@ -120,6 +144,10 @@ def run_embedding_extraction(
     if finetuned and embed_name == args.unique_name:
         embed_name = f"{args.unique_name}_finetuned"
     out_dir = Path(args.embeddings_dir) / embed_name
+    # Keep post_embedding flat (unchanged); route non-default sources to a labeled subdir so
+    # the current 128-d embeddings are never overwritten.
+    if representation_source != "post_embedding":
+        out_dir = out_dir / representation_source
     out_dir.mkdir(parents=True, exist_ok=True)
 
     splits = (
@@ -129,20 +157,37 @@ def run_embedding_extraction(
     )
 
     embedding_dim: int | None = None
+    split_checksums: dict = {}
     for split_name, loader, split_inds, graph_data in splits:
         expected = expected_seed_edge_ids(loader.data, split_inds, hetero=hetero)
         if hetero:
             edge_ids, z, y = extract_seed_embeddings_hetero(
-                loader, split_inds, model, graph_data, device, args
+                loader, split_inds, model, graph_data, device, args,
+                representation_source=representation_source, pre_dim=pre_dim, emb_dim=emb_dim,
+                head_spec=head_spec,
             )
         else:
             edge_ids, z, y = extract_seed_embeddings_homo(
-                loader, split_inds, model, graph_data, device, args
+                loader, split_inds, model, graph_data, device, args,
+                representation_source=representation_source, pre_dim=pre_dim, emb_dim=emb_dim,
+                head_spec=head_spec,
             )
 
         log_seed_coverage(edge_ids, expected, split_name)
         save_embedding_split_npz(out_dir / f"{split_name}.npz", z, y, edge_ids)
         embedding_dim = int(z.shape[1])
+        # Edge-order/identity checksum so a paired comparison can verify both representations
+        # cover an identical, identically-ordered set of seed transactions.
+        eid_np = edge_ids.detach().cpu().numpy()
+        y_np = y.detach().cpu().numpy()
+        split_checksums[split_name] = {
+            "num_rows": int(eid_np.shape[0]),
+            "num_positives": int(y_np.sum()),
+            "positive_rate": float(y_np.mean()) if eid_np.shape[0] else float("nan"),
+            "edge_id_sum": int(eid_np.astype("int64").sum()),
+            "edge_id_first": int(eid_np[0]) if eid_np.shape[0] else None,
+            "edge_id_last": int(eid_np[-1]) if eid_np.shape[0] else None,
+        }
         logging.info(
             "Wrote %s: Z=%s y=%s path=%s",
             split_name,
@@ -161,6 +206,15 @@ def run_embedding_extraction(
         "model": args.model,
         "reverse_mp": hetero,
         "embedding_dim": embedding_dim,
+        "representation_source": representation_source,
+        "representation_dim": embedding_dim,
+        "n_hidden": actual_n_hidden,
+        "requested_n_hidden": int(round(float(config.n_hidden))),
+        "expected_pre_embedding_3h_dim": pre_dim,
+        "pre_embedding_dim": pre_dim if representation_source == "pre_embedding_3h" else None,
+        "embedding_head_module": head_spec.module_name if head_spec is not None else None,
+        "seed": int(args.seed),
+        "split_checksums": split_checksums,
         "batch_size": int(args.batch_size),
         "num_neighs": list(args.num_neighs),
         "ports": bool(args.ports),
@@ -204,6 +258,19 @@ def main() -> None:
         type=str,
         default=None,
         help="Override output folder name under --embeddings_dir (default: --unique_name).",
+    )
+    parser.add_argument(
+        "--representation_source",
+        type=str,
+        default="post_embedding",
+        choices=list(REPRESENTATION_SOURCES),
+        help=(
+            "Which frozen representation to export. 'post_embedding' (default) exports the "
+            "embedding_head output (current 128-d z; unchanged behavior, flat output dir). "
+            "'pre_embedding_3h' exports the tensor fed INTO embedding_head "
+            "(cat(src_node, dst_node, edge_attr) = 3*n_hidden) into a 'pre_embedding_3h/' subdir. "
+            "Neither uses the contrastive projection-head output."
+        ),
     )
     args = parser.parse_args()
 

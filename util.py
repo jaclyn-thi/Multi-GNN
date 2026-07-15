@@ -34,6 +34,28 @@ def create_parser():
         help="Training objective: contrastive pretraining (default), supervised AML edge "
         "classification, or masked edge-attribute reconstruction (GraphMAE-style).",
     )
+    parser.add_argument(
+        "--supervised_head",
+        type=str,
+        choices=["embedding", "legacy"],
+        default="embedding",
+        help="Supervised classification head (only used with --objective supervised). "
+        "'embedding' (default, backward-compatible): current project architecture "
+        "(edge representation -> 128-d embedding head -> classifier). "
+        "'legacy': reproduction-oriented IBM Multi-GNN / Egressy et al. head "
+        "(edge representation -> 3*n_hidden -> 50 -> 25 -> 2 logits, no embedding bottleneck). "
+        "Only GINe is numerically validated against the fork point; gat/pna/rgcn legacy heads "
+        "are restored-but-unvalidated.",
+    )
+    parser.add_argument(
+        "--embedding_dim",
+        type=int,
+        default=128,
+        help="Exported embedding dimension = output width of the embedding head (embedding mode "
+        "only; unused with --supervised_head legacy). Default 128 (backward-compatible). n_hidden "
+        "and the pre_embedding_3h dimension (3*n_hidden) are unaffected. Must match the checkpoint "
+        "when loading/extracting.",
+    )
     parser.add_argument("--ports", action='store_true', help="Use port numberings in GNN training")
     parser.add_argument("--tds", action='store_true', help="Use time deltas (i.e. the time between subsequent transactions) in GNN training")
     parser.add_argument("--ego", action='store_true', help="Use ego IDs in GNN training")
@@ -80,6 +102,12 @@ def create_parser():
         help="Optional per-run GNN hidden width override (else model_settings.json for --model).",
     )
     parser.add_argument(
+        "--override_dropout",
+        type=float,
+        default=None,
+        help="Optional per-run GNN dropout override (else model_settings.json for --model).",
+    )
+    parser.add_argument(
         "--override_final_dropout",
         type=float,
         default=None,
@@ -103,6 +131,13 @@ def create_parser():
         "--finetune",
         action="store_true",
         help="Initialize weights (and optimizer state) from checkpoint_{unique_name}.tar before training; works with either objective.",
+    )
+    parser.add_argument(
+        "--resume_supervised",
+        action="store_true",
+        help="Supervised only: resume from saved-models/<unique_name>/checkpoint_last.tar "
+        "(model, optimizer, best-val selection state, epoch history). Next epoch continues until "
+        "--n_epochs.",
     )
     parser.add_argument("--inference", action='store_true', help="Load a trained model and only do AML inference with it. args.unique name needs to point to the trained model.")
     parser.add_argument(

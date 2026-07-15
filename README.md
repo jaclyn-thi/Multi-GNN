@@ -7,7 +7,13 @@ This repository extends [IBM Multi-GNN](https://github.com/IBM/Multi-GNN) for an
 3. **Linear probing** — sklearn logistic regression on frozen features (`linear_probe.py`)
 4. **Label-efficiency probing** (optional) — same embeddings, stratified train-label subsets (`scripts/label_efficiency_probe.py`)
 
-The original **supervised** path (`--objective supervised`) remains as a baseline (~0.97 test AUROC in-GNN on Small-HI). Downstream evaluation uses **frozen embeddings + linear probe** (Papagei-style), not end-to-end finetune, unless you explicitly use `--finetune`.
+The **supervised** path (`--objective supervised`) supports two heads via `--supervised_head`
+(see [Supervised edge classification](#supervised-edge-classification---supervised_head)):
+`embedding` (default; the current embedding-head supervised control) and `legacy` (a numerically
+validated GINe reproduction of the IBM Multi-GNN / Egressy et al. head). Earlier "supervised
+baseline" runs in these notes used the **embedding-head** architecture unless explicitly labeled
+`legacy`. Downstream evaluation otherwise uses **frozen embeddings + linear probe** (Papagei-style),
+not end-to-end finetune, unless you explicitly use `--finetune`.
 
 > **Repo scope:** Active thesis research code. Some tooling is intentionally local-only and gitignored — notably `slurm/` (cluster-specific job scripts) and `tests/`. Commands anywhere in these docs that reference `sbatch slurm/*.sh` or `tests/` are maintainer convenience wrappers and **won't exist in a fresh clone**; the canonical, runnable path is always the `python main.py …` / `python scripts/…` commands they wrap. Data and artifact directories (`aml-data/`, `embeddings/`, `saved-models/`, `morphology_cache/`, …) are likewise gitignored and generated locally.
 
@@ -85,6 +91,13 @@ python linear_probe.py --unique_name my_pretrain --testing
 
 Writes `embeddings/{unique_name}/probe_results.json`. Report **AUROC**, **AUPRC** (important for rare positives), and **F1** (val-tuned threshold). AML labels are not used for SSL checkpoint selection; use `--checkpoint_policy best` for morph/projection runs.
 
+**Representation source (diagnostic lever).** `embedding_extraction.py --representation_source` selects which frozen tensor to export:
+
+- `post_embedding` (default): the `embedding_head` output (128-d `z`; unchanged behavior, flat output dir).
+- `pre_embedding_3h`: the tensor fed *into* `embedding_head` — `cat(src_node, dst_node, edge_attr)` = `3 * n_hidden` — written to an `embeddings/{unique_name}/pre_embedding_3h/` subdir. Neither uses the contrastive projection-head output.
+
+Compare the two from the *same* checkpoint with `scripts/compare_representation_source.py` (paired by `edge_id` inner-join, identical probe pipeline). See `notes/pre_embedding_3h_vs_post_embedding_current_protocol.md`.
+
 **Current best dev recipes** ([`notes/results.md`](notes/results.md)): AUROC → baseline contrastive (**0.951**). SSL embedding-only → **emlps+tds 40 ep seed2** (**0.307 F1**). Best **`embedding+raw` scout** → GIN 40 ep seed2 (**0.346 F1** @ shared probe `cw=model`, C=1.0; robust across probe settings but **not cross-seed stable**). Best **full stack** → **FNF + emlps+tds seed1 + `embedding+raw+morph`** (**0.319 F1**). Use **`cw=model --model gin`** for comparable probes. Small-LI dataset comparison is weaker than Small-HI; see [Small-LI scout](notes/results.md#small-li-current-protocol-scout-jul-2).
 
 ---
@@ -148,19 +161,63 @@ positives, it falls back naturally to the same-edge positive.
 
 Adds a **morphology expert head** (label-free structural targets) and/or **M2 soft positives** in InfoNCE. Phases M0–M5, metric definitions, example commands, and flags cheat sheet: [`notes/morphology-reference.md`](notes/morphology-reference.md).
 
-### Supervised baseline (original Multi-GNN)
+### Supervised edge classification (`--supervised_head`)
+
+Two supervised heads are supported (both share the same graph encoder, message-passing flags,
+ports, reverse MP, ego IDs, edge updates, and dataset handling):
+
+| `--supervised_head` | Head architecture | Use |
+|---------------------|-------------------|-----|
+| `embedding` (default) | edge representation → 128-d embedding head → `Linear(128,50)→ReLU→Dropout→Linear(50,2)` | **current embedding-head supervised control** (backward-compatible; the only supervised path before this flag existed) |
+| `legacy` | edge representation → `Linear(3·h,50)→ReLU→Dropout→Linear(50,25)→ReLU→Dropout→Linear(25,2)` (logits direct, no 128-d bottleneck) | **legacy supervised reproduction** of the IBM Multi-GNN / Egressy et al. head (commit `fc751e8`). Numerically validated for **GINe**; `gat`/`pna`/`rgcn` legacy heads are restored-but-unvalidated |
+
+The default is `embedding` (unchanged behavior). Do **not** describe the embedding-head run as the
+Egressy/Multi-GNN baseline; it is a current-architecture control.
 
 ```bash
+# Legacy supervised reproduction (paper-compatible head + protocol), GINe:
 python main.py \
   --data Small-HI --model gin \
-  --objective supervised \
-  --unique_name my_supervised \
+  --objective supervised --supervised_head legacy \
+  --unique_name my_legacy_supervised \
   --save_model \
   --reverse_mp --ego --ports \
   --n_epochs 100 --tqdm
+
+# Current embedding-head supervised control (default head):
+python main.py \
+  --data Small-HI --model gin \
+  --objective supervised \
+  --unique_name my_embedding_supervised \
+  --save_model --reverse_mp --ego --ports --n_epochs 100 --tqdm
 ```
 
-Use `--inference` to evaluate a saved checkpoint without training.
+**Protocol (both heads).** Prediction is by argmax over two-class logits (paper-compatible
+decision rule); the per-epoch minority-class (label 1) F1 is tracked; the best checkpoint is
+selected by **validation minority F1 only** (no probability-threshold tuning). Each supervised run
+writes:
+
+- per-epoch history: `results/diagnostics/supervised_<data>_<run>_epoch_history.json` (atomic, survives interruption)
+- dual checkpoints (with `--save_model`): `saved-models/<run>/checkpoint_last.tar` and `saved-models/<run>/checkpoint_best_val_f1.tar`
+- a run summary: `results/diagnostics/supervised_<data>_<run>_summary.json` + `notes/supervised_<data>_<run>_summary.md`
+
+The flat `saved-models/checkpoint_<run>.tar` is retained (= **last epoch**) for backward-compatible
+tooling. **Reproduction evaluation MUST use `saved-models/<run>/checkpoint_best_val_f1.tar`.**
+
+Post-hoc richer evaluation (auto-selects the best-val checkpoint, keeps `paper_argmax` and
+`validation_tuned_threshold` metrics strictly separate):
+
+```bash
+python scripts/evaluate_supervised_gnn.py \
+  --data Small-HI --model gin --objective supervised \
+  --unique_name my_legacy_supervised --reverse_mp --ego --ports \
+  --output_json results/diagnostics/eval_my_legacy_supervised.json \
+  --output_md notes/eval_my_legacy_supervised.md
+# add --checkpoint_file <path> to override checkpoint selection
+```
+
+Use `--inference` to evaluate a saved checkpoint without training. A tiny CPU smoke test for both
+heads: `python scripts/smoke_supervised_legacy.py --supervised_head legacy`.
 
 ### Supervised finetune (secondary / ablation)
 

@@ -1,6 +1,22 @@
 
 # Small-LI Supervised Baseline Comparison
 
+> **Architecture note (added Jul 2026).** This "supervised baseline" run used the **current
+> embedding-head architecture** (`--supervised_head embedding`, the default), i.e. the
+> `edge representation → 128-d embedding head → Linear(128,50) → Linear(50,2)` control. It is
+> **NOT** the legacy IBM Multi-GNN / Egressy et al. reproduction (`--supervised_head legacy`,
+> the `3·h → 50 → 25 → 2` head). Do not treat this row as the Egressy/Multi-GNN baseline.
+>
+> In the table below, the **`F1`** column is the **validation-tuned-threshold** F1 (diagnostic
+> only, NOT paper-compatible), while **`F1@0.5`** corresponds to the paper-compatible
+> **argmax over two-class logits** decision rule. These are different metrics and must not be
+> compared or merged. New runs record the paper-compatible metric as `paper_argmax` and the tuned
+> metric as `validation_tuned_threshold` (see `scripts/evaluate_supervised_gnn.py`), and select the
+> checkpoint by validation minority F1 (`checkpoint_best_val_f1.tar`) rather than the final epoch.
+>
+> For the legacy (Egressy-head) counterpart, see
+> [`small_li_legacy_supervised_scout.md`](small_li_legacy_supervised_scout.md).
+
 Updated from `results/diagnostics/supervised_small_li_gin_emlps_tds_seed1.json` and the current Small-LI probe artifacts.
 
 ## Thesis-Relevant Takeaway

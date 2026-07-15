@@ -89,26 +89,46 @@ def alert_budget_metrics(y: np.ndarray, proba: np.ndarray) -> Dict[str, float]:
     return out
 
 
-def split_metrics(y: np.ndarray, proba: np.ndarray, threshold: float) -> Dict[str, float]:
-    pred = (proba >= threshold).astype(np.int64)
-    pred_05 = (proba >= 0.5).astype(np.int64)
-    out = {
+def split_metrics(y: np.ndarray, proba: np.ndarray, tuned_threshold: float) -> Dict[str, Any]:
+    """Per-split metrics with two clearly separated F1 families.
+
+    ``paper_argmax``: prediction by argmax over two-class logits (equivalently proba>=0.5).
+    This is the primary, paper-compatible reproduction metric (IBM Multi-GNN / Egressy et al.).
+
+    ``validation_tuned_threshold``: prediction by a threshold tuned to maximize F1 on the
+    validation softmax probability. This is NOT paper-compatible and must never be compared
+    to, merged with, or labeled as the paper_argmax metric.
+    """
+    argmax_pred = (proba >= 0.5).astype(np.int64)  # argmax over two-class logits
+    tuned_pred = (proba >= tuned_threshold).astype(np.int64)
+    if len(np.unique(y)) < 2:
+        auroc = float("nan")
+        auprc = float("nan")
+    else:
+        auroc = float(roc_auc_score(y, proba))
+        auprc = float(average_precision_score(y, proba))
+    return {
         "n": float(y.shape[0]),
         "positive_rate": float(y.mean()) if y.shape[0] else float("nan"),
-        "f1": float(f1_score(y, pred, zero_division=0)),
-        "precision": float(precision_score(y, pred, zero_division=0)),
-        "recall": float(recall_score(y, pred, zero_division=0)),
-        "f1_at_0_5": float(f1_score(y, pred_05, zero_division=0)),
-        "threshold": float(threshold),
+        "auroc": auroc,
+        "auprc": auprc,
+        "paper_argmax": {
+            "f1": float(f1_score(y, argmax_pred, zero_division=0)),
+            "precision": float(precision_score(y, argmax_pred, zero_division=0)),
+            "recall": float(recall_score(y, argmax_pred, zero_division=0)),
+            "decision_rule": "argmax over two-class logits",
+            "note": "Primary reproduction metric (paper-compatible).",
+        },
+        "validation_tuned_threshold": {
+            "f1": float(f1_score(y, tuned_pred, zero_division=0)),
+            "precision": float(precision_score(y, tuned_pred, zero_division=0)),
+            "recall": float(recall_score(y, tuned_pred, zero_division=0)),
+            "threshold": float(tuned_threshold),
+            "threshold_source": "max_f1_on_validation_softmax_prob",
+            "note": "NOT paper-compatible; do not compare to paper_argmax.",
+        },
+        "alert_budget": alert_budget_metrics(y, proba),
     }
-    if len(np.unique(y)) < 2:
-        out["auroc"] = float("nan")
-        out["auprc"] = float("nan")
-    else:
-        out["auroc"] = float(roc_auc_score(y, proba))
-        out["auprc"] = float(average_precision_score(y, proba))
-    out.update(alert_budget_metrics(y, proba))
-    return out
 
 
 @torch.no_grad()
@@ -187,33 +207,58 @@ def parse_training_log(path: Path) -> Dict[str, Any]:
 
 
 def write_markdown(path: Path, payload: Dict[str, Any]) -> None:
+    head = payload.get("supervised_head", "embedding")
+    mode_line = (
+        "legacy supervised reproduction (IBM Multi-GNN / Egressy et al. head)"
+        if head == "legacy"
+        else "current embedding-head supervised control (NOT the Egressy/Multi-GNN baseline)"
+    )
+    tuned = payload.get("validation_tuned_threshold", {})
     lines = [
-        "# Supervised Small-LI GINe Baseline",
+        f"# Supervised evaluation: {payload['run_name']}",
         "",
-        "Small-LI comparison run using the repo's canonical supervised CE path.",
-        "",
-        f"- **run:** `{payload['run_name']}`",
-        f"- **checkpoint:** `{payload['checkpoint_path']}`",
+        f"- **Supervised mode:** {mode_line} (`supervised_head={head}`)",
+        f"- **Model / data:** {payload.get('model')} / {payload.get('data')}",
+        f"- **Checkpoint:** `{payload['checkpoint_path']}` (source: {payload.get('checkpoint_source')})",
+        f"- **Checkpoint epoch:** {payload['checkpoint_epoch']}  |  "
+        f"**selected (best-val) epoch:** {payload.get('checkpoint_selected_epoch')}",
         f"- **CE class weights:** `{payload['ce_class_weight']}`",
-        f"- **checkpoint epoch:** {payload['checkpoint_epoch']}",
+        f"- **Validation-tuned threshold (diagnostic only, NOT paper-compatible):** "
+        f"{tuned.get('value')}",
         "",
-        "| Split | AUROC | AUPRC | F1 | F1@0.5 | Precision | Recall | P@500 | R@500 | lift@500 | Pos Rate |",
-        "|-------|------:|------:|---:|-------:|----------:|-------:|------:|------:|---------:|---------:|",
+        "## paper_argmax (primary reproduction metric; decision rule = argmax over two-class logits)",
+        "",
+        "| Split | AUROC | AUPRC | F1 | Precision | Recall | Pos Rate |",
+        "|-------|------:|------:|---:|----------:|-------:|---------:|",
     ]
     for split in ("train", "val", "test"):
         row = payload["splits"][split]
+        pa = row["paper_argmax"]
         lines.append(
-            f"| {split} | {row['auroc']:.4f} | {row['auprc']:.4f} | {row['f1']:.4f} | "
-            f"{row['f1_at_0_5']:.4f} | {row['precision']:.4f} | {row['recall']:.4f} | "
-            f"{row.get('precision_at_500', float('nan')):.4f} | {row.get('recall_at_500', float('nan')):.4f} | "
-            f"{row.get('lift_at_500', float('nan')):.1f} | {row['positive_rate']:.6f} |"
+            f"| {split} | {row['auroc']:.4f} | {row['auprc']:.4f} | {pa['f1']:.4f} | "
+            f"{pa['precision']:.4f} | {pa['recall']:.4f} | {row['positive_rate']:.6f} |"
         )
-    best = payload.get("training_log", {}).get("best_by_val_f1_argmax")
+    lines.extend(
+        [
+            "",
+            "## validation_tuned_threshold (diagnostic only; NOT paper-compatible, do not compare to paper_argmax)",
+            "",
+            "| Split | F1 | Precision | Recall | Threshold |",
+            "|-------|---:|----------:|-------:|----------:|",
+        ]
+    )
+    for split in ("train", "val", "test"):
+        vt = payload["splits"][split]["validation_tuned_threshold"]
+        lines.append(
+            f"| {split} | {vt['f1']:.4f} | {vt['precision']:.4f} | {vt['recall']:.4f} | "
+            f"{vt['threshold']:.4f} |"
+        )
+    best = (payload.get("training_log") or {}).get("best_by_val_f1_argmax")
     if best:
         lines.extend(
             [
                 "",
-                f"Best log epoch by canonical argmax Validation F1: epoch {best.get('epoch_index')} "
+                f"Best log epoch by argmax Validation F1: epoch {best.get('epoch_index')} "
                 f"(val {best.get('val_f1_argmax'):.4f}, test {best.get('test_f1_argmax', float('nan')):.4f}).",
             ]
         )
@@ -222,17 +267,68 @@ def write_markdown(path: Path, payload: Dict[str, Any]) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def resolve_checkpoint_path(args, data_config) -> Tuple[Path, str]:
+    """Resolve which supervised checkpoint to evaluate.
+
+    Precedence (does not silently break legacy flat-file runs):
+    1. Explicit --checkpoint_file override.
+    2. New-style best-validation checkpoint saved-models/<run>/checkpoint_best_val_f1.tar
+       (preferred: this is the reproduction checkpoint).
+    3. Legacy flat saved-models/checkpoint_{run}.tar (= last epoch; NOT the reproduction
+       checkpoint) with a warning.
+    """
+    override = getattr(args, "checkpoint_file", None)
+    if override:
+        return Path(override), "explicit_override"
+    model_root = Path(data_config["paths"]["model_to_load"])
+    best_val = model_root / str(args.unique_name) / "checkpoint_best_val_f1.tar"
+    if best_val.is_file():
+        return best_val, "best_val_f1"
+    flat = model_root / f"checkpoint_{args.unique_name}.tar"
+    if flat.is_file():
+        print(
+            f"WARNING: best-val checkpoint {best_val} not found; falling back to legacy flat "
+            f"checkpoint {flat} (= last epoch, NOT the reproduction checkpoint).",
+            file=sys.stderr,
+        )
+        return flat, "legacy_flat_last_epoch"
+    raise FileNotFoundError(
+        f"No checkpoint found. Looked for override, {best_val}, and {flat}."
+    )
+
+
 def main() -> None:
     parser = create_parser()
     parser.add_argument("--output_json", required=True)
     parser.add_argument("--output_md", required=True)
     parser.add_argument("--training_log", default=None)
+    parser.add_argument(
+        "--checkpoint_file",
+        default=None,
+        help="Explicit checkpoint path override. If omitted, prefers "
+        "saved-models/<run>/checkpoint_best_val_f1.tar, then legacy flat checkpoint.",
+    )
     args = parser.parse_args()
 
     logger_setup()
     set_seed(args.seed)
     with open(args.data_config if hasattr(args, "data_config") else "data_config.json", "r", encoding="utf-8") as f:
         data_config = json.load(f)
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    checkpoint_path, checkpoint_source = resolve_checkpoint_path(args, data_config)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    # Match the model head to the checkpoint so state_dict shapes align, even if the caller
+    # forgot --supervised_head. Never silently downgrade an explicit request.
+    ckpt_head = checkpoint.get("supervised_head")
+    if ckpt_head and getattr(args, "supervised_head", "embedding") != ckpt_head:
+        print(
+            f"Overriding --supervised_head {getattr(args, 'supervised_head', None)!r} with "
+            f"checkpoint value {ckpt_head!r} to match saved weights.",
+            file=sys.stderr,
+        )
+        args.supervised_head = ckpt_head
 
     tr_data, val_data, te_data, tr_inds, val_inds, te_inds = get_data(args, data_config)
     transform = AddEgoIds() if args.ego else None
@@ -241,14 +337,11 @@ def main() -> None:
         tr_data, val_data, te_data, tr_inds, val_inds, te_inds, transform, args, train_shuffle=False
     )
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     sample_batch = next(iter(tr_loader))
     config = build_model_config(args)
     model = get_model(sample_batch, config, args)
     if args.reverse_mp:
         model = to_hetero(model, te_data.metadata(), aggr="mean")
-    checkpoint_path = Path(data_config["paths"]["model_to_load"]) / f"checkpoint_{args.unique_name}.tar"
-    checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     model.eval()
@@ -272,16 +365,23 @@ def main() -> None:
         "data": args.data,
         "model": args.model,
         "objective": "supervised",
+        "supervised_head": getattr(args, "supervised_head", "embedding"),
         "checkpoint_path": str(checkpoint_path),
+        "checkpoint_source": checkpoint_source,
         "checkpoint_epoch": int(checkpoint.get("epoch", -1)),
+        "checkpoint_selected_epoch": checkpoint.get("selected_epoch"),
+        "checkpoint_best_validation_f1": checkpoint.get("best_validation_f1"),
+        "checkpoint_test_f1_at_selected_epoch": checkpoint.get("test_f1_at_selected_epoch"),
         "ce_class_weight": {
             "0": float(extract_param("w_ce1", args)),
             "1": float(extract_param("w_ce2", args)),
         },
-        "classification_threshold": {
+        "primary_reproduction_metric": "splits.test.paper_argmax.f1 (decision rule: argmax over two-class logits)",
+        "validation_tuned_threshold": {
             "method": "max_f1_on_val",
             "value": float(threshold),
             "val_f1_at_selection": float(val_f1),
+            "note": "Diagnostic only; NOT paper-compatible.",
         },
         "splits": split_payload,
         "coverage": coverage,

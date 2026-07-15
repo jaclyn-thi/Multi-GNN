@@ -1,8 +1,10 @@
 import json
 import logging
+import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -10,7 +12,13 @@ import tqdm
 from torch_geometric.transforms import BaseTransform
 from torch_geometric.data import Data, HeteroData
 from torch_geometric.loader import LinkNeighborLoader
-from sklearn.metrics import f1_score
+from sklearn.metrics import (
+    average_precision_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 
 # Heterogeneous graph edge types (reverse MP).
 FORWARD_EDGE_TYPE = ("node", "to", "node")
@@ -124,7 +132,7 @@ def extract_param(parameter_name: str, args) -> float:
     Extract the value of the specified parameter for the given model.
 
     Per-run CLI overrides (when set) take precedence over model_settings.json:
-    ``--override_lr``, ``--override_n_hidden``, ``--override_final_dropout``.
+    ``--override_lr``, ``--override_n_hidden``, ``--override_dropout``, ``--override_final_dropout``.
 
     Args:
     - parameter_name (str): Name of the parameter (e.g., "lr").
@@ -139,6 +147,10 @@ def extract_param(parameter_name: str, args) -> float:
             return float(override)
     if parameter_name == "n_hidden":
         override = getattr(args, "override_n_hidden", None)
+        if override is not None:
+            return float(override)
+    if parameter_name == "dropout":
+        override = getattr(args, "override_dropout", None)
         if override is not None:
             return float(override)
     if parameter_name == "final_dropout":
@@ -518,6 +530,7 @@ def save_model(model, optimizer, epoch, args, data_config, *, suffix: str = ""):
         "epoch": epoch + 1,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "embedding_dim": int(getattr(args, "embedding_dim", 128)),
     }
     morph_head = getattr(args, "morph_expert_head", None)
     if morph_head is not None:
@@ -544,6 +557,16 @@ def load_checkpoint_weights(model, device, args, data_config) -> int:
     if not path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
     checkpoint = torch.load(path, map_location=device)
+    # Fail clearly on an embedding-dim mismatch (e.g. loading an emb198 checkpoint with the default
+    # 128, or vice versa) before the lower-level state_dict shape error.
+    ckpt_emb_dim = checkpoint.get("embedding_dim")
+    req_emb_dim = int(getattr(args, "embedding_dim", 128))
+    if ckpt_emb_dim is not None and int(ckpt_emb_dim) != req_emb_dim:
+        raise ValueError(
+            f"embedding_dim mismatch: checkpoint {path.name} was trained with embedding_dim="
+            f"{int(ckpt_emb_dim)} but the current run uses --embedding_dim {req_emb_dim}. "
+            f"Pass --embedding_dim {int(ckpt_emb_dim)} to match this checkpoint."
+        )
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     return int(checkpoint.get("epoch", -1))
@@ -622,6 +645,205 @@ def save_embedding_split_npz(
     )
 
 
+# Representation-source lever for extraction diagnostics.
+#   post_embedding  -> output of embedding_head (current 128-d z; default, unchanged behavior)
+#   pre_embedding_3h -> tensor fed INTO embedding_head (cat(src_node, dst_node, edge_attr) = 3*n_hidden)
+REPRESENTATION_SOURCES = ("post_embedding", "pre_embedding_3h")
+
+
+@dataclass(frozen=True)
+class EmbeddingHeadSpec:
+    """Resolved embedding-head Linear used for pre_embedding_3h capture."""
+
+    module: torch.nn.Linear
+    module_name: str
+    in_features: int
+    out_features: int
+
+
+def _linear_module_path(root: torch.nn.Module, target: torch.nn.Module) -> str:
+    for name, module in root.named_modules():
+        if module is target:
+            return name or "<root>"
+    return repr(target)
+
+
+def resolve_embedding_head_linear(
+    model: torch.nn.Module,
+    emb_dim: int,
+    pre_dim: Optional[int] = None,
+) -> EmbeddingHeadSpec:
+    """Locate the embedding-head Linear that maps pre-edge representation -> exported embedding.
+
+    Prefers the named ``embedding_head`` when it is a matching ``nn.Linear``. Otherwise searches
+    for ``nn.Linear`` layers with ``out_features == emb_dim`` and ``in_features % 3 == 0``,
+    excluding obvious projection/classifier heads (``in_features == emb_dim``).
+
+    Raises ``ValueError`` when no candidate is found or when multiple candidates remain ambiguous.
+    """
+    emb_dim = int(emb_dim)
+    named_head = getattr(model, "embedding_head", None)
+    if isinstance(named_head, torch.nn.Linear):
+        if named_head.out_features != emb_dim:
+            raise ValueError(
+                "model.embedding_head out_features={0} != embedding_dim={1}".format(
+                    named_head.out_features, emb_dim
+                )
+            )
+        if pre_dim is not None and named_head.in_features != int(pre_dim):
+            raise ValueError(
+                "model.embedding_head in_features={0} != expected pre_dim={1}".format(
+                    named_head.in_features, pre_dim
+                )
+            )
+        if named_head.in_features % 3 != 0:
+            raise ValueError(
+                "model.embedding_head in_features={0} is not divisible by 3".format(
+                    named_head.in_features
+                )
+            )
+        return EmbeddingHeadSpec(
+            module=named_head,
+            module_name="embedding_head",
+            in_features=int(named_head.in_features),
+            out_features=int(named_head.out_features),
+        )
+
+    candidates: List[Tuple[str, torch.nn.Linear]] = []
+    for name, module in model.named_modules():
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        if module.out_features != emb_dim:
+            continue
+        if module.in_features == emb_dim:
+            # Projection/classifier-style head (e.g. Linear(128, 128)); not pre-edge representation.
+            continue
+        if module.in_features % 3 != 0:
+            continue
+        if pre_dim is not None and module.in_features != int(pre_dim):
+            continue
+        candidates.append((name or "<unnamed>", module))
+
+    if not candidates:
+        raise ValueError(
+            "pre_embedding_3h requested but no embedding-head Linear "
+            f"(out_features={emb_dim}, in_features%3==0"
+            + (f", in_features={int(pre_dim)}" if pre_dim is not None else "")
+            + ") was found. This checkpoint is incompatible with pre_embedding_3h extraction "
+            "(e.g. a legacy/supervised head, or a model with a different embedding_dim)."
+        )
+    if len(candidates) > 1:
+        desc = ", ".join(
+            "{0}(in={1}, out={2})".format(name, lin.in_features, lin.out_features)
+            for name, lin in candidates
+        )
+        raise ValueError(
+            "pre_embedding_3h requested but multiple embedding-head candidates were found: "
+            f"{desc}. Resolve ambiguity explicitly (prefer model.embedding_head)."
+        )
+
+    name, module = candidates[0]
+    return EmbeddingHeadSpec(
+        module=module,
+        module_name=name,
+        in_features=int(module.in_features),
+        out_features=int(module.out_features),
+    )
+
+
+def infer_pre_embedding_dim(model: torch.nn.Module, emb_dim: int) -> int:
+    """Return ``3 * n_hidden`` from the resolved embedding head (handles PNA width rounding)."""
+    return resolve_embedding_head_linear(model, emb_dim).in_features
+
+
+class PreEmbeddingCapture:
+    """Capture the tensor fed into ``embedding_head`` via a forward hook (no forward changes).
+
+    Uses :func:`resolve_embedding_head_linear` to locate the head on homogeneous or
+    ``to_hetero``-wrapped models. The captured input is keyed by the ``id`` of the produced
+    output tensor so the caller looks up the exact head call that produced the forward-edge
+    embedding.
+
+    Raises ``ValueError`` if no matching head is found (e.g. a legacy/supervised checkpoint or a
+    different embedding_dim), satisfying the "fail clearly on incompatible checkpoint" requirement.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        pre_dim: Optional[int] = None,
+        emb_dim: int = 128,
+        head_spec: Optional[EmbeddingHeadSpec] = None,
+    ):
+        self.emb_dim = int(emb_dim)
+        self.head_spec = head_spec or resolve_embedding_head_linear(model, self.emb_dim, pre_dim)
+        self.pre_dim = int(self.head_spec.in_features)
+        if pre_dim is not None and self.pre_dim != int(pre_dim):
+            raise ValueError(
+                f"Resolved embedding-head in_features={self.pre_dim} != requested pre_dim={pre_dim}"
+            )
+        logging.info(
+            "pre_embedding_3h capture: module=%s in_features=%d out_features=%d",
+            self.head_spec.module_name,
+            self.head_spec.in_features,
+            self.head_spec.out_features,
+        )
+        self.captured: Dict[int, torch.Tensor] = {}
+        self.handles: List[Any] = []
+        matched = 0
+        for module in model.modules():
+            if (
+                isinstance(module, torch.nn.Linear)
+                and module.in_features == self.pre_dim
+                and module.out_features == self.emb_dim
+            ):
+                self.handles.append(module.register_forward_hook(self._hook))
+                matched += 1
+        if matched == 0:
+            raise ValueError(
+                "pre_embedding_3h requested but no embedding-head Linear "
+                f"(in_features={self.pre_dim}, out_features={self.emb_dim}) was found in the "
+                f"execution model. Resolved head {self.head_spec.module_name!r} on the "
+                "homogeneous template may not have been replicated after to_hetero."
+            )
+        self.matched = matched
+
+    def _hook(self, module, inputs, output):
+        self.captured[id(output)] = inputs[0].detach()
+
+    def clear(self) -> None:
+        self.captured.clear()
+
+    def get(self, output: torch.Tensor) -> torch.Tensor:
+        pre = self.captured.get(id(output))
+        if pre is None:
+            raise RuntimeError(
+                "pre_embedding_3h capture failed: the forward output was not matched to an "
+                "embedding-head input. The model forward may not route through embedding_head."
+            )
+        if pre.shape[-1] != self.pre_dim:
+            raise RuntimeError(
+                "pre_embedding_3h capture dimension mismatch: captured last dim "
+                f"{pre.shape[-1]} != embedding-head in_features={self.pre_dim} "
+                f"(module={self.head_spec.module_name})"
+            )
+        return pre
+
+    def remove(self) -> None:
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+
+
+def _validate_representation_source(representation_source: str) -> str:
+    src = str(representation_source or "post_embedding")
+    if src not in REPRESENTATION_SOURCES:
+        raise ValueError(
+            f"Unsupported representation_source {src!r}; use one of {REPRESENTATION_SOURCES}."
+        )
+    return src
+
+
 @torch.no_grad()
 def extract_seed_embeddings_homo(
     loader,
@@ -630,8 +852,42 @@ def extract_seed_embeddings_homo(
     data,
     device,
     args,
+    representation_source: str = "post_embedding",
+    pre_dim: Optional[int] = None,
+    emb_dim: Optional[int] = None,
+    head_spec: Optional[EmbeddingHeadSpec] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Collect frozen edge embeddings and labels for seed edges (homogeneous graphs)."""
+    """Collect frozen edge representations and labels for seed edges (homogeneous graphs).
+
+    ``representation_source='post_embedding'`` (default) returns the embedding-head output
+    (unchanged behavior). ``'pre_embedding_3h'`` returns the tensor fed into embedding_head
+    (``3*n_hidden``) captured via a forward hook; ``pre_dim``/``emb_dim`` locate the head.
+    """
+    representation_source = _validate_representation_source(representation_source)
+    capture = (
+        PreEmbeddingCapture(model, pre_dim=pre_dim, emb_dim=emb_dim or 128, head_spec=head_spec)
+        if representation_source == "pre_embedding_3h"
+        else None
+    )
+    try:
+        return _extract_seed_embeddings_homo_impl(
+            loader, split_inds, model, data, device, args, capture
+        )
+    finally:
+        if capture is not None:
+            capture.remove()
+
+
+@torch.no_grad()
+def _extract_seed_embeddings_homo_impl(
+    loader,
+    split_inds,
+    model,
+    data,
+    device,
+    args,
+    capture: Optional[PreEmbeddingCapture],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     edge_id_chunks: List[torch.Tensor] = []
     z_chunks: List[torch.Tensor] = []
     y_chunks: List[torch.Tensor] = []
@@ -663,7 +919,11 @@ def extract_seed_embeddings_homo(
         batch.edge_attr = batch.edge_attr[:, 1:]
 
         batch.to(device)
+        if capture is not None:
+            capture.clear()
         z = model(batch.x, batch.edge_index, batch.edge_attr)
+        if capture is not None:
+            z = capture.get(z)
         mask_dev = mask.to(device, non_blocking=True)
         edge_id_chunks.append(edge_ids[mask].detach().cpu())
         z_chunks.append(z[mask_dev].detach().cpu())
@@ -686,8 +946,40 @@ def extract_seed_embeddings_hetero(
     data,
     device,
     args,
+    representation_source: str = "post_embedding",
+    pre_dim: Optional[int] = None,
+    emb_dim: Optional[int] = None,
+    head_spec: Optional[EmbeddingHeadSpec] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Collect frozen forward-edge embeddings for seed transactions (heterogeneous graphs)."""
+    """Collect frozen forward-edge representations for seed transactions (hetero graphs).
+
+    See :func:`extract_seed_embeddings_homo` for the ``representation_source`` semantics.
+    """
+    representation_source = _validate_representation_source(representation_source)
+    capture = (
+        PreEmbeddingCapture(model, pre_dim=pre_dim, emb_dim=emb_dim or 128, head_spec=head_spec)
+        if representation_source == "pre_embedding_3h"
+        else None
+    )
+    try:
+        return _extract_seed_embeddings_hetero_impl(
+            loader, split_inds, model, data, device, args, capture
+        )
+    finally:
+        if capture is not None:
+            capture.remove()
+
+
+@torch.no_grad()
+def _extract_seed_embeddings_hetero_impl(
+    loader,
+    split_inds,
+    model,
+    data,
+    device,
+    args,
+    capture: Optional[PreEmbeddingCapture],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     edge_id_chunks: List[torch.Tensor] = []
     z_chunks: List[torch.Tensor] = []
     y_chunks: List[torch.Tensor] = []
@@ -722,8 +1014,12 @@ def extract_seed_embeddings_hetero(
         batch[REVERSE_EDGE_TYPE].edge_attr = batch[REVERSE_EDGE_TYPE].edge_attr[:, 1:]
 
         batch.to(device)
+        if capture is not None:
+            capture.clear()
         out = model(batch.x_dict, batch.edge_index_dict, batch.edge_attr_dict)
         z = out[store]
+        if capture is not None:
+            z = capture.get(z)
         mask_dev = mask.to(device, non_blocking=True)
         edge_id_chunks.append(edge_ids[mask].detach().cpu())
         z_chunks.append(z[mask_dev].detach().cpu())
@@ -832,6 +1128,527 @@ def evaluate_hetero(loader, inds, model, data, device, args):
     f1 = f1_score(ground_truth, pred)
 
     return f1
+
+
+# ---------------------------------------------------------------------------
+# Paper-compatible supervised evaluation, per-epoch history, dual checkpointing
+# and run summaries (legacy IBM Multi-GNN / Egressy et al. reproduction protocol).
+#
+# Primary decision rule for the reproduction metric: argmax over two-class logits.
+# Checkpoint-selection metric: validation minority-class (label 1) F1 only.
+# Per-epoch metrics are computed in the upstream train-mode regime (model.eval() is
+# NOT toggled), matching the fork-point (commit fc751e8) evaluation. Deterministic
+# richer evaluation is produced post-hoc from the best-val checkpoint by
+# scripts/evaluate_supervised_gnn.py (which does call model.eval()).
+# ---------------------------------------------------------------------------
+
+DECISION_RULE_ARGMAX = "argmax over two-class logits"
+SELECTION_METRIC_VAL_F1 = "validation_minority_f1"
+CHECKPOINT_SELECTION_RULE = (
+    "best validation minority-class F1 (strict improvement; earliest epoch kept on tie)"
+)
+SUPERVISED_ARG_KEYS = (
+    "model", "data", "supervised_head", "objective", "reverse_mp", "emlps",
+    "ports", "tds", "ego", "seed", "n_epochs", "batch_size", "num_neighs",
+    "override_lr", "override_n_hidden", "override_final_dropout", "finetune",
+    "unique_name",
+)
+
+
+def supervised_run_name(args) -> str:
+    return str(getattr(args, "unique_name", None) or f"{getattr(args, 'model', 'model')}_supervised")
+
+
+def supervised_diagnostics_dir() -> Path:
+    return Path("results") / "diagnostics"
+
+
+def supervised_epoch_history_path(args) -> Path:
+    return supervised_diagnostics_dir() / (
+        f"supervised_{getattr(args, 'data', 'data')}_{supervised_run_name(args)}_epoch_history.json"
+    )
+
+
+def supervised_summary_json_path(args) -> Path:
+    return supervised_diagnostics_dir() / (
+        f"supervised_{getattr(args, 'data', 'data')}_{supervised_run_name(args)}_summary.json"
+    )
+
+
+def supervised_summary_md_path(args) -> Path:
+    return Path("notes") / (
+        f"supervised_{getattr(args, 'data', 'data')}_{supervised_run_name(args)}_summary.md"
+    )
+
+
+def supervised_run_dir(data_config, run_name: str) -> Path:
+    return Path(data_config["paths"]["model_to_save"]) / str(run_name)
+
+
+def _atomic_json_dump(payload: Dict[str, Any], path: Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    os.replace(tmp, path)
+
+
+def _atomic_torch_save(payload: Dict[str, Any], path: Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
+def _supervised_split_metrics(
+    y_true: np.ndarray, y_pred_argmax: np.ndarray, y_proba: np.ndarray
+) -> Dict[str, float]:
+    metrics = {
+        "f1_argmax": float(f1_score(y_true, y_pred_argmax, zero_division=0)),
+        "precision_argmax": float(precision_score(y_true, y_pred_argmax, zero_division=0)),
+        "recall_argmax": float(recall_score(y_true, y_pred_argmax, zero_division=0)),
+    }
+    if np.unique(y_true).size < 2:
+        metrics["auroc"] = float("nan")
+        metrics["auprc"] = float("nan")
+    else:
+        metrics["auroc"] = float(roc_auc_score(y_true, y_proba))
+        metrics["auprc"] = float(average_precision_score(y_true, y_proba))
+    return metrics
+
+
+@torch.no_grad()
+def _collect_supervised_predictions_homo(loader, inds, model, data, device, args):
+    preds: List[torch.Tensor] = []
+    grounds: List[torch.Tensor] = []
+    probas: List[torch.Tensor] = []
+    for batch in tqdm.tqdm(loader, disable=not args.tqdm):
+        inds_cpu = inds.detach().cpu()
+        batch_edge_inds = inds_cpu[batch.input_id.detach().cpu()]
+        batch_edge_ids = loader.data.edge_attr.detach().cpu()[batch_edge_inds, 0]
+        mask = torch.isin(batch.edge_attr[:, 0].detach().cpu(), batch_edge_ids)
+
+        missing = ~torch.isin(batch_edge_ids, batch.edge_attr[:, 0].detach().cpu())
+        if missing.sum() != 0 and (args.data == 'Small_J' or args.data == 'Small_Q'):
+            missing_ids = batch_edge_ids[missing].int()
+            n_ids = batch.n_id
+            add_edge_index = data.edge_index[:, missing_ids].detach().clone()
+            node_mapping = {value.item(): idx for idx, value in enumerate(n_ids)}
+            add_edge_index = torch.tensor([[node_mapping[val.item()] for val in row] for row in add_edge_index])
+            add_edge_attr = data.edge_attr[missing_ids, :].detach().clone()
+            add_y = data.y[missing_ids].detach().clone()
+            batch.edge_index = torch.cat((batch.edge_index, add_edge_index), 1)
+            batch.edge_attr = torch.cat((batch.edge_attr, add_edge_attr), 0)
+            batch.y = torch.cat((batch.y, add_y), 0)
+            mask = torch.cat((mask, torch.ones(add_y.shape[0], dtype=torch.bool)))
+
+        batch.edge_attr = batch.edge_attr[:, 1:]
+        batch.to(device)
+        z = model(batch.x, batch.edge_index, batch.edge_attr)
+        logits = model.classifier(z)[mask]
+        probas.append(torch.softmax(logits, dim=-1)[:, 1].cpu())
+        preds.append(logits.argmax(dim=-1).cpu())
+        grounds.append(batch.y[mask].cpu())
+    y = torch.cat(grounds).numpy()
+    pred = torch.cat(preds).numpy()
+    proba = torch.cat(probas).numpy()
+    return y, pred, proba
+
+
+@torch.no_grad()
+def _collect_supervised_predictions_hetero(loader, inds, model, data, device, args):
+    preds: List[torch.Tensor] = []
+    grounds: List[torch.Tensor] = []
+    probas: List[torch.Tensor] = []
+    for batch in tqdm.tqdm(loader, disable=not args.tqdm):
+        inds_cpu = inds.detach().cpu()
+        batch_edge_inds = inds_cpu[batch['node', 'to', 'node'].input_id.detach().cpu()]
+        batch_edge_ids = loader.data['node', 'to', 'node'].edge_attr.detach().cpu()[batch_edge_inds, 0]
+        mask = torch.isin(batch['node', 'to', 'node'].edge_attr[:, 0].detach().cpu(), batch_edge_ids)
+
+        missing = ~torch.isin(batch_edge_ids, batch['node', 'to', 'node'].edge_attr[:, 0].detach().cpu())
+        if missing.sum() != 0 and (args.data == 'Small_J' or args.data == 'Small_Q'):
+            missing_ids = batch_edge_ids[missing].int()
+            n_ids = batch['node'].n_id
+            add_edge_index = data['node', 'to', 'node'].edge_index[:, missing_ids].detach().clone()
+            node_mapping = {value.item(): idx for idx, value in enumerate(n_ids)}
+            add_edge_index = torch.tensor([[node_mapping[val.item()] for val in row] for row in add_edge_index])
+            add_edge_attr = data['node', 'to', 'node'].edge_attr[missing_ids, :].detach().clone()
+            add_y = data['node', 'to', 'node'].y[missing_ids].detach().clone()
+            batch['node', 'to', 'node'].edge_index = torch.cat((batch['node', 'to', 'node'].edge_index, add_edge_index), 1)
+            batch['node', 'to', 'node'].edge_attr = torch.cat((batch['node', 'to', 'node'].edge_attr, add_edge_attr), 0)
+            batch['node', 'to', 'node'].y = torch.cat((batch['node', 'to', 'node'].y, add_y), 0)
+            mask = torch.cat((mask, torch.ones(add_y.shape[0], dtype=torch.bool)))
+
+        batch['node', 'to', 'node'].edge_attr = batch['node', 'to', 'node'].edge_attr[:, 1:]
+        batch['node', 'rev_to', 'node'].edge_attr = batch['node', 'rev_to', 'node'].edge_attr[:, 1:]
+        batch.to(device)
+        z = model(batch.x_dict, batch.edge_index_dict, batch.edge_attr_dict)[('node', 'to', 'node')]
+        logits = edge_classifier_logits(model, z)[mask]
+        probas.append(torch.softmax(logits, dim=-1)[:, 1].cpu())
+        preds.append(logits.argmax(dim=-1).cpu())
+        grounds.append(batch['node', 'to', 'node'].y[mask].cpu())
+    y = torch.cat(grounds).numpy()
+    pred = torch.cat(preds).numpy()
+    proba = torch.cat(probas).numpy()
+    return y, pred, proba
+
+
+def evaluate_supervised_split(loader, inds, model, data, device, args) -> Dict[str, float]:
+    """One-pass supervised metrics for a split (argmax F1/precision/recall + AUROC/AUPRC).
+
+    The paper-compatible fields (``*_argmax``) use argmax over two-class logits, matching the
+    upstream evaluation. ``model.eval()`` is deliberately NOT toggled here, reproducing the
+    fork-point train-mode evaluation regime; the caller controls the model's mode.
+    """
+    if isinstance(data, HeteroData):
+        y, pred, proba = _collect_supervised_predictions_hetero(loader, inds, model, data, device, args)
+    else:
+        y, pred, proba = _collect_supervised_predictions_homo(loader, inds, model, data, device, args)
+    return _supervised_split_metrics(y, pred, proba)
+
+
+def supervised_run_metadata(args, config) -> Dict[str, Any]:
+    return {
+        "run_name": supervised_run_name(args),
+        "dataset": getattr(args, "data", None),
+        "seed": int(getattr(args, "seed", -1)),
+        "model_architecture": getattr(args, "model", None),
+        "supervised_head": getattr(args, "supervised_head", "embedding"),
+        "graph_flags": {
+            "emlps": bool(getattr(args, "emlps", False)),
+            "reverse_mp": bool(getattr(args, "reverse_mp", False)),
+            "ports": bool(getattr(args, "ports", False)),
+            "tds": bool(getattr(args, "tds", False)),
+            "ego": bool(getattr(args, "ego", False)),
+        },
+        "class_weights": {
+            "0": float(getattr(config, "w_ce1", float("nan"))),
+            "1": float(getattr(config, "w_ce2", float("nan"))),
+        },
+        "optimizer": "adam",
+        "n_epochs": int(getattr(config, "epochs", getattr(args, "n_epochs", -1))),
+        "checkpoint_selection_rule": CHECKPOINT_SELECTION_RULE,
+        "selection_metric": SELECTION_METRIC_VAL_F1,
+        "decision_rule": DECISION_RULE_ARGMAX,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+class SupervisedHistoryRecorder:
+    """Incrementally writes per-epoch supervised history with an atomic replace each epoch."""
+
+    def __init__(self, path: Path, metadata: Dict[str, Any]):
+        self.path = Path(path)
+        self.metadata = metadata
+        self.epochs: List[Dict[str, Any]] = []
+
+    def record_epoch(self, row: Dict[str, Any]) -> None:
+        self.epochs.append(row)
+        payload = dict(self.metadata)
+        payload["epochs"] = self.epochs
+        try:
+            _atomic_json_dump(payload, self.path)
+        except OSError as exc:  # keep long training runs alive if disk write fails
+            logging.warning("Failed to write supervised epoch history %s: %s", self.path, exc)
+
+
+class SupervisedCheckpointer:
+    """Dual supervised checkpointing on the Egressy-style best-validation protocol.
+
+    - ``checkpoint_last.tar``        : written every epoch (resume state).
+    - ``checkpoint_best_val_f1.tar`` : written only when validation minority-class F1 strictly
+                                       improves (ties keep the earliest epoch).
+    - flat ``checkpoint_{unique_name}.tar`` : retained (= last epoch) for backward-compatible
+                                       tooling. Reproduction evaluation MUST use the best-val file.
+
+    Best-validation selection state is tracked regardless of ``--save_model``; files are only
+    written when ``args.save_model`` is set.
+    """
+
+    def __init__(self, args, config, data_config):
+        self.args = args
+        self.config = config
+        self.data_config = data_config
+        self.save = bool(getattr(args, "save_model", False))
+        self.run_name = supervised_run_name(args)
+        self.run_dir = supervised_run_dir(data_config, self.run_name)
+        self.flat_path = Path(data_config["paths"]["model_to_save"]) / f"checkpoint_{self.run_name}.tar"
+        self.best_val_f1: Optional[float] = None
+        self.selected_epoch: Optional[int] = None
+        self.test_f1_at_selected: Optional[float] = None
+        if self.save:
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+
+    def _base_payload(self, epoch: int, model, optimizer, scheduler) -> Dict[str, Any]:
+        return {
+            "epoch": epoch + 1,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+            "seed": int(getattr(self.args, "seed", -1)),
+            "supervised_head": getattr(self.args, "supervised_head", "embedding"),
+            "args": {k: getattr(self.args, k, None) for k in SUPERVISED_ARG_KEYS},
+            "config": {
+                "lr": float(getattr(self.config, "lr", float("nan"))),
+                "n_hidden": float(getattr(self.config, "n_hidden", float("nan"))),
+                "n_gnn_layers": int(round(float(getattr(self.config, "n_gnn_layers", 0) or 0))),
+                "dropout": float(getattr(self.config, "dropout", float("nan"))),
+                "final_dropout": float(getattr(self.config, "final_dropout", float("nan"))),
+                "w_ce1": float(getattr(self.config, "w_ce1", float("nan"))),
+                "w_ce2": float(getattr(self.config, "w_ce2", float("nan"))),
+                "epochs": int(getattr(self.config, "epochs", -1)),
+            },
+            "best_validation_f1": self.best_val_f1,
+            "selected_epoch": self.selected_epoch,
+            "test_f1_at_selected_epoch": self.test_f1_at_selected,
+        }
+
+    def update(self, epoch: int, model, optimizer, scheduler, val_f1: float, test_f1: float) -> bool:
+        """Update selection state and (when saving) write last + best checkpoints.
+
+        Selection depends ONLY on ``val_f1`` (validation minority-class F1); ``test_f1`` is
+        recorded alongside the selected checkpoint but never influences selection.
+        """
+        improved = self.best_val_f1 is None or val_f1 > self.best_val_f1
+        if improved:
+            self.best_val_f1 = float(val_f1)
+            self.selected_epoch = epoch + 1
+            self.test_f1_at_selected = float(test_f1)
+
+        if self.save:
+            payload = self._base_payload(epoch, model, optimizer, scheduler)
+            _atomic_torch_save(payload, self.run_dir / "checkpoint_last.tar")
+            # Flat compatibility checkpoint tracks the LAST epoch for legacy tooling.
+            _atomic_torch_save(payload, self.flat_path)
+            if improved:
+                best_payload = dict(payload)
+                best_payload.update({
+                    "selected_epoch": self.selected_epoch,
+                    "best_validation_f1": self.best_val_f1,
+                    "test_f1_at_selected_epoch": self.test_f1_at_selected,
+                    "selection_metric": SELECTION_METRIC_VAL_F1,
+                    "decision_rule": "argmax",
+                })
+                _atomic_torch_save(best_payload, self.run_dir / "checkpoint_best_val_f1.tar")
+        return improved
+
+
+def prepare_supervised_resume(
+    args,
+    model,
+    optimizer,
+    recorder: SupervisedHistoryRecorder,
+    checkpointer: SupervisedCheckpointer,
+    device,
+) -> int:
+    """Load ``checkpoint_last.tar`` when ``--resume_supervised`` is set.
+
+    Restores model/optimizer state, best-validation selection, and prior epoch history.
+    Returns the 0-based epoch index to continue from (``checkpoint['epoch']`` = completed count).
+    """
+    if not getattr(args, "resume_supervised", False):
+        return 0
+    last_path = checkpointer.run_dir / "checkpoint_last.tar"
+    if not last_path.is_file():
+        logging.warning(
+            "--resume_supervised set but %s is missing; starting from epoch 0.", last_path
+        )
+        return 0
+    checkpoint = torch.load(last_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    checkpointer.best_val_f1 = checkpoint.get("best_validation_f1")
+    checkpointer.selected_epoch = checkpoint.get("selected_epoch")
+    checkpointer.test_f1_at_selected = checkpoint.get("test_f1_at_selected_epoch")
+    hist_path = supervised_epoch_history_path(args)
+    if hist_path.is_file():
+        with hist_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        recorder.epochs = list(payload.get("epochs", []))
+    start_epoch = int(checkpoint.get("epoch", 0))
+    logging.info(
+        "Resuming supervised training from epoch %d (loaded %s; best val F1 %.4f @ ep %s).",
+        start_epoch,
+        last_path,
+        checkpointer.best_val_f1 if checkpointer.best_val_f1 is not None else float("nan"),
+        checkpointer.selected_epoch,
+    )
+    return start_epoch
+
+
+def _is_configured_to_reproduce_egressy(args) -> bool:
+    """Conservative gate for reproduction wording (constraint 8).
+
+    Only GINe with the legacy head is a numerically validated legacy restoration. A ``--testing``
+    (dev/scout) run is never labeled reproduction-configured. Full reproduction still requires
+    manual confirmation of data split, hyperparameters, class weights, optimizer, epoch count,
+    selection rule, and decision rule against the upstream row.
+    """
+    return (
+        getattr(args, "supervised_head", "embedding") == "legacy"
+        and getattr(args, "model", None) == "gin"
+        and not bool(getattr(args, "testing", False))
+    )
+
+
+def write_supervised_summary(args, config, recorder: SupervisedHistoryRecorder,
+                             checkpointer: SupervisedCheckpointer) -> Optional[Path]:
+    """Write the Phase 6 run summary JSON + Markdown note. Never raises during training."""
+    try:
+        epochs = recorder.epochs
+        if not epochs:
+            return None
+        final_row = epochs[-1]
+        final_test_f1 = float(final_row.get("test_minority_f1_argmax", float("nan")))
+        selected_epoch = checkpointer.selected_epoch
+        selected_row = None
+        if selected_epoch is not None:
+            for row in epochs:
+                if row.get("epoch") == selected_epoch:
+                    selected_row = row
+                    break
+        best_val_f1 = checkpointer.best_val_f1
+        test_f1_at_best = checkpointer.test_f1_at_selected
+        best_final_delta = (
+            abs(final_test_f1 - test_f1_at_best)
+            if test_f1_at_best is not None and not np.isnan(final_test_f1)
+            else float("nan")
+        )
+        differ_substantially = bool(best_final_delta > 0.02) if not np.isnan(best_final_delta) else False
+        head = getattr(args, "supervised_head", "embedding")
+        reproduction = _is_configured_to_reproduce_egressy(args)
+        is_scout = bool(getattr(args, "testing", False))
+        run_kind = "scout/dev (--testing)" if is_scout else "standard"
+        if head == "legacy" and getattr(args, "model", None) == "gin":
+            if reproduction:
+                caveat = (
+                    "Legacy GINe head is a numerically validated restoration; 'configured to "
+                    "reproduce the corresponding Egressy et al. setup' still requires manual "
+                    "confirmation of data split, hyperparameters, class weights, optimizer, epoch "
+                    "count, selection rule, and decision rule."
+                )
+            else:
+                caveat = (
+                    "Legacy GINe head (numerically validated), but this is a scout/dev run "
+                    "(--testing) and/or not the full upstream setup: NOT paper-comparable. Run a "
+                    "non-testing, upstream epoch-count job before comparing to the Egressy et al. table."
+                )
+        elif head == "legacy":
+            caveat = (
+                f"Legacy head on a non-GINe architecture ({getattr(args, 'model', None)}) is "
+                "restored-but-unvalidated; not paper-comparable."
+            )
+        else:
+            caveat = (
+                "This is the current embedding-head supervised control; it is NOT the "
+                "Egressy/Multi-GNN baseline."
+            )
+        metadata = recorder.metadata
+
+        summary = {
+            **metadata,
+            "supervised_mode": head,
+            "run_kind": run_kind,
+            "paper_comparable": reproduction,
+            "best_validation_epoch": selected_epoch,
+            "validation_minority_f1_argmax_at_best": best_val_f1,
+            "test_minority_f1_argmax_at_best": test_f1_at_best,
+            "final_epoch_test_minority_f1_argmax": final_test_f1,
+            "best_vs_final_test_f1_abs_delta": best_final_delta,
+            "best_and_final_differ_substantially": differ_substantially,
+            "primary_reproduction_metric": "test_minority_f1_argmax_at_best (decision rule: argmax over two-class logits)",
+            "richer_ranking_metrics_at_best": {
+                "validation_auroc": selected_row.get("validation_auroc") if selected_row else None,
+                "validation_auprc": selected_row.get("validation_auprc") if selected_row else None,
+                "test_auroc": selected_row.get("test_auroc") if selected_row else None,
+                "test_auprc": selected_row.get("test_auprc") if selected_row else None,
+            },
+            "configured_to_reproduce_egressy_setup": reproduction,
+            "reproduction_caveat": caveat,
+            "epoch_history_path": str(recorder.path),
+            "best_val_checkpoint_path": str(checkpointer.run_dir / "checkpoint_best_val_f1.tar"),
+            "last_checkpoint_path": str(checkpointer.run_dir / "checkpoint_last.tar"),
+            "flat_compat_checkpoint_path": str(checkpointer.flat_path),
+        }
+        json_path = supervised_summary_json_path(args)
+        _atomic_json_dump(summary, json_path)
+        _write_supervised_summary_md(supervised_summary_md_path(args), summary)
+        logging.info("Wrote supervised run summary to %s", json_path)
+        return json_path
+    except Exception as exc:  # noqa: BLE001 - summary must never break training
+        logging.warning("Failed to write supervised run summary: %s", exc)
+        return None
+
+
+def _fmt(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    if isinstance(value, float):
+        return "n/a" if np.isnan(value) else f"{value:.4f}"
+    return str(value)
+
+
+def _write_supervised_summary_md(path: Path, summary: Dict[str, Any]) -> None:
+    head = summary.get("supervised_head", "embedding")
+    run_kind = summary.get("run_kind", "standard")
+    if head == "legacy":
+        scout_tag = " scout/integration run (NOT the full reproduction)" if "scout" in run_kind else ""
+        mode_line = f"legacy supervised reproduction head (IBM Multi-GNN / Egressy et al.){scout_tag}"
+    else:
+        mode_line = "current embedding-head supervised control (NOT the Egressy/Multi-GNN baseline)"
+    flags = summary.get("graph_flags", {})
+    flag_str = ", ".join(f"{k}={v}" for k, v in flags.items())
+    ranking = summary.get("richer_ranking_metrics_at_best", {})
+    lines = [
+        f"# Supervised run summary: {summary.get('run_name')}",
+        "",
+        f"- **Supervised mode:** {mode_line}",
+        f"- **Run kind:** {run_kind}  |  **Paper-comparable:** {summary.get('paper_comparable')}",
+        f"- **Model architecture:** {summary.get('model_architecture')} (supervised_head={head})",
+        f"- **Dataset:** {summary.get('dataset')}  |  **Seed:** {summary.get('seed')}",
+        f"- **Graph flags:** {flag_str}",
+        f"- **Class weights (0,1):** ({_fmt(summary.get('class_weights', {}).get('0'))}, "
+        f"{_fmt(summary.get('class_weights', {}).get('1'))})",
+        f"- **Optimizer / epochs:** {summary.get('optimizer')} / {summary.get('n_epochs')}",
+        f"- **Selection metric:** {summary.get('selection_metric')}  |  "
+        f"**Decision rule:** {summary.get('decision_rule')}",
+        "",
+        "## Best-validation selection",
+        "",
+        f"- **Best validation epoch:** {_fmt(summary.get('best_validation_epoch'))}",
+        f"- **Validation minority F1 (argmax) at best:** {_fmt(summary.get('validation_minority_f1_argmax_at_best'))}",
+        f"- **Test minority F1 (argmax) at best epoch:** {_fmt(summary.get('test_minority_f1_argmax_at_best'))}  "
+        "(primary reproduction metric)",
+        f"- **Final-epoch test minority F1 (argmax):** {_fmt(summary.get('final_epoch_test_minority_f1_argmax'))}",
+        f"- **Best vs final test F1 |delta|:** {_fmt(summary.get('best_vs_final_test_f1_abs_delta'))}  "
+        f"(differ substantially: {summary.get('best_and_final_differ_substantially')})",
+        "",
+        "## Richer ranking metrics at best epoch (train-mode, diagnostic)",
+        "",
+        f"- validation AUROC: {_fmt(ranking.get('validation_auroc'))}  |  "
+        f"validation AUPRC: {_fmt(ranking.get('validation_auprc'))}",
+        f"- test AUROC: {_fmt(ranking.get('test_auroc'))}  |  "
+        f"test AUPRC: {_fmt(ranking.get('test_auprc'))}",
+        "",
+        "## Reproduction comparability",
+        "",
+        f"- **Configured to reproduce Egressy et al. setup:** {summary.get('configured_to_reproduce_egressy_setup')}",
+        f"- {summary.get('reproduction_caveat')}",
+        "",
+        "## Artifacts",
+        "",
+        f"- Epoch history: `{summary.get('epoch_history_path')}`",
+        f"- Best-val checkpoint (use for reproduction eval): `{summary.get('best_val_checkpoint_path')}`",
+        f"- Last checkpoint: `{summary.get('last_checkpoint_path')}`",
+        f"- Flat compatibility checkpoint (= last epoch): `{summary.get('flat_compat_checkpoint_path')}`",
+        "",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+
 
 def load_model(model, device, args, config, data_config):
     checkpoint = torch.load(f'{data_config["paths"]["model_to_load"]}/checkpoint_{args.unique_name}.tar')

@@ -5,12 +5,42 @@ import torch
 import logging
 from torch.utils.checkpoint import checkpoint
 
+SUPERVISED_HEADS = ("embedding", "legacy")
+
+
+def _validate_supervised_head(supervised_head: str) -> str:
+    head = str(supervised_head or "embedding").lower()
+    if head not in SUPERVISED_HEADS:
+        raise ValueError(
+            f"Unsupported supervised_head {supervised_head!r}; use one of {SUPERVISED_HEADS}."
+        )
+    return head
+
+
+def _legacy_edge_classifier(n_hidden: int, n_classes: int, final_dropout: float) -> nn.Sequential:
+    """Fork-point IBM Multi-GNN (Egressy et al.) supervised head: 3*n_hidden -> 50 -> 25 -> n_classes.
+
+    Reproduces ``self.mlp`` from commit ``fc751e8:models.py`` (identical across GINe/GATe/PNA/RGCN):
+    ``Sequential(Linear(3h,50), ReLU, Dropout(fd), Linear(50,25), ReLU, Dropout(fd), Linear(25, n))``.
+    Applied on the raw edge representation, it emits two-class logits directly (no 128-d bottleneck).
+    """
+    return nn.Sequential(
+        nn.Linear(n_hidden * 3, 50),
+        nn.ReLU(),
+        nn.Dropout(final_dropout),
+        nn.Linear(50, 25),
+        nn.ReLU(),
+        nn.Dropout(final_dropout),
+        nn.Linear(25, n_classes),
+    )
+
 
 class GINe(torch.nn.Module):
     def __init__(self, num_features, num_gnn_layers, n_classes=2,
                 n_hidden=100, edge_updates=False, residual=True,
                 edge_dim=None, dropout=0.0, final_dropout=0.5,
-                embedding_dim=128, use_gradient_checkpointing=False):
+                embedding_dim=128, use_gradient_checkpointing=False,
+                supervised_head="embedding"):
 
         super().__init__()
         self.n_hidden = n_hidden
@@ -19,6 +49,7 @@ class GINe(torch.nn.Module):
         self.final_dropout = final_dropout
         self.embedding_dim = embedding_dim
         self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.supervised_head = _validate_supervised_head(supervised_head)
 
         self.node_emb = nn.Linear(num_features, n_hidden)
         self.edge_emb = nn.Linear(edge_dim, n_hidden)
@@ -44,16 +75,22 @@ class GINe(torch.nn.Module):
             self.convs.append(conv)
             self.batch_norms.append(BatchNorm(n_hidden))
 
-        # new embedding layer compresses GNN output into clean representation space
-        self.embedding_head = nn.Linear(n_hidden * 3, embedding_dim)
-
-        # classifier uses embedding_dim and maps representation to a prediction
-        self.classifier = nn.Sequential(
-            nn.Linear(embedding_dim, 50),
-            nn.ReLU(),
-            nn.Dropout(self.final_dropout),
-            nn.Linear(50, n_classes)
-        )
+        if self.supervised_head == "legacy":
+            # Fork-point (IBM Multi-GNN, Egressy et al.) head: logits straight from the
+            # 3*n_hidden edge representation, no embedding bottleneck. forward() returns
+            # that representation and self.classifier maps it to two-class logits.
+            self.embedding_head = None
+            self.classifier = _legacy_edge_classifier(n_hidden, n_classes, self.final_dropout)
+        else:
+            # Current project head: embedding layer compresses GNN output into a clean
+            # representation space; classifier maps the embedding to a prediction.
+            self.embedding_head = nn.Linear(n_hidden * 3, embedding_dim)
+            self.classifier = nn.Sequential(
+                nn.Linear(embedding_dim, 50),
+                nn.ReLU(),
+                nn.Dropout(self.final_dropout),
+                nn.Linear(50, n_classes)
+            )
 
     def _input_embedding_forward(self, x: torch.Tensor, edge_attr: torch.Tensor) -> tuple:
         return self.node_emb(x), self.edge_emb(edge_attr)
@@ -106,20 +143,37 @@ class GINe(torch.nn.Module):
                         torch.cat([x[src], x[dst], edge_attr], dim=-1)
                     ) / 2
 
-        # Per-edge readout + embedding head: large activations; checkpoint when enabled.
+        # Per-edge readout (+ embedding head in embedding mode): large activations;
+        # checkpoint when enabled.
+        tail_fn = (
+            self._legacy_readout_forward
+            if self.supervised_head == "legacy"
+            else self._embedding_tail_forward
+        )
         if self.use_gradient_checkpointing and self.training:
             z = checkpoint(
-                self._embedding_tail_forward,
+                tail_fn,
                 x,
                 edge_index,
                 edge_attr,
                 use_reentrant=False,
             )
         else:
-            z = self._embedding_tail_forward(x, edge_index, edge_attr)
+            z = tail_fn(x, edge_index, edge_attr)
 
-        # Edge embeddings only (FX-safe for torch_geometric.to_hetero). Supervised: model.classifier(z).
+        # Edge representation only (FX-safe for torch_geometric.to_hetero). Supervised:
+        # model.classifier(z). embedding mode returns embedding_dim; legacy returns 3*n_hidden.
         return z
+
+    def _legacy_readout_forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+    ) -> torch.Tensor:
+        """Upstream fork-point edge representation: cat(relu(node pair), edge_attr) -> 3*n_hidden."""
+        x = x[edge_index.T].reshape(-1, 2 * self.n_hidden).relu()
+        return torch.cat((x, edge_attr), dim=1)
 
     def _embedding_tail_forward(
         self,
@@ -145,6 +199,7 @@ class GATe(torch.nn.Module):
         dropout=0.0,
         final_dropout=0.5,
         embedding_dim=128,
+        supervised_head="embedding",
     ):
         super().__init__()
 
@@ -159,6 +214,7 @@ class GATe(torch.nn.Module):
         self.dropout = dropout
         self.final_dropout = final_dropout
         self.embedding_dim = embedding_dim
+        self.supervised_head = _validate_supervised_head(supervised_head)
 
         self.node_emb = nn.Linear(num_features, n_hidden)
         self.edge_emb = nn.Linear(edge_dim, n_hidden)
@@ -190,14 +246,19 @@ class GATe(torch.nn.Module):
             self.convs.append(conv)
             self.batch_norms.append(BatchNorm(n_hidden))
 
-        self.embedding_head = nn.Linear(n_hidden * 3, embedding_dim)
-
-        self.classifier = nn.Sequential(
-            nn.Linear(embedding_dim, 50),
-            nn.ReLU(),
-            nn.Dropout(self.final_dropout),
-            nn.Linear(50, n_classes),
-        )
+        # supervised_head="legacy" is restored-but-unvalidated for GATe (uniform fork-point
+        # head; only GINe is numerically validated against the fork point).
+        if self.supervised_head == "legacy":
+            self.embedding_head = None
+            self.classifier = _legacy_edge_classifier(n_hidden, n_classes, self.final_dropout)
+        else:
+            self.embedding_head = nn.Linear(n_hidden * 3, embedding_dim)
+            self.classifier = nn.Sequential(
+                nn.Linear(embedding_dim, 50),
+                nn.ReLU(),
+                nn.Dropout(self.final_dropout),
+                nn.Linear(50, n_classes),
+            )
 
     def forward(self, x, edge_index, edge_attr):
         src, dst = edge_index
@@ -223,6 +284,8 @@ class GATe(torch.nn.Module):
         x = torch.cat((x, edge_attr), dim=1)
         logging.debug(f"x.shape after concat = {x.shape}")
 
+        if self.supervised_head == "legacy":
+            return x
         z = self.embedding_head(x)
         return z
 
@@ -240,6 +303,7 @@ class PNA(torch.nn.Module):
         final_dropout=0.5,
         deg=None,
         embedding_dim=128,
+        supervised_head="embedding",
     ):
         super().__init__()
 
@@ -250,6 +314,7 @@ class PNA(torch.nn.Module):
         self.edge_updates = edge_updates
         self.final_dropout = final_dropout
         self.embedding_dim = embedding_dim
+        self.supervised_head = _validate_supervised_head(supervised_head)
 
         aggregators = ['mean', 'min', 'max', 'std']
         scalers = ['identity', 'amplification', 'attenuation']
@@ -287,14 +352,19 @@ class PNA(torch.nn.Module):
             self.convs.append(conv)
             self.batch_norms.append(BatchNorm(n_hidden))
 
-        self.embedding_head = nn.Linear(n_hidden * 3, embedding_dim)
-
-        self.classifier = nn.Sequential(
-            nn.Linear(embedding_dim, 50),
-            nn.ReLU(),
-            nn.Dropout(self.final_dropout),
-            nn.Linear(50, n_classes),
-        )
+        # supervised_head="legacy" is restored-but-unvalidated for PNA (uniform fork-point
+        # head; only GINe is numerically validated against the fork point).
+        if self.supervised_head == "legacy":
+            self.embedding_head = None
+            self.classifier = _legacy_edge_classifier(n_hidden, n_classes, self.final_dropout)
+        else:
+            self.embedding_head = nn.Linear(n_hidden * 3, embedding_dim)
+            self.classifier = nn.Sequential(
+                nn.Linear(embedding_dim, 50),
+                nn.ReLU(),
+                nn.Dropout(self.final_dropout),
+                nn.Linear(50, n_classes),
+            )
 
     def forward(self, x, edge_index, edge_attr):
         src, dst = edge_index
@@ -321,6 +391,8 @@ class PNA(torch.nn.Module):
         x = torch.cat((x, edge_attr), dim=1)
         logging.debug(f"x.shape after concat = {x.shape}")
 
+        if self.supervised_head == "legacy":
+            return x
         z = self.embedding_head(x)
         return z
 
@@ -340,6 +412,7 @@ class RGCN(nn.Module):
         final_dropout=0.5,
         n_bases=-1,
         embedding_dim=128,
+        supervised_head="embedding",
     ):
         super(RGCN, self).__init__()
 
@@ -354,6 +427,7 @@ class RGCN(nn.Module):
         self.num_relations = num_relations
         self.n_bases = n_bases
         self.embedding_dim = embedding_dim
+        self.supervised_head = _validate_supervised_head(supervised_head)
 
         self.node_emb = nn.Linear(num_features, n_hidden)
         self.edge_emb = nn.Linear(edge_dim, n_hidden)
@@ -383,14 +457,19 @@ class RGCN(nn.Module):
                     )
                 )
 
-        self.embedding_head = nn.Linear(n_hidden * 3, embedding_dim)
-
-        self.classifier = nn.Sequential(
-            nn.Linear(embedding_dim, 50),
-            nn.ReLU(),
-            nn.Dropout(self.final_dropout),
-            nn.Linear(50, n_classes),
-        )
+        # supervised_head="legacy" is restored-but-unvalidated for RGCN (uniform fork-point
+        # head; only GINe is numerically validated against the fork point).
+        if self.supervised_head == "legacy":
+            self.embedding_head = None
+            self.classifier = _legacy_edge_classifier(n_hidden, n_classes, self.final_dropout)
+        else:
+            self.embedding_head = nn.Linear(n_hidden * 3, embedding_dim)
+            self.classifier = nn.Sequential(
+                nn.Linear(embedding_dim, 50),
+                nn.ReLU(),
+                nn.Dropout(self.final_dropout),
+                nn.Linear(50, n_classes),
+            )
 
     def reset_parameters(self):
         for m in self.modules():
@@ -427,5 +506,7 @@ class RGCN(nn.Module):
         x = x[edge_index.T].reshape(-1, 2 * self.n_hidden).relu()
         x = torch.cat((x, edge_attr), dim=1)
 
+        if self.supervised_head == "legacy":
+            return x
         z = self.embedding_head(x)
         return z

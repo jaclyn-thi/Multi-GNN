@@ -25,6 +25,13 @@ from train_util import (
     get_loaders,
     evaluate_homo,
     evaluate_hetero,
+    evaluate_supervised_split,
+    supervised_run_metadata,
+    supervised_epoch_history_path,
+    SupervisedHistoryRecorder,
+    SupervisedCheckpointer,
+    prepare_supervised_resume,
+    write_supervised_summary,
     edge_classifier_logits,
     log_training_setup,
     resolve_training_setup,
@@ -585,10 +592,73 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
     return model
 
 
+def _log_and_record_supervised_epoch(
+    epoch, train_f1, train_loss, val_metrics, te_metrics, optimizer, recorder
+):
+    """Log the paper-compatible per-epoch metrics (argmax) and append to the history file.
+
+    The 'Train F1:' / 'Validation F1:' / 'Test F1:' log lines are preserved verbatim so
+    downstream log parsers (scripts/evaluate_supervised_gnn.py) keep working.
+    """
+    lr = float(optimizer.param_groups[0]["lr"])
+    logging.info(f"Train F1: {train_f1:.4f}")
+    logging.info(f"Validation F1: {val_metrics['f1_argmax']:.4f}")
+    logging.info(f"Test F1: {te_metrics['f1_argmax']:.4f}")
+    wandb.log(
+        {
+            "f1/train": train_f1,
+            "loss/train": train_loss,
+            "f1/validation": val_metrics["f1_argmax"],
+            "f1/test": te_metrics["f1_argmax"],
+            "precision/validation": val_metrics["precision_argmax"],
+            "recall/validation": val_metrics["recall_argmax"],
+            "precision/test": te_metrics["precision_argmax"],
+            "recall/test": te_metrics["recall_argmax"],
+            "auroc/validation": val_metrics["auroc"],
+            "auprc/validation": val_metrics["auprc"],
+            "auroc/test": te_metrics["auroc"],
+            "auprc/test": te_metrics["auprc"],
+            "lr": lr,
+        },
+        step=epoch,
+    )
+    recorder.record_epoch(
+        {
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "validation_minority_f1_argmax": val_metrics["f1_argmax"],
+            "test_minority_f1_argmax": te_metrics["f1_argmax"],
+            "validation_precision_argmax": val_metrics["precision_argmax"],
+            "validation_recall_argmax": val_metrics["recall_argmax"],
+            "test_precision_argmax": te_metrics["precision_argmax"],
+            "test_recall_argmax": te_metrics["recall_argmax"],
+            "validation_auroc": val_metrics["auroc"],
+            "validation_auprc": val_metrics["auprc"],
+            "test_auroc": te_metrics["auroc"],
+            "test_auprc": te_metrics["auprc"],
+            "learning_rate": lr,
+        }
+    )
+
+
 def train_homo_supervised(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, model, optimizer, loss_fn, args, config, device, val_data, te_data, data_config):
-    """Supervised AML edge classification on homogeneous graphs."""
-    best_val_f1 = 0
-    for epoch in range(config.epochs):
+    """Supervised AML edge classification on homogeneous graphs.
+
+    Paper-compatible protocol (IBM Multi-GNN / Egressy et al.): predictions by argmax over
+    two-class logits; per-epoch minority-class (label 1) F1; the best checkpoint is selected by
+    validation minority F1 only; no probability-threshold tuning. Per-epoch metrics are computed
+    in the upstream train-mode regime (``model.eval()`` is not toggled). Works for both the
+    ``embedding`` (default) and ``legacy`` supervised heads without change: ``model.classifier``
+    maps whatever ``forward`` returns to two-class logits.
+    """
+    recorder = SupervisedHistoryRecorder(
+        supervised_epoch_history_path(args), supervised_run_metadata(args, config)
+    )
+    checkpointer = SupervisedCheckpointer(args, config, data_config)
+    start_epoch = prepare_supervised_resume(
+        args, model, optimizer, recorder, checkpointer, device
+    )
+    for epoch in range(start_epoch, config.epochs):
         total_loss = total_examples = 0
         preds = []
         ground_truths = []
@@ -618,37 +688,47 @@ def train_homo_supervised(tr_loader, val_loader, te_loader, tr_inds, val_inds, t
 
         pred = torch.cat(preds, dim=0).detach().cpu().numpy()
         ground_truth = torch.cat(ground_truths, dim=0).detach().cpu().numpy()
-        f1 = f1_score(ground_truth, pred)
-        wandb.log({"f1/train": f1}, step=epoch)
-        logging.info(f"Train F1: {f1:.4f}")
+        train_f1 = f1_score(ground_truth, pred, zero_division=0)
+        train_loss = total_loss / max(total_examples, 1)
 
-        val_f1 = evaluate_homo(val_loader, val_inds, model, val_data, device, args)
-        te_f1 = evaluate_homo(te_loader, te_inds, model, te_data, device, args)
+        val_metrics = evaluate_supervised_split(val_loader, val_inds, model, val_data, device, args)
+        te_metrics = evaluate_supervised_split(te_loader, te_inds, model, te_data, device, args)
 
-        wandb.log({"f1/validation": val_f1}, step=epoch)
-        wandb.log({"f1/test": te_f1}, step=epoch)
-        logging.info(f"Validation F1: {val_f1:.4f}")
-        logging.info(f"Test F1: {te_f1:.4f}")
-
-        if epoch == 0:
-            wandb.log({"best_test_f1": te_f1}, step=epoch)
-        elif val_f1 > best_val_f1:
-            best_val_f1 = val_f1
-            wandb.log({"best_test_f1": te_f1}, step=epoch)
-            if args.save_model:
-                save_model(model, optimizer, epoch, args, data_config)
+        _log_and_record_supervised_epoch(
+            epoch, train_f1, train_loss, val_metrics, te_metrics, optimizer, recorder
+        )
+        # Checkpoint selection depends ONLY on validation minority-class F1.
+        checkpointer.update(
+            epoch, model, optimizer, None, val_metrics["f1_argmax"], te_metrics["f1_argmax"]
+        )
 
     if args.save_model:
-        save_model(model, optimizer, epoch, args, data_config)
-        logging.info("Saved final-epoch checkpoint for %s", args.unique_name)
-
+        logging.info(
+            "Saved checkpoints for %s: last=%s best_val_f1=%s (best epoch %s, val F1 %.4f). "
+            "Reproduction evaluation MUST use checkpoint_best_val_f1.tar.",
+            checkpointer.run_name,
+            checkpointer.run_dir / "checkpoint_last.tar",
+            checkpointer.run_dir / "checkpoint_best_val_f1.tar",
+            checkpointer.selected_epoch,
+            checkpointer.best_val_f1 if checkpointer.best_val_f1 is not None else float("nan"),
+        )
+    write_supervised_summary(args, config, recorder, checkpointer)
     return model
 
 
 def train_hetero_supervised(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, model, optimizer, loss_fn, args, config, device, val_data, te_data, data_config):
-    """Supervised AML edge classification on heterogeneous (reverse MP) graphs."""
-    best_val_f1 = 0
-    for epoch in range(config.epochs):
+    """Supervised AML edge classification on heterogeneous (reverse MP) graphs.
+
+    Same paper-compatible protocol and dual-checkpoint behavior as ``train_homo_supervised``.
+    """
+    recorder = SupervisedHistoryRecorder(
+        supervised_epoch_history_path(args), supervised_run_metadata(args, config)
+    )
+    checkpointer = SupervisedCheckpointer(args, config, data_config)
+    start_epoch = prepare_supervised_resume(
+        args, model, optimizer, recorder, checkpointer, device
+    )
+    for epoch in range(start_epoch, config.epochs):
         total_loss = total_examples = 0
         preds = []
         ground_truths = []
@@ -685,31 +765,32 @@ def train_hetero_supervised(tr_loader, val_loader, te_loader, tr_inds, val_inds,
 
         pred = torch.cat(preds, dim=0).detach().cpu().numpy()
         ground_truth = torch.cat(ground_truths, dim=0).detach().cpu().numpy()
-        f1 = f1_score(ground_truth, pred)
-        wandb.log({"f1/train": f1}, step=epoch)
-        logging.info(f'Train F1: {f1:.4f}')
+        train_f1 = f1_score(ground_truth, pred, zero_division=0)
+        train_loss = total_loss / max(total_examples, 1)
 
         #evaluate
-        val_f1 = evaluate_hetero(val_loader, val_inds, model, val_data, device, args)
-        te_f1 = evaluate_hetero(te_loader, te_inds, model, te_data, device, args)
+        val_metrics = evaluate_supervised_split(val_loader, val_inds, model, val_data, device, args)
+        te_metrics = evaluate_supervised_split(te_loader, te_inds, model, te_data, device, args)
 
-        wandb.log({"f1/validation": val_f1}, step=epoch)
-        wandb.log({"f1/test": te_f1}, step=epoch)
-        logging.info(f'Validation F1: {val_f1:.4f}')
-        logging.info(f'Test F1: {te_f1:.4f}')
-
-        if epoch == 0:
-            wandb.log({"best_test_f1": te_f1}, step=epoch)
-        elif val_f1 > best_val_f1:
-            best_val_f1 = val_f1
-            wandb.log({"best_test_f1": te_f1}, step=epoch)
-            if args.save_model:
-                save_model(model, optimizer, epoch, args, data_config)
+        _log_and_record_supervised_epoch(
+            epoch, train_f1, train_loss, val_metrics, te_metrics, optimizer, recorder
+        )
+        # Checkpoint selection depends ONLY on validation minority-class F1.
+        checkpointer.update(
+            epoch, model, optimizer, None, val_metrics["f1_argmax"], te_metrics["f1_argmax"]
+        )
 
     if args.save_model:
-        save_model(model, optimizer, epoch, args, data_config)
-        logging.info("Saved final-epoch checkpoint for %s", args.unique_name)
-
+        logging.info(
+            "Saved checkpoints for %s: last=%s best_val_f1=%s (best epoch %s, val F1 %.4f). "
+            "Reproduction evaluation MUST use checkpoint_best_val_f1.tar.",
+            checkpointer.run_name,
+            checkpointer.run_dir / "checkpoint_last.tar",
+            checkpointer.run_dir / "checkpoint_best_val_f1.tar",
+            checkpointer.selected_epoch,
+            checkpointer.best_val_f1 if checkpointer.best_val_f1 is not None else float("nan"),
+        )
+    write_supervised_summary(args, config, recorder, checkpointer)
     return model
 
 
@@ -1261,19 +1342,26 @@ def get_model(sample_batch, config, args):
     n_feats = sample_batch.x.shape[1] if not isinstance(sample_batch, HeteroData) else sample_batch['node'].x.shape[1]
     e_dim = (sample_batch.edge_attr.shape[1] - 1) if not isinstance(sample_batch, HeteroData) else (sample_batch['node', 'to', 'node'].edge_attr.shape[1] - 1)
 
+    supervised_head = getattr(args, "supervised_head", "embedding")
+    embedding_dim = int(getattr(args, "embedding_dim", 128))
+
     if args.model == "gin":
         model = GINe(
                 num_features=n_feats, num_gnn_layers=config.n_gnn_layers, n_classes=2,
                 n_hidden=round(config.n_hidden), residual=False, edge_updates=args.emlps, edge_dim=e_dim,
                 dropout=config.dropout, final_dropout=config.final_dropout,
+                embedding_dim=embedding_dim,
                 use_gradient_checkpointing=getattr(args, "gradient_checkpointing", False),
+                supervised_head=supervised_head,
                 )
     elif args.model == "gat":
         model = GATe(
                 num_features=n_feats, num_gnn_layers=config.n_gnn_layers, n_classes=2,
                 n_hidden=round(config.n_hidden), n_heads=round(config.n_heads),
                 edge_updates=args.emlps, edge_dim=e_dim,
-                dropout=config.dropout, final_dropout=config.final_dropout
+                dropout=config.dropout, final_dropout=config.final_dropout,
+                embedding_dim=embedding_dim,
+                supervised_head=supervised_head,
                 )
     elif args.model == "pna":
         if not isinstance(sample_batch, HeteroData):
@@ -1285,7 +1373,9 @@ def get_model(sample_batch, config, args):
         model = PNA(
             num_features=n_feats, num_gnn_layers=config.n_gnn_layers, n_classes=2,
             n_hidden=round(config.n_hidden), edge_updates=args.emlps, edge_dim=e_dim,
-            dropout=config.dropout, deg=deg, final_dropout=config.final_dropout
+            dropout=config.dropout, deg=deg, final_dropout=config.final_dropout,
+            embedding_dim=embedding_dim,
+            supervised_head=supervised_head,
             )
     elif args.model == "rgcn":
         num_relations = 2 if args.reverse_mp else 1
@@ -1293,7 +1383,9 @@ def get_model(sample_batch, config, args):
             num_features=n_feats, edge_dim=e_dim, num_relations=num_relations,
             num_gnn_layers=round(config.n_gnn_layers),
             n_classes=2, n_hidden=round(config.n_hidden),
-            edge_update=args.emlps, dropout=config.dropout, final_dropout=config.final_dropout, n_bases=None
+            edge_update=args.emlps, dropout=config.dropout, final_dropout=config.final_dropout, n_bases=None,
+            embedding_dim=embedding_dim,
+            supervised_head=supervised_head,
         )
 
     return model
@@ -1320,12 +1412,14 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
             "data": args.data,
             "graph_form": setup.graph_form,
             "objective": setup.objective,
+            "supervised_head": getattr(args, "supervised_head", "embedding"),
             "reverse_mp": bool(args.reverse_mp),
             "finetune": bool(args.finetune),
             "num_neighbors": args.num_neighs,
             "lr": extract_param("lr", args),
             "n_hidden": extract_param("n_hidden", args),
             "n_gnn_layers": extract_param("n_gnn_layers", args),
+            "embedding_dim": int(getattr(args, "embedding_dim", 128)),
             "loss": (
                 "infonce"
                 if setup.is_contrastive
@@ -1398,6 +1492,9 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
     #get the model
     sample_batch = next(iter(tr_loader))
     model = get_model(sample_batch, config, args)
+    # Capture the exported embedding width before to_hetero wraps the module (GraphModule drops
+    # the .embedding_dim attribute). The projection head and masked-edge decoder must adapt to it.
+    model_embedding_dim = int(getattr(model, "embedding_dim", int(getattr(args, "embedding_dim", 128))))
 
     if args.reverse_mp:
         model = to_hetero(model, te_data.metadata(), aggr='mean')
@@ -1407,7 +1504,7 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
     args.morph_expert_cfg = morph_cfg
     morph_contrast_cfg = setup_morphology_contrast(args, device)
     args.morph_contrast_cfg = morph_contrast_cfg
-    proj_head = setup_contrastive_projection(args, device)
+    proj_head = setup_contrastive_projection(args, device, embedding_dim=model_embedding_dim)
     args.contrast_projection_module = proj_head
     args._val_data_for_morph = val_data
 
