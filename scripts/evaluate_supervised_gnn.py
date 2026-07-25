@@ -40,7 +40,7 @@ from train_util import (
 from training import get_model
 from util import create_parser, logger_setup, set_seed
 
-ALERT_BUDGET_KS = (100, 500, 1000)
+from ranking_metrics import ALERT_BUDGET_KS, ranking_metrics
 
 
 def build_model_config(args) -> SimpleNamespace:
@@ -68,25 +68,8 @@ def tune_threshold(y: np.ndarray, proba: np.ndarray) -> Tuple[float, float]:
 
 
 def alert_budget_metrics(y: np.ndarray, proba: np.ndarray) -> Dict[str, float]:
-    y = y.astype(np.int64)
-    n = int(y.shape[0])
-    positives = int(y.sum())
-    prevalence = float(y.mean()) if n else float("nan")
-    out: Dict[str, float] = {}
-    if n == 0:
-        return out
-    order = np.argsort(-proba)
-    for k in ALERT_BUDGET_KS:
-        kk = min(k, n)
-        top = order[:kk]
-        tp = int(y[top].sum())
-        precision = float(tp / kk) if kk else float("nan")
-        recall = float(tp / positives) if positives else float("nan")
-        lift = float(precision / prevalence) if prevalence > 0 else float("nan")
-        out[f"precision_at_{k}"] = precision
-        out[f"recall_at_{k}"] = recall
-        out[f"lift_at_{k}"] = lift
-    return out
+    """Backward-compatible name: now includes precision-constrained recall too."""
+    return ranking_metrics(y, proba)
 
 
 def split_metrics(y: np.ndarray, proba: np.ndarray, tuned_threshold: float) -> Dict[str, Any]:

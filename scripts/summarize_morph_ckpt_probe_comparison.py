@@ -28,7 +28,7 @@ def row_from_probe(run: str, ckpt_type: str, path: Path, data: dict) -> dict:
     test_sel = data["splits_at_selected_threshold"]["test"]
     test_fixed = (data.get("splits_at_threshold_0.5") or {}).get("test", {})
     meta = data.get("extraction_meta") or {}
-    return {
+    row = {
         "run": run,
         "checkpoint_type": ckpt_type,
         "epoch": meta.get("checkpoint_epoch"),
@@ -39,6 +39,25 @@ def row_from_probe(run: str, ckpt_type: str, path: Path, data: dict) -> dict:
         "f1_at_0.5": test_fixed.get("f1"),
         "path": str(path.relative_to(ROOT)),
     }
+    # Optional recall-oriented fields when present (future enriched probes).
+    for k in (
+        "precision_at_100",
+        "recall_at_100",
+        "lift_at_100",
+        "precision_at_500",
+        "recall_at_500",
+        "lift_at_500",
+        "precision_at_1000",
+        "recall_at_1000",
+        "lift_at_1000",
+        "recall_at_precision_ge_0.95",
+        "recall_at_precision_ge_0.90",
+        "recall_at_precision_ge_0.80",
+        "recall_at_precision_ge_0.70",
+    ):
+        if k in test_sel:
+            row[k] = test_sel[k]
+    return row
 
 
 def main() -> None:

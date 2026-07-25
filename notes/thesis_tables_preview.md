@@ -2,9 +2,86 @@
 
 Auto-generated from `results/diagnostics/thesis_experiment_registry.json`.
 
-- **Rows in registry:** 155
+- **Rows in registry:** 345
 - **Include provisional:** False
 - **Temporal-flow validation passed:** True
+
+- Label-scarcity temporal-flow diagnostic available (`results/diagnostics/label_scarcity_temporal_flow_probe.json`; see appendix).
+## PI-facing summary
+
+### Short update
+
+- Added a causal temporal-flow feature group: sender/receiver interarrival time, sender recent 7-day activity, amount relative to sender history, and repeat sender→receiver pair.
+- Built a registry/table pipeline so results are generated from result JSONs instead of hand-copied.
+- Added validated temporal-flow results, Small-HI supervised baseline, and width-aligned PNA diagnostics.
+- Current best frozen SSL stack is pre-3h + raw + temporal-flow.
+- Supervised GIN remains strongest, but frozen SSL + temporal-flow is competitive at top-alert precision.
+
+### Compact AUPRC summary
+
+| Method | Small-HI AUPRC | Small-LI AUPRC |
+| --- | --- | --- |
+| SSL post-128 | 0.245 | 0.014 ± 0.010 |
+| SSL pre-3h | 0.295 | 0.039 ± 0.016 |
+| SSL pre-3h + raw | 0.321 | 0.061 ± 0.034 |
+| SSL pre-3h + raw + temporal-flow | 0.501 | 0.128 ± 0.027 |
+| Legacy supervised GIN | 0.663 | 0.292 |
+
+**Notes:**
+- Small-LI SSL rows are mean ± sample SD (ddof=1) over seeds 1–3.
+- Small-HI SSL rows use the validated strong-run / temporal-flow protocol.
+- Supervised rows use end-to-end paper_argmax evaluation; SSL rows use frozen probe AUPRC.
+
+### Compact temporal-flow ablation
+
+| Dataset | Baseline stack | Baseline AUPRC | + temporal-flow AUPRC | Δ AUPRC |
+| --- | --- | --- | --- | --- |
+| Small-HI | pre-3h + raw | 0.320 | 0.501 | +0.180 |
+| Small-LI | pre-3h + raw | 0.061 ± 0.033 | 0.128 ± 0.027 | +0.067 ± 0.010 |
+
+**Notes:**
+- Baseline = pre-3h + raw; +temporal-flow = pre-3h + raw + temporal_flow_causal.
+- Uses validated max_iter=5000 temporal-flow results when available.
+- Small-LI values are mean ± sample SD over seeds 1–3.
+
+### Compact supervised versus frozen SSL
+
+| Dataset | Method | AUPRC | F1 | P@100 | R@100 | Caveat |
+| --- | --- | --- | --- | --- | --- | --- |
+| Small-HI | SSL pre-3h + raw + temporal-flow | 0.501 | 0.465 | 0.940 | 0.058 | val-tuned F1; frozen linear probe |
+| Small-HI | Legacy supervised GIN | 0.663 | 0.660 | — | — | paper_argmax F1 mean (seeds 1–3); supervised CE; not comparable to SSL val-tuned F1 |
+| Small-LI | SSL pre-3h + raw + temporal-flow | 0.128 ± 0.027 | 0.092 ± 0.029 | 0.600 ± 0.056 | 0.075 ± 0.007 | val-tuned F1; frozen linear probe; mean ± sample SD (n=3) |
+| Small-LI | Legacy supervised GIN | 0.292 | 0.357 | 0.970 | 0.121 | paper_argmax F1; supervised CE; not comparable to SSL val-tuned F1 |
+
+**Notes:**
+- SSL uses frozen linear probe with validation-tuned threshold.
+- Supervised uses end-to-end supervised CE and paper_argmax F1.
+- F1 values are not directly comparable without the protocol caveat.
+
+### Compact PNA diagnostic
+
+| Encoder / setup | Representation + features | Small-HI AUPRC | Takeaway |
+| --- | --- | --- | --- |
+| GIN main stack | pre-3h + raw + temporal-flow | 0.501 | main encoder/result |
+| PNA width-aligned | post-128 embedding only | 0.147 | post-128 understates PNA |
+| PNA width-aligned | pre-3h + raw + temporal-flow | 0.407 | competitive but below GIN; one-seed diagnostic |
+
+**Notes:**
+- PNA rows are one-seed width-aligned scouts; not a full architecture ranking.
+- Best-stack PNA row is downstream-only (no PNA SSL retraining).
+
+### Definitions
+
+- **post-128:** exported 128-dimensional embedding after the learned embedding head.
+- **pre-3h:** edge representation immediately before the embedding head, formed from source-node, destination-node, and edge representations. For GIN h=66, this is 3h=198 dimensions.
+- **P@100:** precision among the top 100 scored test transactions.
+- **R@100:** fraction of all positive test transactions recovered in the top 100 scored test transactions.
+- **Lift@100:** P@100 divided by the test-set positive rate.
+- **temporal-flow:** causal per-transaction history features using only prior transactions.
+
+---
+
+## Full detailed tables
 ## Table 1 — Dataset summary
 
 | Dataset | Split | # Transactions | # Positives | Positive rate | Task |
@@ -18,6 +95,7 @@ Auto-generated from `results/diagnostics/thesis_experiment_registry.json`.
 
 **Notes:**
 - Split counts from cited source JSON in registry dataset_metadata; node counts omitted when unavailable.
+
 ## Table 2 — Main Small-HI results
 
 | Method | Representation | Features | AUROC | AUPRC | F1 | P@100 | R@100 | Lift@100 | Caveat |
@@ -29,7 +107,7 @@ Auto-generated from `results/diagnostics/thesis_experiment_registry.json`.
 | SSL post-128 + raw | post-128 | embedding+raw | 0.955 | 0.284 | 0.343 | 0.790 | 0.049 | 423 | val-tuned F1 |
 | SSL pre-3h + raw | pre-3h | embedding+raw | 0.960 | 0.321 | 0.344 | 0.840 | 0.052 | 450 | val-tuned F1 |
 | SSL pre-3h + raw + temporal-flow | pre-3h | embedding+raw+temporal_flow_causal | 0.979 | **0.501** | 0.465 | 0.940 | 0.058 | 504 | val-tuned F1; validated temporal-flow stack |
-| Legacy supervised GIN (100ep seed1) | logits | in-GNN end-to-end | 0.984 | 0.639 | 0.539 | 0.990 | 0.061 | 530 | paper_argmax F1; paper_argmax F1; supervised CE; not comparable to SSL val-tuned F1 |
+| Legacy supervised Multi-GIN+EU (ports TDS-off, 50ep seeds1–3 mean) | logits | in-GNN end-to-end | 0.985 | 0.663 | 0.660 | — | — | — | paper_argmax F1; mean seeds 1–3; not comparable to SSL val-tuned F1 |
 
 **Notes:**
 - Small-HI pre/post rows use paired strong-run protocol (results/diagnostics/pre3h_strong_run_comparison.json).
@@ -40,6 +118,7 @@ Auto-generated from `results/diagnostics/thesis_experiment_registry.json`.
 - P@100 = precision among the top 100 scored test transactions.
 - R@100 = fraction of all positive test transactions recovered in the top 100 scored test transactions.
 - Lift@100 = P@100 divided by the test-set positive rate for that dataset.
+
 ## Table 3 — Main Small-LI results
 
 | Method | Representation | Features | AUROC | AUPRC | F1 | P@100 | R@100 | Lift@100 | Caveat |
@@ -58,6 +137,7 @@ Auto-generated from `results/diagnostics/thesis_experiment_registry.json`.
 - P@100 = precision among the top 100 scored test transactions.
 - R@100 = fraction of all positive test transactions recovered in the top 100 scored test transactions.
 - Lift@100 = P@100 divided by the test-set positive rate for that dataset.
+
 ## Table 4 — Representation readout ablation
 
 | Dataset / run | Feature stack | Post-128 AUPRC | Pre-3h AUPRC | Δ AUPRC | Post-128 F1 | Pre-3h F1 | Caveat |
@@ -71,6 +151,7 @@ Auto-generated from `results/diagnostics/thesis_experiment_registry.json`.
 - Δ AUPRC = pre-3h minus post-128 on paired rows.
 - Small-LI Δ AUPRC uses mean ± sample SD over per-seed paired deltas when available.
 - emb198 scout omitted from main table (diagnostic-only; see contrastive appendix if included).
+
 ## Table 5 — Temporal-flow ablation
 
 | Dataset / run | Comparison | Feature stack | AUPRC | Δ AUPRC vs pre-3h + raw | F1 | P@100 | R@100 | Lift@100 | Validation status |
@@ -89,12 +170,13 @@ Auto-generated from `results/diagnostics/thesis_experiment_registry.json`.
 - P@100 = precision among the top 100 scored test transactions.
 - R@100 = fraction of all positive test transactions recovered in the top 100 scored test transactions.
 - Lift@100 = P@100 divided by the test-set positive rate for that dataset.
+
 ## Table 6 — Supervised versus frozen SSL
 
 | Dataset | Method | Training signal | Encoder updated with labels? | AUPRC | F1 | P@100 | R@100 | Lift@100 | Caveat |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Small-HI | SSL pre-3h + raw + temporal-flow | contrastive + frozen probe | no (frozen probe) | 0.501 | 0.465 | 0.940 | 0.058 | 504 | val-tuned F1 |
-| Small-HI | Legacy supervised GIN | supervised CE (end-to-end) | yes | 0.639 | 0.539 | 0.990 | 0.061 | 530 | paper_argmax F1 |
+| Small-HI | Legacy supervised GIN | supervised CE (end-to-end) | yes | 0.663 | 0.660 | — | — | — | paper_argmax F1 |
 | Small-LI | SSL pre-3h + raw (multiseed mean) | contrastive + frozen probe | no (frozen probe) | 0.061 ± 0.034 | 0.054 ± 0.007 | 0.343 ± 0.159 | 0.043 ± 0.020 | 502 ± 232 | val-tuned F1; frozen linear probe |
 | Small-LI | SSL pre-3h + raw + temporal-flow (multiseed mean) | contrastive + frozen probe | no (frozen probe) | 0.128 ± 0.027 | 0.092 ± 0.029 | 0.600 ± 0.056 | 0.075 ± 0.007 | 878 ± 81 | val-tuned F1; mean ± sample SD (n=3) |
 | Small-LI | Legacy supervised GIN | supervised CE (end-to-end) | yes | 0.292 | 0.357 | 0.970 | 0.121 | 1419 | paper_argmax F1 |
@@ -108,6 +190,7 @@ Auto-generated from `results/diagnostics/thesis_experiment_registry.json`.
 - P@100 = precision among the top 100 scored test transactions.
 - R@100 = fraction of all positive test transactions recovered in the top 100 scored test transactions.
 - Lift@100 = P@100 divided by the test-set positive rate for that dataset.
+
 ## Appendix — Alert-budget performance
 
 | Dataset | Method | P@100 | R@100 | Lift@100 | P@500 | R@500 | Lift@500 | P@1000 | R@1000 | Lift@1000 | Caveat |
@@ -119,7 +202,7 @@ Auto-generated from `results/diagnostics/thesis_experiment_registry.json`.
 | Small-HI | SSL post-128 + raw | 0.790 | 0.049 | 423 | 0.630 | 0.196 | 337 | 0.442 | 0.274 | 237 | val-tuned F1 |
 | Small-HI | SSL pre-3h + raw | 0.840 | 0.052 | 450 | 0.640 | 0.199 | 343 | 0.490 | 0.304 | 262 | val-tuned F1 |
 | Small-HI | SSL pre-3h + raw + temporal-flow | 0.940 | 0.058 | 504 | 0.842 | 0.261 | 451 | 0.682 | 0.423 | 365 | val-tuned F1; validated temporal-flow stack |
-| Small-HI | Legacy supervised GIN (100ep seed1) | 0.990 | 0.061 | 530 | 0.966 | 0.300 | 518 | 0.835 | 0.518 | 447 | paper_argmax F1 |
+| Small-HI | Legacy supervised Multi-GIN+EU (ports TDS-off 50ep mean) | — | — | — | — | — | — | — | — | — | paper_argmax F1 |
 | Small-LI | SSL post-128 | 0.120 ± 0.060 | 0.015 ± 0.007 | 176 ± 88 | 0.058 ± 0.034 | 0.036 ± 0.021 | 85 ± 50 | 0.046 ± 0.025 | 0.057 ± 0.031 | 67 ± 36 | frozen probe; mean ± sample SD (n=3) |
 | Small-LI | SSL pre-3h | 0.220 ± 0.082 | 0.027 ± 0.010 | 322 ± 120 | 0.123 ± 0.059 | 0.077 ± 0.037 | 180 ± 87 | 0.087 ± 0.032 | 0.108 ± 0.040 | 127 ± 47 | frozen probe; mean ± sample SD (n=3) |
 | Small-LI | SSL post-128 + raw | 0.227 ± 0.122 | 0.028 ± 0.015 | 332 ± 179 | 0.095 ± 0.059 | 0.059 ± 0.037 | 138 ± 86 | 0.070 ± 0.033 | 0.087 ± 0.041 | 102 ± 49 | frozen probe; mean ± sample SD (n=3) |
@@ -134,6 +217,7 @@ Auto-generated from `results/diagnostics/thesis_experiment_registry.json`.
 - P@100 = precision among the top 100 scored test transactions.
 - R@100 = fraction of all positive test transactions recovered in the top 100 scored test transactions.
 - Lift@100 = P@100 divided by the test-set positive rate for that dataset.
+
 ## Appendix — Architecture ablation
 
 | Encoder | Hidden dim | Pre dim | Post dim | Params | AUROC | AUPRC | F1 | Caveat |
@@ -146,8 +230,10 @@ Auto-generated from `results/diagnostics/thesis_experiment_registry.json`.
 | pna (width-aligned, best stack) | 65 | 195 | 128 | — | 0.982 | 0.407 | 0.410 | pre-3h+raw+temporal-flow; one seed; downstream-only diagnostic |
 
 **Notes:**
-- Comparable rows only: embedding-only, post-128, shared probe settings, Small-HI architecture sweep (results/diagnostics/architecture_sweep_shared_probe_weights.json).
+- Rows above the best-stack PNA diagnostic are embedding-only post-128 architecture comparisons under shared probe settings (results/diagnostics/architecture_sweep_shared_probe_weights.json).
+- The width-aligned best-stack PNA row is a downstream-only diagnostic (pre-3h + raw + temporal-flow) and is not directly comparable to the embedding-only architecture sweep.
 - Default PNA (hidden 20, pre dim 60) was not capacity/hyperparameter matched to GIN (hidden 66, pre dim 198).
+
 ## Appendix — Contrastive and diagnostic ablations
 
 | Variant | Dataset | Representation | Feature stack | AUROC | AUPRC | F1 | Takeaway |
@@ -160,3 +246,23 @@ Auto-generated from `results/diagnostics/thesis_experiment_registry.json`.
 **Notes:**
 - Appendix rows are curated for interpretability; raw-only rows are not compared directly to embedding-only SSL baselines.
 - Pending/manual review: queue-size contrastive variants; multi-positive contrastive variants; KNN positive variants; morphology auxiliary-loss variants.
+
+## Appendix — Label-scarcity temporal-flow diagnostic
+
+| Label fraction | Small-HI pre-3h+raw AUPRC | Small-HI pre-3h+raw+temporal AUPRC | Small-LI pre-3h+raw AUPRC | Small-LI pre-3h+raw+temporal AUPRC |
+| --- | --- | --- | --- | --- |
+| 1% | 0.058 | 0.139 | 0.004 ± 0.001 | 0.004 ± 0.001 |
+| 5% | 0.143 | 0.300 | 0.036 ± 0.037 | 0.068 ± 0.053 |
+| 10% | 0.306 | 0.430 | 0.023 ± 0.012 | 0.052 ± 0.018 |
+| 25% | 0.298 | 0.475 | 0.047 ± 0.025 | 0.106 ± 0.028 |
+| 50% | 0.306 | 0.496 | 0.061 ± 0.037 | 0.121 ± 0.040 |
+| 100% | 0.320 | 0.501 | 0.065 ± 0.037 | 0.130 ± 0.029 |
+
+**Notes:**
+- Small-HI: temporal-flow improved AUPRC in 6/6 label fractions (mean ΔAUPRC=+0.152).
+- Small-HI: temporal-flow gain appears larger at high label fractions.
+- Small-LI: temporal-flow improved mean AUPRC in 6/6 label fractions (mean ΔAUPRC=+0.041).
+- At 1% labels, performance is degraded vs 100% but not fully collapsed on the available datasets.
+- Diagnostic appendix only; not inserted into main thesis tables.
+- Train labels subsampled; validation/test unchanged. Frozen pre-3h embeddings.
+- Small-LI values are mean ± sample SD over model seeds 1–3 when available.

@@ -9,7 +9,7 @@
 | Small-HI | SSL post-128 + raw | 0.790 | 0.049 | 423 | 0.630 | 0.196 | 337 | 0.442 | 0.274 | 237 | val-tuned F1 |
 | Small-HI | SSL pre-3h + raw | 0.840 | 0.052 | 450 | 0.640 | 0.199 | 343 | 0.490 | 0.304 | 262 | val-tuned F1 |
 | Small-HI | SSL pre-3h + raw + temporal-flow | 0.940 | 0.058 | 504 | 0.842 | 0.261 | 451 | 0.682 | 0.423 | 365 | val-tuned F1; validated temporal-flow stack |
-| Small-HI | Legacy supervised GIN (100ep seed1) | 0.990 | 0.061 | 530 | 0.966 | 0.300 | 518 | 0.835 | 0.518 | 447 | paper_argmax F1 |
+| Small-HI | Legacy supervised Multi-GIN+EU (ports TDS-off 50ep mean) | — | — | — | — | — | — | — | — | — | paper_argmax F1 |
 | Small-LI | SSL post-128 | 0.120 ± 0.060 | 0.015 ± 0.007 | 176 ± 88 | 0.058 ± 0.034 | 0.036 ± 0.021 | 85 ± 50 | 0.046 ± 0.025 | 0.057 ± 0.031 | 67 ± 36 | frozen probe; mean ± sample SD (n=3) |
 | Small-LI | SSL pre-3h | 0.220 ± 0.082 | 0.027 ± 0.010 | 322 ± 120 | 0.123 ± 0.059 | 0.077 ± 0.037 | 180 ± 87 | 0.087 ± 0.032 | 0.108 ± 0.040 | 127 ± 47 | frozen probe; mean ± sample SD (n=3) |
 | Small-LI | SSL post-128 + raw | 0.227 ± 0.122 | 0.028 ± 0.015 | 332 ± 179 | 0.095 ± 0.059 | 0.059 ± 0.037 | 138 ± 86 | 0.070 ± 0.033 | 0.087 ± 0.041 | 102 ± 49 | frozen probe; mean ± sample SD (n=3) |

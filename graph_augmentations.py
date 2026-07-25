@@ -36,6 +36,24 @@ def _edge_keep_mask(num_edges: int, drop_rate: float, device: torch.device) -> t
     return keep
 
 
+def _force_keep_seed_edges(
+    keep: torch.Tensor,
+    edge_ids: torch.Tensor,
+    seed_edge_ids: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """
+    Opt-in: force-keep edges whose stable ``edge_id`` is in ``seed_edge_ids``.
+
+    Approximates seed retention by retaining the seed *relation* in the
+    message-passing graph (not a separated query-only readout).
+    """
+    if seed_edge_ids is None or seed_edge_ids.numel() == 0:
+        return keep
+    seed_ids = seed_edge_ids.detach().to(device=edge_ids.device, dtype=torch.long).view(-1)
+    is_seed = torch.isin(edge_ids.long().view(-1), seed_ids)
+    return keep | is_seed
+
+
 def _policy_edge_keep_mask(drop_probs: torch.Tensor) -> torch.Tensor:
     """Bernoulli keep mask from per-edge drop probabilities."""
     num_edges = int(drop_probs.numel())
@@ -159,7 +177,13 @@ def _slice_hetero_edge_store(store, keep: torch.Tensor) -> None:
     _slice_edge_aligned_fields(store, keep)
 
 
-def _random_edge_drop_view(data: Data, drop_rate: float) -> Data:
+def _random_edge_drop_view(
+    data: Data,
+    drop_rate: float,
+    *,
+    seed_edge_ids: Optional[torch.Tensor] = None,
+    preserve_seed_edges: bool = False,
+) -> Data:
     """
     Independent random edge subset; does not mutate the input ``data``.
 
@@ -177,6 +201,8 @@ def _random_edge_drop_view(data: Data, drop_rate: float) -> Data:
         )
 
     keep = _edge_keep_mask(E, drop_rate, out.edge_index.device)
+    if preserve_seed_edges:
+        keep = _force_keep_seed_edges(keep, out.edge_id, seed_edge_ids)
     _slice_edge_aligned_fields(out, keep)
     return out
 
@@ -186,6 +212,9 @@ def _hetero_random_edge_drop_view(
     drop_rate: float,
     forward_et=FORWARD_EDGE_TYPE,
     reverse_et=REVERSE_EDGE_TYPE,
+    *,
+    seed_edge_ids: Optional[torch.Tensor] = None,
+    preserve_seed_edges: bool = False,
 ) -> HeteroData:
     """
     Independent random edge drop on forward transactions; reverse edges with the same
@@ -204,6 +233,8 @@ def _hetero_random_edge_drop_view(
         )
 
     keep_fwd = _edge_keep_mask(E, drop_rate, fwd.edge_index.device)
+    if preserve_seed_edges:
+        keep_fwd = _force_keep_seed_edges(keep_fwd, fwd.edge_id, seed_edge_ids)
     _slice_hetero_edge_store(fwd, keep_fwd)
     kept_txn = fwd.edge_id
 
@@ -222,6 +253,9 @@ def _hetero_policy_edge_drop_view(
     reverse_et=REVERSE_EDGE_TYPE,
     edge_drop_stats: Optional[Dict[str, float]] = None,
     view_tag: str = "v1",
+    *,
+    seed_edge_ids: Optional[torch.Tensor] = None,
+    preserve_seed_edges: bool = False,
 ) -> HeteroData:
     """Independent policy-weighted edge drop on forward transactions."""
     out = batch.clone()
@@ -238,6 +272,8 @@ def _hetero_policy_edge_drop_view(
 
     drop_probs = edge_drop_cache.lookup_drop_prob(fwd.edge_id, fwd.edge_index.device)
     keep_fwd = _policy_edge_keep_mask(drop_probs)
+    if preserve_seed_edges:
+        keep_fwd = _force_keep_seed_edges(keep_fwd, fwd.edge_id, seed_edge_ids)
     _accumulate_edge_drop_stats(
         edge_drop_stats,
         edges_before=E,
@@ -263,6 +299,9 @@ def _policy_edge_drop_view(
     edge_drop_cache: "EdgeDropScoreCache",
     edge_drop_stats: Optional[Dict[str, float]] = None,
     view_tag: str = "v1",
+    *,
+    seed_edge_ids: Optional[torch.Tensor] = None,
+    preserve_seed_edges: bool = False,
 ) -> Data:
     out = data.clone()
     E = out.edge_index.size(1)
@@ -277,6 +316,8 @@ def _policy_edge_drop_view(
 
     drop_probs = edge_drop_cache.lookup_drop_prob(out.edge_id, out.edge_index.device)
     keep = _policy_edge_keep_mask(drop_probs)
+    if preserve_seed_edges:
+        keep = _force_keep_seed_edges(keep, out.edge_id, seed_edge_ids)
     _accumulate_edge_drop_stats(
         edge_drop_stats,
         edges_before=E,
@@ -354,6 +395,9 @@ def generate_views(
     edge_drop_policy: str = "random",
     edge_drop_cache: Optional["EdgeDropScoreCache"] = None,
     edge_drop_stats: Optional[Dict[str, float]] = None,
+    *,
+    seed_edge_ids: Optional[torch.Tensor] = None,
+    preserve_seed_edges: bool = False,
 ):
     """
     Two augmented views for edge-level contrastive learning.
@@ -366,17 +410,21 @@ def generate_views(
       probabilities from ``edge_drop_cache``.
     - If ``edge_attr_mask_rate > 0``: independent edge-attribute masking on the
       surviving edges of each view.
+    - If ``preserve_seed_edges`` is True, edges whose ``edge_id`` is in
+      ``seed_edge_ids`` are force-kept in both views (opt-in). This retains the
+      seed *relation* in the message-passing graph; it is an approximation of
+      seed-as-query retention, not a separated readout path. Default False
+      preserves legacy behavior (seeds may be dropped).
 
     Does not mutate ``data`` (including ``data.edge_attr`` / ``data.edge_id``).
 
     For ``HeteroData``, edge drops are synchronized across forward and reverse edge
     types by transaction ``edge_id``; attribute masking is applied independently per
     view on both edge types.
-
-    Seed/anchor edges are **not** protected: if a seed edge is dropped from one view,
-    ``select_shared_seed_edge_embeddings`` excludes it from the contrastive loss
-    (same semantics as uniform random drop).
     """
+    if preserve_seed_edges and (seed_edge_ids is None or seed_edge_ids.numel() == 0):
+        raise ValueError("preserve_seed_edges=True requires non-empty seed_edge_ids")
+
     use_policy = edge_drop_policy != "random"
     if use_policy and edge_drop_cache is None:
         raise ValueError(f"edge_drop_policy={edge_drop_policy!r} requires edge_drop_cache")
@@ -386,18 +434,24 @@ def generate_views(
             edge_drop_cache.target_drop_rate if edge_drop_cache is not None else edge_drop_rate
         )
         edge_drop_stats["edge_drop_policy"] = edge_drop_policy
+        edge_drop_stats["preserve_seed_edges"] = bool(preserve_seed_edges)
+
+    drop_kw = {
+        "seed_edge_ids": seed_edge_ids,
+        "preserve_seed_edges": bool(preserve_seed_edges),
+    }
 
     if isinstance(data, HeteroData):
         if use_policy:
             view1 = _hetero_policy_edge_drop_view(
-                data, edge_drop_cache, edge_drop_stats=edge_drop_stats, view_tag="v1"
+                data, edge_drop_cache, edge_drop_stats=edge_drop_stats, view_tag="v1", **drop_kw
             )
             view2 = _hetero_policy_edge_drop_view(
-                data, edge_drop_cache, edge_drop_stats=edge_drop_stats, view_tag="v2"
+                data, edge_drop_cache, edge_drop_stats=edge_drop_stats, view_tag="v2", **drop_kw
             )
         else:
-            view1 = _hetero_random_edge_drop_view(data, edge_drop_rate)
-            view2 = _hetero_random_edge_drop_view(data, edge_drop_rate)
+            view1 = _hetero_random_edge_drop_view(data, edge_drop_rate, **drop_kw)
+            view2 = _hetero_random_edge_drop_view(data, edge_drop_rate, **drop_kw)
         if edge_drop_stats is not None and edge_drop_rate > 0 or use_policy:
             eid1 = view1[FORWARD_EDGE_TYPE].edge_id
             eid2 = view2[FORWARD_EDGE_TYPE].edge_id
@@ -425,11 +479,15 @@ def generate_views(
         return view1, view2
 
     if use_policy:
-        view1 = _policy_edge_drop_view(data, edge_drop_cache, edge_drop_stats=edge_drop_stats, view_tag="v1")
-        view2 = _policy_edge_drop_view(data, edge_drop_cache, edge_drop_stats=edge_drop_stats, view_tag="v2")
+        view1 = _policy_edge_drop_view(
+            data, edge_drop_cache, edge_drop_stats=edge_drop_stats, view_tag="v1", **drop_kw
+        )
+        view2 = _policy_edge_drop_view(
+            data, edge_drop_cache, edge_drop_stats=edge_drop_stats, view_tag="v2", **drop_kw
+        )
     else:
-        view1 = _random_edge_drop_view(data, edge_drop_rate)
-        view2 = _random_edge_drop_view(data, edge_drop_rate)
+        view1 = _random_edge_drop_view(data, edge_drop_rate, **drop_kw)
+        view2 = _random_edge_drop_view(data, edge_drop_rate, **drop_kw)
 
     if edge_drop_stats is not None and (edge_drop_rate > 0 or use_policy):
         eid1 = view1.edge_id

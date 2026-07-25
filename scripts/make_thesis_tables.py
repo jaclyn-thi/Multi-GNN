@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_PREPOST = "results/diagnostics/pre3h_strong_run_comparison.json"
 MULTISEED_LI = "results/diagnostics/pre_embedding_3h_vs_post_embedding_small_li_multiseed.json"
 LEGACY_EVAL = "results/diagnostics/eval_small_li_legacy_supervised_gin_emlps_tds_100ep_seed1.json"
-HI_LEGACY_EVAL = "results/diagnostics/eval_small_hi_legacy_supervised_gin_emlps_tds_100ep_seed1.json"
+HI_LEGACY_EVAL = "results/diagnostics/eval_small_hi_legacy_supervised_gin_emlps_ports_50ep_seeds1-3_formal_aggregate.json"
 FEATURE_ABLATION = "results/diagnostics/probe_feature_ablation_current_protocol_comparison.json"
 ARCH_SWEEP = "results/diagnostics/architecture_sweep_shared_probe_weights.json"
 PNA_WIDTH_ALIGNED = "results/diagnostics/pna_width_aligned_probe.json"
@@ -616,17 +616,17 @@ def build_main_small_hi(
     )
     if hi_legacy:
         add(
-            "Legacy supervised GIN (100ep seed1)",
+            "Legacy supervised Multi-GIN+EU (ports TDS-off, 50ep seeds1–3 mean)",
             "logits",
             "in-GNN end-to-end",
             hi_legacy,
-            "paper_argmax F1; supervised CE; not comparable to SSL val-tuned F1",
+            "supervised CE; not comparable to SSL val-tuned F1",
         )
     else:
         missing.append("Legacy supervised GIN (Small-HI)")
         body.append([
-            "Legacy supervised GIN (100ep seed1)", "logits", "in-GNN end-to-end",
-        ] + [MISSING] * 6 + ["pending Small-HI legacy supervised run"])
+            "Legacy supervised Multi-GIN+EU (ports TDS-off, 50ep)", "logits", "in-GNN end-to-end",
+        ] + [MISSING] * 6 + ["pending Small-HI ports TDS-off supervised aggregate"])
 
     if strict and missing:
         raise RuntimeError("Missing Small-HI main table rows: {0}".format(", ".join(missing)))
@@ -1138,7 +1138,7 @@ def build_alert_budget_appendix(
         source_json=HI_LEGACY_EVAL,
     )
     if hi_legacy:
-        add_registry_row("Small-HI", "Legacy supervised GIN (100ep seed1)", hi_legacy)
+        add_registry_row("Small-HI", "Legacy supervised Multi-GIN+EU (ports TDS-off 50ep mean)", hi_legacy)
 
     # Small-LI multiseed SSL rows
     for label, rep_display, stack in (
@@ -1275,12 +1275,294 @@ def build_architecture_ablation(
         ])
 
     footnotes = [
-        "Comparable rows only: embedding-only, post-128, shared probe settings, Small-HI architecture sweep ({0}).".format(ARCH_SWEEP),
+        "Rows above the best-stack PNA diagnostic are embedding-only post-128 architecture "
+        "comparisons under shared probe settings ({0}).".format(ARCH_SWEEP),
+        "The width-aligned best-stack PNA row is a downstream-only diagnostic "
+        "(pre-3h + raw + temporal-flow) and is not directly comparable to the embedding-only architecture sweep.",
         "Default PNA (hidden 20, pre dim 60) was not capacity/hyperparameter matched to GIN (hidden 66, pre dim 198).",
     ]
     if pending:
         footnotes.append("Pending/manual review: {0}.".format("; ".join(pending)))
     return headers, body, footnotes, comments, pending
+
+
+def build_compact_auprc_by_dataset(
+    payload: Dict[str, Any],
+    include_provisional: bool,
+) -> Tuple[List[str], List[List[str]], List[str], List[str]]:
+    """Egressy-style compact AUPRC summary across datasets."""
+    rows = _rows(payload)
+    headers = ["Method", "Small-HI AUPRC", "Small-LI AUPRC"]
+    body: List[List[str]] = []
+    comments: List[str] = []
+
+    def hi_ssl(rep: str, stack: str) -> Optional[Dict[str, Any]]:
+        return _pick(
+            rows,
+            dataset="Small-HI",
+            representation_source=rep,
+            probe_feature_stack=stack,
+            training_epochs=40,
+            seed=2,
+            source_json=CANONICAL_PREPOST,
+        )
+
+    specs = [
+        ("SSL post-128", "post_embedding_128", "embedding", False),
+        ("SSL pre-3h", "pre_embedding_3h", "embedding", False),
+        ("SSL pre-3h + raw", "pre_embedding_3h", "embedding+raw", False),
+        ("SSL pre-3h + raw + temporal-flow", "pre_embedding_3h", "embedding+raw+temporal_flow_causal", True),
+    ]
+    for label, rep, stack, is_tf in specs:
+        if is_tf:
+            hi = _pick_temporal_arm(rows, "Small-HI", "D", include_provisional)
+            hi_s = fmt_metric(hi.get("AUPRC")) if hi else MISSING
+            if hi:
+                comments.append(_source_comment(hi))
+            li_mean, li_std = _tf_ms(payload, "D", "auprc")
+            li_s = fmt_pm(li_mean, li_std) if li_mean is not None else MISSING
+        else:
+            hi = hi_ssl(rep, stack)
+            hi_s = fmt_metric(hi.get("AUPRC")) if hi else MISSING
+            if hi:
+                comments.append(_source_comment(hi))
+            li_mean, li_std = _ms(payload, stack, rep, "auprc")
+            li_s = fmt_pm(li_mean, li_std) if li_mean is not None else MISSING
+        body.append([label, hi_s, li_s])
+
+    hi_legacy = _pick(
+        rows, dataset="Small-HI", objective="supervised",
+        threshold_rule="paper_argmax", scout_or_formal="formal",
+        source_json=HI_LEGACY_EVAL,
+    )
+    li_legacy = _pick(
+        rows, dataset="Small-LI", objective="supervised",
+        threshold_rule="paper_argmax", scout_or_formal="formal",
+        source_json=LEGACY_EVAL,
+    )
+    if hi_legacy:
+        comments.append(_source_comment(hi_legacy))
+    if li_legacy:
+        comments.append(_source_comment(li_legacy))
+    body.append([
+        "Legacy supervised GIN",
+        fmt_metric(hi_legacy.get("AUPRC") if hi_legacy else None),
+        fmt_metric(li_legacy.get("AUPRC") if li_legacy else None),
+    ])
+
+    footnotes = [
+        "Small-LI SSL rows are mean ± sample SD (ddof=1) over seeds 1–3.",
+        "Small-HI SSL rows use the validated strong-run / temporal-flow protocol.",
+        "Supervised rows use end-to-end paper_argmax evaluation; SSL rows use frozen probe AUPRC.",
+    ]
+    return headers, body, footnotes, comments
+
+
+def build_compact_temporal_flow_ablation(
+    payload: Dict[str, Any],
+    include_provisional: bool,
+) -> Tuple[List[str], List[List[str]], List[str], List[str]]:
+    """Compact baseline vs +temporal-flow AUPRC deltas."""
+    rows = _rows(payload)
+    headers = [
+        "Dataset", "Baseline stack", "Baseline AUPRC",
+        "+ temporal-flow AUPRC", "Δ AUPRC",
+    ]
+    body: List[List[str]] = []
+    comments: List[str] = []
+
+    hi_b = _pick_temporal_arm(rows, "Small-HI", "B", include_provisional)
+    hi_d = _pick_temporal_arm(rows, "Small-HI", "D", include_provisional)
+    if hi_b and hi_d and hi_b.get("AUPRC") is not None and hi_d.get("AUPRC") is not None:
+        comments.append(_source_comment(hi_b))
+        comments.append(_source_comment(hi_d))
+        delta = float(hi_d["AUPRC"]) - float(hi_b["AUPRC"])
+        body.append([
+            "Small-HI",
+            "pre-3h + raw",
+            fmt_metric(hi_b.get("AUPRC")),
+            fmt_metric(hi_d.get("AUPRC")),
+            fmt_delta(delta),
+        ])
+    else:
+        body.append(["Small-HI", "pre-3h + raw", MISSING, MISSING, MISSING])
+
+    b_mean, b_std = _tf_ms(payload, "B", "auprc")
+    d_mean, d_std = _tf_ms(payload, "D", "auprc")
+    d_delta, d_delta_std = _tf_d_minus_b_ms(payload, "auprc")
+    if b_mean is not None and d_mean is not None:
+        body.append([
+            "Small-LI",
+            "pre-3h + raw",
+            fmt_pm(b_mean, b_std),
+            fmt_pm(d_mean, d_std),
+            fmt_delta(d_delta, d_delta_std) if d_delta is not None else fmt_delta(d_mean - b_mean),
+        ])
+    else:
+        body.append(["Small-LI", "pre-3h + raw", MISSING, MISSING, MISSING])
+
+    footnotes = [
+        "Baseline = pre-3h + raw; +temporal-flow = pre-3h + raw + temporal_flow_causal.",
+        "Uses validated max_iter=5000 temporal-flow results when available.",
+        "Small-LI values are mean ± sample SD over seeds 1–3.",
+    ]
+    return headers, body, footnotes, comments
+
+
+def build_compact_supervised_vs_ssl(
+    payload: Dict[str, Any],
+    include_provisional: bool,
+) -> Tuple[List[str], List[List[str]], List[str], List[str]]:
+    """Compact supervised vs frozen SSL comparison for PI summary."""
+    rows = _rows(payload)
+    headers = ["Dataset", "Method", "AUPRC", "F1", "P@100", "R@100", "Caveat"]
+    body: List[List[str]] = []
+    comments: List[str] = []
+
+    hi_tf = _pick_temporal_arm(rows, "Small-HI", "D", include_provisional)
+    if hi_tf:
+        comments.append(_source_comment(hi_tf))
+        body.append([
+            "Small-HI",
+            "SSL pre-3h + raw + temporal-flow",
+            fmt_metric(hi_tf.get("AUPRC")),
+            fmt_metric(hi_tf.get("F1")),
+            fmt_metric(_alert_metric(hi_tf, "precision_at_100")),
+            fmt_metric(_alert_metric(hi_tf, "recall_at_100")),
+            "val-tuned F1; frozen linear probe",
+        ])
+    else:
+        body.append(["Small-HI", "SSL pre-3h + raw + temporal-flow"] + [MISSING] * 5)
+
+    hi_legacy = _pick(
+        rows, dataset="Small-HI", objective="supervised",
+        threshold_rule="paper_argmax", scout_or_formal="formal",
+        source_json=HI_LEGACY_EVAL,
+    )
+    if hi_legacy:
+        comments.append(_source_comment(hi_legacy))
+        body.append([
+            "Small-HI",
+            "Legacy supervised GIN",
+            fmt_metric(hi_legacy.get("AUPRC")),
+            fmt_metric(hi_legacy.get("F1")),
+            fmt_metric(_alert_metric(hi_legacy, "precision_at_100")),
+            fmt_metric(_alert_metric(hi_legacy, "recall_at_100")),
+            "paper_argmax F1 mean (seeds 1–3); supervised CE; not comparable to SSL val-tuned F1",
+        ])
+    else:
+        body.append(["Small-HI", "Legacy supervised GIN"] + [MISSING] * 5)
+
+    tf_d = _li_tf_arm_d_aggregate(payload)
+    if tf_d:
+        comments.append("<!-- multiseed: temporal-flow Small-LI compact -->")
+        body.append([
+            "Small-LI",
+            "SSL pre-3h + raw + temporal-flow",
+            tf_d["auprc"],
+            tf_d["f1"],
+            tf_d["p100"],
+            tf_d["r100"],
+            "val-tuned F1; frozen linear probe; mean ± sample SD (n=3)",
+        ])
+    else:
+        body.append(["Small-LI", "SSL pre-3h + raw + temporal-flow"] + [MISSING] * 5)
+
+    li_legacy = _pick(
+        rows, dataset="Small-LI", objective="supervised",
+        threshold_rule="paper_argmax", scout_or_formal="formal",
+        source_json=LEGACY_EVAL,
+    )
+    if li_legacy:
+        comments.append(_source_comment(li_legacy))
+        body.append([
+            "Small-LI",
+            "Legacy supervised GIN",
+            fmt_metric(li_legacy.get("AUPRC")),
+            fmt_metric(li_legacy.get("F1")),
+            fmt_metric(_alert_metric(li_legacy, "precision_at_100")),
+            fmt_metric(_alert_metric(li_legacy, "recall_at_100")),
+            "paper_argmax F1; supervised CE; not comparable to SSL val-tuned F1",
+        ])
+    else:
+        body.append(["Small-LI", "Legacy supervised GIN"] + [MISSING] * 5)
+
+    footnotes = [
+        "SSL uses frozen linear probe with validation-tuned threshold.",
+        "Supervised uses end-to-end supervised CE and paper_argmax F1.",
+        "F1 values are not directly comparable without the protocol caveat.",
+    ]
+    return headers, body, footnotes, comments
+
+
+def build_compact_pna_diagnostic(
+    payload: Dict[str, Any],
+    include_provisional: bool,
+) -> Tuple[List[str], List[List[str]], List[str], List[str]]:
+    """Compact PNA width-aligned diagnostic vs GIN main stack."""
+    rows = _rows(payload)
+    headers = ["Encoder / setup", "Representation + features", "Small-HI AUPRC", "Takeaway"]
+    body: List[List[str]] = []
+    comments: List[str] = []
+
+    gin_d = _pick_temporal_arm(rows, "Small-HI", "D", include_provisional)
+    if gin_d:
+        comments.append(_source_comment(gin_d))
+        body.append([
+            "GIN main stack",
+            "pre-3h + raw + temporal-flow",
+            fmt_metric(gin_d.get("AUPRC")),
+            "main encoder/result",
+        ])
+    else:
+        body.append(["GIN main stack", "pre-3h + raw + temporal-flow", MISSING, "main encoder/result"])
+
+    pna_post = _filter_rows(
+        rows, include_provisional=True,
+        source_json=PNA_WIDTH_ALIGNED,
+        dataset="Small-HI",
+        probe_feature_stack="embedding",
+        representation_source="post_embedding_128",
+    )
+    if pna_post:
+        comments.append(_source_comment(pna_post[0]))
+        body.append([
+            "PNA width-aligned",
+            "post-128 embedding only",
+            fmt_metric(pna_post[0].get("AUPRC")),
+            "post-128 understates PNA",
+        ])
+    else:
+        body.append(["PNA width-aligned", "post-128 embedding only", MISSING, "post-128 understates PNA"])
+
+    pna_best = _filter_rows(
+        rows, include_provisional=True,
+        source_json=PNA_WIDTH_TF_PROBE,
+        dataset="Small-HI",
+        probe_feature_stack="embedding+raw+temporal_flow_causal",
+        representation_source="pre_embedding_3h",
+    )
+    if pna_best:
+        comments.append(_source_comment(pna_best[0]))
+        body.append([
+            "PNA width-aligned",
+            "pre-3h + raw + temporal-flow",
+            fmt_metric(pna_best[0].get("AUPRC")),
+            "competitive but below GIN; one-seed diagnostic",
+        ])
+    else:
+        body.append([
+            "PNA width-aligned",
+            "pre-3h + raw + temporal-flow",
+            MISSING,
+            "competitive but below GIN; one-seed diagnostic",
+        ])
+
+    footnotes = [
+        "PNA rows are one-seed width-aligned scouts; not a full architecture ranking.",
+        "Best-stack PNA row is downstream-only (no PNA SSL retraining).",
+    ]
+    return headers, body, footnotes, comments
 
 
 def build_contrastive_ablations(
@@ -1388,7 +1670,99 @@ TABLE_BUILDERS: Dict[str, Callable[..., Tuple[List[str], List[List[str]], List[s
     "alert_budget_performance_appendix": build_alert_budget_appendix,
     "architecture_ablation_appendix": lambda p, ip, st: build_architecture_ablation(p) + ([],),
     "contrastive_ablations_appendix": lambda p, ip, st: build_contrastive_ablations(p) + ([],),
+    "label_scarcity_appendix": lambda p, ip, st: build_label_scarcity_appendix(p),
 }
+
+COMPACT_TABLE_BUILDERS: Dict[str, Callable[..., Tuple[List[str], List[List[str]], List[str], List[str]]]] = {
+    "compact_auprc_by_dataset": lambda p, ip, st: build_compact_auprc_by_dataset(p, ip),
+    "compact_temporal_flow_ablation": lambda p, ip, st: build_compact_temporal_flow_ablation(p, ip),
+    "compact_supervised_vs_ssl": lambda p, ip, st: build_compact_supervised_vs_ssl(p, ip),
+    "compact_pna_diagnostic": lambda p, ip, st: build_compact_pna_diagnostic(p, ip),
+}
+
+PI_UPDATE_BULLETS = [
+    "Added a causal temporal-flow feature group: sender/receiver interarrival time, "
+    "sender recent 7-day activity, amount relative to sender history, and repeat "
+    "sender→receiver pair.",
+    "Built a registry/table pipeline so results are generated from result JSONs "
+    "instead of hand-copied.",
+    "Added validated temporal-flow results, Small-HI supervised baseline, and "
+    "width-aligned PNA diagnostics.",
+    "Current best frozen SSL stack is pre-3h + raw + temporal-flow.",
+    "Supervised GIN remains strongest, but frozen SSL + temporal-flow is competitive "
+    "at top-alert precision.",
+]
+
+PI_DEFINITIONS = [
+    ("post-128", "exported 128-dimensional embedding after the learned embedding head."),
+    (
+        "pre-3h",
+        "edge representation immediately before the embedding head, formed from "
+        "source-node, destination-node, and edge representations. For GIN h=66, "
+        "this is 3h=198 dimensions.",
+    ),
+    ("P@100", "precision among the top 100 scored test transactions."),
+    ("R@100", "fraction of all positive test transactions recovered in the top 100 scored test transactions."),
+    ("Lift@100", "P@100 divided by the test-set positive rate."),
+    ("temporal-flow", "causal per-transaction history features using only prior transactions."),
+]
+
+COMPACT_CAPTIONS = {
+    "compact_auprc_by_dataset": "Compact AUPRC summary",
+    "compact_temporal_flow_ablation": "Compact temporal-flow ablation",
+    "compact_supervised_vs_ssl": "Compact supervised versus frozen SSL",
+    "compact_pna_diagnostic": "Compact PNA diagnostic",
+}
+
+LABEL_SCARCITY_DIAG = "results/diagnostics/label_scarcity_temporal_flow_probe.json"
+LABEL_SCARCITY_TABLE_MD = "tables/label_scarcity_auprc.md"
+
+
+def build_label_scarcity_appendix(
+    payload: Dict[str, Any],
+) -> Tuple[List[str], List[List[str]], List[str], List[str]]:
+    """Optional diagnostic appendix; prefers summarize script table if present."""
+    headers = [
+        "Label fraction",
+        "Small-HI pre-3h+raw AUPRC",
+        "Small-HI pre-3h+raw+temporal AUPRC",
+        "Small-LI pre-3h+raw AUPRC",
+        "Small-LI pre-3h+raw+temporal AUPRC",
+    ]
+    body: List[List[str]] = []
+    comments: List[str] = []
+    diag_path = ROOT / LABEL_SCARCITY_DIAG
+    if not diag_path.is_file():
+        body = [[
+            "Pending",
+            MISSING,
+            MISSING,
+            MISSING,
+            MISSING,
+        ]]
+        footnotes = [
+            "Label-scarcity temporal-flow probe not yet available "
+            f"({LABEL_SCARCITY_DIAG}). Downstream-only diagnostic; not a main-table result.",
+        ]
+        return headers, body, footnotes, comments
+
+    with diag_path.open(encoding="utf-8") as f:
+        diag = json.load(f)
+    comments.append(f"<!-- source: {LABEL_SCARCITY_DIAG} -->")
+    table = diag.get("auprc_table") or {}
+    if table.get("headers"):
+        headers = list(table["headers"])
+    for row in table.get("rows") or []:
+        body.append([str(c) for c in row])
+    if not body:
+        body = [[MISSING] * len(headers)]
+    footnotes = list(diag.get("interpretation") or [])
+    footnotes.extend([
+        "Diagnostic appendix only; not inserted into main thesis tables.",
+        "Train labels subsampled; validation/test unchanged. Frozen pre-3h embeddings.",
+        "Small-LI values are mean ± sample SD over model seeds 1–3 when available.",
+    ])
+    return headers, body, footnotes, comments
 
 
 def write_table_files(
@@ -1428,7 +1802,6 @@ def build_preview(
     out_dir: Path,
     include_sources: bool = False,
 ) -> Tuple[str, List[Path]]:
-    sections = []
     all_written: List[Path] = []
     captions = {
         "dataset_summary": "Table 1 — Dataset summary",
@@ -1440,7 +1813,19 @@ def build_preview(
         "alert_budget_performance_appendix": "Appendix — Alert-budget performance",
         "architecture_ablation_appendix": "Appendix — Architecture ablation",
         "contrastive_ablations_appendix": "Appendix — Contrastive and diagnostic ablations",
+        "label_scarcity_appendix": "Appendix — Label-scarcity temporal-flow diagnostic",
     }
+
+    for name, builder in COMPACT_TABLE_BUILDERS.items():
+        result = builder(payload, include_provisional, strict)
+        headers, body, footnotes = result[:3]
+        comments = result[3] if len(result) > 3 else []
+        caption = COMPACT_CAPTIONS[name]
+        written = write_table_files(
+            name, caption, headers, body, footnotes, comments, out_dir, formats, include_sources,
+        )
+        all_written.extend(written)
+
     for name, builder in TABLE_BUILDERS.items():
         result = builder(payload, include_provisional, strict)
         headers, body, footnotes = result[:3]
@@ -1450,7 +1835,7 @@ def build_preview(
             name, caption, headers, body, footnotes, comments, out_dir, formats, include_sources,
         )
         all_written.extend(written)
-        sections.append("## {0}\n\n{{include}} tables/{0}.md\n".format(name))
+
     tf_val = payload.get("temporal_flow_validation") or {}
     header = [
         "# Thesis tables preview",
@@ -1464,9 +1849,53 @@ def build_preview(
     ]
     if payload.get("pending_sources"):
         header.append("### Pending optional sources")
-        for p in payload["pending_sources"]:
-            header.append("- `{0}`".format(p))
+        for psrc in payload["pending_sources"]:
+            header.append("- `{0}`".format(psrc))
         header.append("")
+
+    scarcity_note = []
+    if (ROOT / LABEL_SCARCITY_DIAG).is_file():
+        scarcity_note = [
+            "- Label-scarcity temporal-flow diagnostic available "
+            f"(`{LABEL_SCARCITY_DIAG}`; see appendix).",
+            "",
+        ]
+    else:
+        scarcity_note = [
+            "- Label-scarcity temporal-flow diagnostic pending "
+            f"(`{LABEL_SCARCITY_DIAG}`).",
+            "",
+        ]
+    header.extend(scarcity_note)
+
+    summary_parts = [
+        "## PI-facing summary",
+        "",
+        "### Short update",
+        "",
+    ]
+    for bullet in PI_UPDATE_BULLETS:
+        summary_parts.append("- {0}".format(bullet))
+    summary_parts.append("")
+
+    for name in COMPACT_TABLE_BUILDERS:
+        md_path = out_dir / "{0}.md".format(name)
+        if not md_path.is_file():
+            continue
+        text = md_path.read_text(encoding="utf-8")
+        if not include_sources:
+            text = _strip_source_comments(text)
+        lines = text.splitlines()
+        if lines and lines[0].startswith("# "):
+            text = "\n".join(lines[1:]).lstrip()
+        summary_parts.append("### {0}\n\n".format(COMPACT_CAPTIONS[name]) + text)
+        summary_parts.append("")
+
+    summary_parts.extend(["### Definitions", ""])
+    for term, definition in PI_DEFINITIONS:
+        summary_parts.append("- **{0}:** {1}".format(term, definition))
+    summary_parts.extend(["", "---", "", "## Full detailed tables", ""])
+
     content_parts = []
     for name in TABLE_BUILDERS:
         md_path = out_dir / "{0}.md".format(name)
@@ -1477,8 +1906,8 @@ def build_preview(
             lines = text.splitlines()
             if lines and lines[0].startswith("# "):
                 text = "\n".join(lines[1:]).lstrip()
-            content_parts.append("## {0}\n\n".format(captions[name]) + text)
-    preview = "\n".join(header) + "\n".join(content_parts)
+            content_parts.append("## {0}\n\n".format(captions[name]) + text + "\n")
+    preview = "\n".join(header) + "\n".join(summary_parts) + "\n".join(content_parts)
     return preview, all_written
 
 

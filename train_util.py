@@ -97,11 +97,21 @@ def validate_masked_edge_args(args, setup: TrainingSetup) -> None:
 
 def log_training_setup(setup: TrainingSetup, args) -> None:
     logging.info(
-        "Training setup: graph_form=%s objective=%s reverse_mp=%s finetune=%s",
+        "Training setup: graph_form=%s objective=%s reverse_mp=%s finetune=%s "
+        "correct_reverse_edge_features=%s reverse_edge_feature_semantics=%s "
+        "preserve_seed_edges=%s",
         setup.graph_form,
         setup.objective,
         bool(getattr(args, "reverse_mp", False)),
         bool(getattr(args, "finetune", False)),
+        bool(getattr(args, "correct_reverse_edge_features", False)),
+        getattr(args, "reverse_edge_feature_semantics", None)
+        or (
+            "corrected"
+            if bool(getattr(args, "correct_reverse_edge_features", False))
+            else "inherited_legacy"
+        ),
+        bool(getattr(args, "preserve_seed_edges", False)),
     )
 
 
@@ -207,14 +217,23 @@ def add_arange_ids(data_list):
 
     Args:
     - data_list (str): List of tr_data, val_data and te_data.
+
+    Idempotent: skips graphs that already had ids prepended (safe for multi-checkpoint
+    extraction on a shared in-memory graph).
     '''
     for data in data_list:
+        if bool(getattr(data, "_arange_ids_added", False)):
+            continue
         if isinstance(data, HeteroData):
             data['node', 'to', 'node'].edge_attr = torch.cat([torch.arange(data['node', 'to', 'node'].edge_attr.shape[0]).view(-1, 1), data['node', 'to', 'node'].edge_attr], dim=1)
             offset = data['node', 'to', 'node'].edge_attr.shape[0]
             data['node', 'rev_to', 'node'].edge_attr = torch.cat([torch.arange(offset, data['node', 'rev_to', 'node'].edge_attr.shape[0] + offset).view(-1, 1), data['node', 'rev_to', 'node'].edge_attr], dim=1)
         else:
             data.edge_attr = torch.cat([torch.arange(data.edge_attr.shape[0]).view(-1, 1), data.edge_attr], dim=1)
+        try:
+            data._arange_ids_added = True
+        except Exception:
+            pass
 
 
 def attach_edge_id_from_batch(
@@ -531,13 +550,55 @@ def save_model(model, optimizer, epoch, args, data_config, *, suffix: str = ""):
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "embedding_dim": int(getattr(args, "embedding_dim", 128)),
+        "include_temporal_flow_edge_features": bool(
+            getattr(args, "include_temporal_flow_edge_features", False)
+        ),
+        "correct_reverse_edge_features": bool(
+            getattr(args, "correct_reverse_edge_features", False)
+        ),
+        "reverse_edge_feature_semantics": (
+            getattr(args, "reverse_edge_feature_semantics", None)
+            or (
+                "corrected"
+                if bool(getattr(args, "correct_reverse_edge_features", False))
+                else "inherited_legacy"
+            )
+        ),
+        "preserve_seed_edges": bool(getattr(args, "preserve_seed_edges", False)),
+        "ports": bool(getattr(args, "ports", False)),
+        "tds": bool(getattr(args, "tds", False)),
     }
+    schema = getattr(args, "edge_feature_schema", None)
+    if schema is not None:
+        payload["edge_feature_schema"] = schema
+    # Record edge_dim when available (GINe/GATe/PNA/RGCN expose edge_emb).
+    edge_emb = getattr(model, "edge_emb", None)
+    if edge_emb is not None and hasattr(edge_emb, "in_features"):
+        payload["edge_dim"] = int(edge_emb.in_features)
+    tf_meta = getattr(args, "temporal_flow_edge_features_meta", None)
+    if tf_meta is not None:
+        payload["temporal_flow_edge_features_meta"] = tf_meta
     morph_head = getattr(args, "morph_expert_head", None)
     if morph_head is not None:
         payload["morph_expert_state_dict"] = morph_head.state_dict()
     proj_head = getattr(args, "contrast_projection_module", None)
     if proj_head is not None:
         payload["contrast_projection_state_dict"] = proj_head.state_dict()
+    tf_head = getattr(args, "temporal_flow_aux_head", None)
+    if tf_head is not None:
+        payload["temporal_flow_aux_state_dict"] = tf_head.state_dict()
+        tf_cfg = getattr(args, "temporal_flow_aux_cfg", None)
+        if tf_cfg is not None:
+            payload["temporal_flow_aux_meta"] = {
+                "mode": tf_cfg.mode,
+                "weight": tf_cfg.weight,
+                "loss_type": tf_cfg.loss_type,
+                "n_bins": tf_cfg.n_bins,
+                "attach_point": tf_cfg.attach_point,
+                "feature_names": list(tf_cfg.feature_names),
+                "metadata_path": tf_cfg.metadata_path,
+                "uses_labels": False,
+            }
     masked_decoder = getattr(args, "masked_edge_decoder", None)
     if masked_decoder is not None:
         payload["masked_edge_decoder_state_dict"] = masked_decoder.state_dict()
@@ -567,6 +628,9 @@ def load_checkpoint_weights(model, device, args, data_config) -> int:
             f"{int(ckpt_emb_dim)} but the current run uses --embedding_dim {req_emb_dim}. "
             f"Pass --embedding_dim {int(ckpt_emb_dim)} to match this checkpoint."
         )
+    from morphology.temporal_flow_edge_features import assert_checkpoint_tf_edge_features_flag
+
+    assert_checkpoint_tf_edge_features_flag(checkpoint, args, path=path)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     return int(checkpoint.get("epoch", -1))
@@ -636,13 +700,22 @@ def save_embedding_split_npz(
     labels: torch.Tensor,
     edge_ids: torch.Tensor,
 ) -> None:
+    """Atomic write: ``path.tmp.npz`` then ``os.replace`` into ``path``."""
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp.npz")
     np.savez(
-        path,
+        tmp,
         Z=embeddings.detach().cpu().numpy().astype(np.float32),
         y=labels.detach().cpu().numpy(),
         edge_id=edge_ids.detach().cpu().numpy(),
     )
+    # np.savez may append .npz when the destination does not already end in .npz.
+    written = tmp if tmp.is_file() else Path(str(tmp) + ".npz")
+    if written != path:
+        os.replace(written, path)
+    if tmp.is_file() and tmp != path:
+        tmp.unlink(missing_ok=True)
 
 
 # Representation-source lever for extraction diagnostics.
@@ -962,12 +1035,48 @@ def extract_seed_embeddings_hetero(
         else None
     )
     try:
-        return _extract_seed_embeddings_hetero_impl(
-            loader, split_inds, model, data, device, args, capture
+        edge_ids, z_post, y, z_pre = _extract_seed_embeddings_hetero_impl(
+            loader, split_inds, model, data, device, args, capture, dual=False
         )
+        if representation_source == "pre_embedding_3h":
+            return edge_ids, z_pre, y
+        return edge_ids, z_post, y
     finally:
         if capture is not None:
             capture.remove()
+
+
+@torch.no_grad()
+def extract_seed_embeddings_hetero_dual(
+    loader,
+    split_inds,
+    model,
+    data,
+    device,
+    args,
+    pre_dim: Optional[int] = None,
+    emb_dim: Optional[int] = None,
+    head_spec: Optional[EmbeddingHeadSpec] = None,
+    max_batches: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One forward: return ``(edge_ids, z_pre3h, z_post128, y)`` with identical row order."""
+    capture = PreEmbeddingCapture(
+        model, pre_dim=pre_dim, emb_dim=emb_dim or 128, head_spec=head_spec
+    )
+    try:
+        return _extract_seed_embeddings_hetero_impl(
+            loader,
+            split_inds,
+            model,
+            data,
+            device,
+            args,
+            capture,
+            dual=True,
+            max_batches=max_batches,
+        )
+    finally:
+        capture.remove()
 
 
 @torch.no_grad()
@@ -979,14 +1088,19 @@ def _extract_seed_embeddings_hetero_impl(
     device,
     args,
     capture: Optional[PreEmbeddingCapture],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dual: bool = False,
+    max_batches: Optional[int] = None,
+):
     edge_id_chunks: List[torch.Tensor] = []
-    z_chunks: List[torch.Tensor] = []
+    z_post_chunks: List[torch.Tensor] = []
+    z_pre_chunks: List[torch.Tensor] = []
     y_chunks: List[torch.Tensor] = []
     store = FORWARD_EDGE_TYPE
 
     split_inds_cpu = split_inds.detach().cpu()
-    for batch in tqdm.tqdm(loader, disable=not args.tqdm, desc="extract hetero"):
+    for batch_i, batch in enumerate(tqdm.tqdm(loader, disable=not args.tqdm, desc="extract hetero")):
+        if max_batches is not None and batch_i >= int(max_batches):
+            break
         fwd = batch[store]
         batch_edge_inds = split_inds_cpu[fwd.input_id.detach().cpu()]
         batch_edge_ids = loader.data[store].edge_attr.detach().cpu()[batch_edge_inds, 0]
@@ -1017,21 +1131,43 @@ def _extract_seed_embeddings_hetero_impl(
         if capture is not None:
             capture.clear()
         out = model(batch.x_dict, batch.edge_index_dict, batch.edge_attr_dict)
-        z = out[store]
-        if capture is not None:
-            z = capture.get(z)
+        z_post = out[store]
+        z_pre = capture.get(z_post) if capture is not None else None
         mask_dev = mask.to(device, non_blocking=True)
         edge_id_chunks.append(edge_ids[mask].detach().cpu())
-        z_chunks.append(z[mask_dev].detach().cpu())
+        z_post_chunks.append(z_post[mask_dev].detach().cpu())
+        if z_pre is not None:
+            z_pre_chunks.append(z_pre[mask_dev].detach().cpu())
         y_chunks.append(fwd.y[mask_dev].detach().cpu().long())
 
     edge_ids = torch.cat(edge_id_chunks, dim=0)
-    embeddings = torch.cat(z_chunks, dim=0)
-    labels = torch.cat(y_chunks, dim=0)
-    edge_ids, embeddings, labels, n_dup = dedupe_seed_embeddings(edge_ids, embeddings, labels)
+    z_post = torch.cat(z_post_chunks, dim=0)
+    y = torch.cat(y_chunks, dim=0)
+    if capture is not None:
+        z_pre = torch.cat(z_pre_chunks, dim=0)
+        # Dedupe on shared order: apply same keep mask from edge_ids
+        edge_ids_d, z_post_d, y_d, n_dup = dedupe_seed_embeddings(edge_ids, z_post, y)
+        # Rebuild keep indices via first-occurrence of edge_ids
+        seen = {}
+        keep = []
+        for i, eid in enumerate(edge_ids.tolist()):
+            if eid in seen:
+                continue
+            seen[eid] = i
+            keep.append(i)
+        idx = torch.tensor(keep, dtype=torch.long)
+        z_pre_d = z_pre[idx]
+        if n_dup > 0:
+            logging.info("extract hetero: dropped %d duplicate seed rows", n_dup)
+        if dual:
+            return edge_ids_d, z_pre_d, z_post_d, y_d
+        return edge_ids_d, z_post_d, y_d, z_pre_d
+    edge_ids, z_post, y, n_dup = dedupe_seed_embeddings(edge_ids, z_post, y)
     if n_dup > 0:
         logging.info("extract hetero: dropped %d duplicate seed rows", n_dup)
-    return edge_ids, embeddings, labels
+    if dual:
+        raise RuntimeError("dual extract requires pre_embedding capture")
+    return edge_ids, z_post, y, None
 
 
 @torch.no_grad()
@@ -1151,7 +1287,7 @@ SUPERVISED_ARG_KEYS = (
     "model", "data", "supervised_head", "objective", "reverse_mp", "emlps",
     "ports", "tds", "ego", "seed", "n_epochs", "batch_size", "num_neighs",
     "override_lr", "override_n_hidden", "override_final_dropout", "finetune",
-    "unique_name",
+    "unique_name", "correct_reverse_edge_features", "preserve_seed_edges",
 )
 
 
@@ -1323,6 +1459,18 @@ def supervised_run_metadata(args, config) -> Dict[str, Any]:
             "ports": bool(getattr(args, "ports", False)),
             "tds": bool(getattr(args, "tds", False)),
             "ego": bool(getattr(args, "ego", False)),
+            "correct_reverse_edge_features": bool(
+                getattr(args, "correct_reverse_edge_features", False)
+            ),
+            "preserve_seed_edges": bool(getattr(args, "preserve_seed_edges", False)),
+            "reverse_edge_feature_semantics": (
+                getattr(args, "reverse_edge_feature_semantics", None)
+                or (
+                    "corrected"
+                    if bool(getattr(args, "correct_reverse_edge_features", False))
+                    else "inherited_legacy"
+                )
+            ),
         },
         "class_weights": {
             "0": float(getattr(config, "w_ce1", float("nan"))),
@@ -1651,7 +1799,11 @@ def _write_supervised_summary_md(path: Path, summary: Dict[str, Any]) -> None:
 
 
 def load_model(model, device, args, config, data_config):
-    checkpoint = torch.load(f'{data_config["paths"]["model_to_load"]}/checkpoint_{args.unique_name}.tar')
+    path = Path(data_config["paths"]["model_to_load"]) / f"checkpoint_{args.unique_name}.tar"
+    checkpoint = torch.load(path, map_location=device)
+    from morphology.temporal_flow_edge_features import assert_checkpoint_tf_edge_features_flag
+
+    assert_checkpoint_tf_edge_features_flag(checkpoint, args, path=path)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
@@ -1672,6 +1824,9 @@ def load_checkpoint_auxiliary_modules(args, data_config, device) -> None:
     proj_head = getattr(args, "contrast_projection_module", None)
     if proj_head is not None and "contrast_projection_state_dict" in checkpoint:
         proj_head.load_state_dict(checkpoint["contrast_projection_state_dict"])
+    tf_head = getattr(args, "temporal_flow_aux_head", None)
+    if tf_head is not None and "temporal_flow_aux_state_dict" in checkpoint:
+        tf_head.load_state_dict(checkpoint["temporal_flow_aux_state_dict"])
     masked_decoder = getattr(args, "masked_edge_decoder", None)
     if masked_decoder is not None and "masked_edge_decoder_state_dict" in checkpoint:
         masked_decoder.load_state_dict(checkpoint["masked_edge_decoder_state_dict"])

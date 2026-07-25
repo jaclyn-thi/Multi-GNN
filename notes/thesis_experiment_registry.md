@@ -10,7 +10,7 @@ Every metric is copied from a cited JSON file — **no inferred values**.
 | `results/diagnostics/thesis_experiment_registry.csv` | One row per evaluated config |
 | `results/diagnostics/thesis_experiment_registry.json` | Rows + multiseed aggregates |
 
-**Total rows:** 155 | **thesis_primary:** 24 | **thesis_supporting:** 112 | **diagnostic:** 11 | **negative_result:** 5 | **superseded:** 3
+**Total rows:** 367 | **thesis_primary:** 27 | **thesis_supporting:** 112 | **diagnostic:** 119 | **negative_result:** 25 | **superseded:** 5
 
 ## Field conventions
 
@@ -25,12 +25,17 @@ Every metric is copied from a cited JSON file — **no inferred values**.
 
 | Value | Rule |
 |-------|------|
-| `thesis_primary` | Small-LI multiseed pre/post rows; formal legacy supervised (paper_argmax); Small-HI strong-run paired pre/post (`pre3h_strong_run_comparison.json`) for gin 40ep s2 and FNF HI |
-| `thesis_supporting` | Architecture sweep; alert-budget diagnostics; feature ablation; single-file HI pre/post JSON; 20ep baseline rows; FNF/LI strong-run secondary rows |
-| `diagnostic` | emb198 scout; legacy supervised val-tuned row; legacy 20ep scout |
-| `negative_result` | degree-aware edge-drop ablation; superseded non-legacy supervised |
+| `thesis_primary` | Small-LI multiseed pre/post; **paper-faithful** Small-HI ports TDS-off supervised (paper_argmax); Small-HI strong-run paired pre/post for gin 40ep s2 and FNF HI |
+| `thesis_supporting` | Architecture sweep; alert-budget; feature ablation; single-file HI pre/post; 20ep baseline; FNF/LI secondary |
+| `diagnostic` | emb198; val-tuned supervised; batch-size E/F; GCPAL audits; A/B/C/D contrastive arms; txn-node scouts; random-40 |
+| `negative_result` | degree-aware edge-drop; superseded non-legacy supervised |
 | `historical` | Rows from superseded protocols not marked superseded=true |
-| `superseded` | `superseded=true` |
+| `superseded` | `superseded=true` (includes old Small-HI TDS-on supervised for paper table) |
+
+### `paper_comparable` (Multi-GIN+EU)
+
+`true` only for Small-HI legacy supervised with ports, **tds=False**, paper_argmax, formal seeds/aggregate.
+Old TDS-on supervised → `false`. Contrastive / txn-node / random-40 → `false`.
 
 ---
 

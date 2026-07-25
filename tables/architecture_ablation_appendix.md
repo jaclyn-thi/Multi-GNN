@@ -10,5 +10,6 @@
 | pna (width-aligned, best stack) | 65 | 195 | 128 | — | 0.982 | 0.407 | 0.410 | pre-3h+raw+temporal-flow; one seed; downstream-only diagnostic |
 
 **Notes:**
-- Comparable rows only: embedding-only, post-128, shared probe settings, Small-HI architecture sweep (results/diagnostics/architecture_sweep_shared_probe_weights.json).
+- Rows above the best-stack PNA diagnostic are embedding-only post-128 architecture comparisons under shared probe settings (results/diagnostics/architecture_sweep_shared_probe_weights.json).
+- The width-aligned best-stack PNA row is a downstream-only diagnostic (pre-3h + raw + temporal-flow) and is not directly comparable to the embedding-only architecture sweep.
 - Default PNA (hidden 20, pre dim 60) was not capacity/hyperparameter matched to GIN (hidden 66, pre dim 198).

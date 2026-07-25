@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import sys
 import time
 import traceback
 from argparse import Namespace
@@ -16,6 +17,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 from linear_probe import (
     evaluate_probe,
     fit_logistic_probe,
@@ -24,6 +29,7 @@ from linear_probe import (
     serialize_class_weight,
     tune_threshold_max_f1,
 )
+from ranking_metrics import ALERT_BUDGET_KS, ranking_metrics
 from scripts.probe_feature_ablation import (
     assemble_split_matrix,
     build_full_feature_matrix,
@@ -34,7 +40,6 @@ from dataset_specs import get_dataset_spec
 
 CACHE_VERSION = "v1"
 ENGINE_VERSION = "probe_sweep_engine_v1"
-ALERT_BUDGET_KS = (100, 500, 1000)
 
 
 def parse_class_weight_policy(policy: str) -> Tuple[str, Optional[float]]:
@@ -360,25 +365,7 @@ def fit_probe_cell(
     selected_threshold, val_f1_at_selection = tune_threshold_max_f1(bundle.y_val, val_proba)
 
     def _alert_budget_metrics(proba: np.ndarray, y: np.ndarray) -> Dict[str, float]:
-        y = y.astype(np.int64)
-        n = int(y.shape[0])
-        positives = int(y.sum())
-        prevalence = float(y.mean()) if n else float("nan")
-        out: Dict[str, float] = {}
-        if n == 0:
-            return out
-        order = np.argsort(-proba)
-        for k in ALERT_BUDGET_KS:
-            kk = min(int(k), n)
-            top = order[:kk]
-            tp = int(y[top].sum())
-            precision = float(tp / kk) if kk else float("nan")
-            recall = float(tp / positives) if positives else float("nan")
-            lift = float(precision / prevalence) if prevalence > 0 else float("nan")
-            out[f"precision_at_{k}"] = precision
-            out[f"recall_at_{k}"] = recall
-            out[f"lift_at_{k}"] = lift
-        return out
+        return ranking_metrics(y, proba)
 
     def _split_metrics(x, y, split_name: str) -> Dict[str, Any]:
         proba = clf.predict_proba(x)[:, 1]

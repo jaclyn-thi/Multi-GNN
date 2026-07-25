@@ -1,6 +1,8 @@
 # Development results (not frozen benchmarks)
 
-Quick-run numbers for internal comparison while configs and code still change. **Not** a formal evaluation protocol — numbers may change we refine the stack.
+**New to the repo?** Start with the root [`README.md`](../README.md), [`evaluation_protocols.md`](evaluation_protocols.md), and [`thesis_protocol_families.md`](thesis_protocol_families.md). Paper-faithful Small-HI Multi-GIN+EU is **ports TDS-off 50ep** (aggregate F1 **0.660 ± 0.060**); older TDS-on supervised is **not** paper-compatible. Dev probe leaderboards below remain useful for SSL comparisons but are **not** a frozen thesis table.
+
+Quick-run numbers for internal comparison while configs and code still change. **Not** a formal evaluation protocol — numbers may change as we refine the stack.
 
 **New to the repo?** Start with [Recommended configs](#recommended-configs-jun-2026), the [key runs leaderboard](#key-runs-leaderboard-jun-26--jul-2), and the [Small-LI scout](#small-li-current-protocol-scout-jul-2) if you care about dataset transfer. Deeper history is in sections below (not all runs use the same protocol).
 

@@ -71,6 +71,15 @@ from morphology.contrastive_train import (
     morph_expert_loss_hetero_step,
     morph_expert_loss_homo_step,
 )
+from morphology.temporal_flow_aux import (
+    setup_temporal_flow_aux,
+    temporal_flow_aux_loss,
+)
+from morphology.temporal_flow_soft_positives import (
+    build_temporal_flow_soft_positive_batch,
+    setup_temporal_flow_soft_positives,
+    temporal_flow_soft_positives_enabled,
+)
 from morphology.expert import (
     finalize_morph_expert_diagnostics,
     setup_morph_tier0_contexts,
@@ -85,6 +94,27 @@ from masked_edge import (
 )
 import wandb
 import logging
+
+
+def _log_tf_soft_pos_stats(prefix: str, stats: dict) -> None:
+    if not stats or float(stats.get("anchors", 0.0)) <= 0:
+        return
+    shared_dist = {
+        key.removeprefix("shared_bins_").removesuffix("_count"): int(value)
+        for key, value in stats.items()
+        if key.startswith("shared_bins_") and key.endswith("_count")
+    }
+    logging.info(
+        "%s tf_soft_pos: avg=%.3f zero_rate=%.3f max_obs=%.0f capped=%.0f "
+        "mean_shared_bins=%.2f shared_bin_distribution=%s",
+        prefix,
+        float(stats.get("avg_soft_positives", 0.0)),
+        float(stats.get("zero_soft_positive_rate", 0.0)),
+        float(stats.get("max_soft_positives_observed", 0.0)),
+        float(stats.get("capped_anchors", 0.0)),
+        float(stats.get("mean_shared_bins", float("nan"))),
+        shared_dist,
+    )
 
 
 def _edge_endpoints_for_ids(edge_index: torch.Tensor, edge_ids: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -193,9 +223,14 @@ def _log_knn_soft_pos_stats(prefix: str, stats: dict) -> None:
     )
 
 
-def _contrastive_view_kwargs(args, edge_drop_stats: Optional[dict] = None) -> dict:
+def _contrastive_view_kwargs(
+    args,
+    edge_drop_stats: Optional[dict] = None,
+    *,
+    seed_edge_ids=None,
+) -> dict:
     return {
-        "edge_attr_mask_rate": 0.1,
+        "edge_attr_mask_rate": float(getattr(args, "edge_attr_mask_rate", 0.1)),
         "edge_drop_rate": float(getattr(args, "edge_drop_target_rate", 0.1)),
         "mask_value": 0.0,
         "mask_cols": None,
@@ -203,6 +238,8 @@ def _contrastive_view_kwargs(args, edge_drop_stats: Optional[dict] = None) -> di
         "edge_drop_policy": getattr(args, "edge_drop_policy", "random"),
         "edge_drop_cache": getattr(args, "edge_drop_cache", None),
         "edge_drop_stats": edge_drop_stats,
+        "seed_edge_ids": seed_edge_ids,
+        "preserve_seed_edges": bool(getattr(args, "preserve_seed_edges", False)),
     }
 
 
@@ -379,12 +416,17 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
     for epoch in range(config.epochs):
         total_examples = 0
         loss_sum = torch.zeros((), device=device)
+        contrastive_loss_sum = torch.zeros((), device=device)
         morph_loss_sum = torch.zeros((), device=device)
+        tf_loss_sum = torch.zeros((), device=device)
+        tf_diag_sums: Dict[str, float] = {}
+        tf_diag_count = 0
         morph_diag_accumulator = {} if morph_head is not None else None
         false_neg_stats = dict()
         multi_pos_stats = dict()
         knn_filter_stats = dict()
         edge_drop_stats = dict()
+        tf_soft_pos_stats = dict()
         optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(tqdm.tqdm(tr_loader, disable=not args.tqdm)):
             seed_edge_ids = get_homo_seed_edge_ids(batch, tr_loader.data)
@@ -411,7 +453,7 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
             # Two views: independent edge drops (pair by batch.edge_id) + optional attr mask
             view1, view2 = generate_views(
                 batch,
-                **_contrastive_view_kwargs(args, edge_drop_stats),
+                **_contrastive_view_kwargs(args, edge_drop_stats, seed_edge_ids=seed_edge_ids),
             )
 
             with autocast(enabled=use_amp):
@@ -460,6 +502,19 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
                     if false_neg_filter_mode != "none" or multi_positive_mode != "none"
                     else None
                 )
+                tf_soft_cfg = getattr(args, "temporal_flow_soft_pos_cfg", None)
+                tf_soft_ctx = getattr(args, "temporal_flow_soft_pos_ctx", None)
+                tf_pos_ids = tf_pos_weights = tf_pos_valid = tf_pos_z2 = None
+                if tf_soft_cfg is not None and tf_soft_ctx is not None:
+                    tf_pos_ids, tf_pos_weights, tf_pos_valid, tf_pos_z2 = build_temporal_flow_soft_positive_batch(
+                        seed_id1,
+                        z2_con,
+                        tf_soft_cfg,
+                        tf_soft_ctx,
+                        epoch=epoch,
+                        step=step,
+                        stats=tf_soft_pos_stats,
+                    )
                 loss_raw = edge_identity_infonce_loss(
                     z1_con,
                     z2_con,
@@ -480,7 +535,13 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
                     multi_positive_stats=multi_pos_stats,
                     knn_filter=knn_filter,
                     knn_filter_stats=knn_filter_stats,
+                    knn_pos_ids=tf_pos_ids,
+                    knn_pos_weights=tf_pos_weights,
+                    knn_pos_valid=tf_pos_valid,
+                    knn_pos_z2=tf_pos_z2,
+                    knn_soft_pos_stats=tf_soft_pos_stats if tf_pos_ids is not None else None,
                 )
+                contrastive_loss_sum = contrastive_loss_sum + loss_raw.detach()
                 # M1/M1b: predict detached morphology targets from z_seed (view1)
                 if morph_head is not None and morph_cfg is not None:
                     morph_loss = morph_expert_loss_homo_step(
@@ -497,6 +558,19 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
                     )
                     loss_raw = loss_raw + morph_loss
                     morph_loss_sum = morph_loss_sum + morph_loss.detach()
+                tf_head = getattr(args, "temporal_flow_aux_head", None)
+                tf_cfg = getattr(args, "temporal_flow_aux_cfg", None)
+                tf_ctx = getattr(args, "temporal_flow_aux_ctx", None)
+                if tf_head is not None and tf_cfg is not None and tf_ctx is not None:
+                    tf_loss, tf_diag = temporal_flow_aux_loss(
+                        z1_seed, seed_id1, tf_head, tf_cfg, tf_ctx
+                    )
+                    loss_raw = loss_raw + tf_loss
+                    tf_loss_sum = tf_loss_sum + tf_loss.detach()
+                    for k, v in tf_diag.items():
+                        if isinstance(v, (int, float)):
+                            tf_diag_sums[k] = tf_diag_sums.get(k, 0.0) + float(v)
+                    tf_diag_count += 1
             loss = loss_raw / float(accum_steps)
 
             if use_amp:
@@ -529,7 +603,32 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
             total_examples += 1
 
         avg_loss = float((loss_sum / max(total_examples, 1)).cpu())
-        log_payload = {"loss/train": avg_loss}
+        avg_contrastive = float((contrastive_loss_sum / max(total_examples, 1)).cpu())
+        log_payload = {"loss/train": avg_loss, "loss/contrastive": avg_contrastive}
+        _log_tf_soft_pos_stats("homo/train", tf_soft_pos_stats)
+        if tf_soft_pos_stats.get("anchors", 0.0) > 0:
+            log_payload["tf_soft_pos/avg"] = float(tf_soft_pos_stats.get("avg_soft_positives", 0.0))
+            log_payload["tf_soft_pos/zero_rate"] = float(tf_soft_pos_stats.get("zero_soft_positive_rate", 0.0))
+            log_payload["tf_soft_pos/max_obs"] = float(tf_soft_pos_stats.get("max_soft_positives_observed", 0.0))
+        if float(tf_loss_sum.detach().cpu()) != 0.0 or getattr(args, "temporal_flow_aux_head", None) is not None:
+            avg_tf = float((tf_loss_sum / max(total_examples, 1)).cpu())
+            log_payload["loss/temporal_flow_aux"] = avg_tf
+            log_payload["tf_aux/lambda"] = float(getattr(getattr(args, "temporal_flow_aux_cfg", None), "weight", 0.0) or 0.0)
+            if tf_diag_count > 0:
+                for k, v in tf_diag_sums.items():
+                    if k.startswith("tf_aux/feat/"):
+                        log_payload[k] = v / float(tf_diag_count)
+            tf_cfg = getattr(args, "temporal_flow_aux_cfg", None)
+            if tf_cfg is not None:
+                logging.info(
+                    "tf_aux mode=%s weight=%.4f contrastive=%.4f aux=%.4f total=%.4f attach=%s",
+                    tf_cfg.mode,
+                    tf_cfg.weight,
+                    avg_contrastive,
+                    avg_tf,
+                    avg_loss,
+                    tf_cfg.attach_point,
+                )
         if morph_head is not None:
             avg_morph = float((morph_loss_sum / max(total_examples, 1)).cpu())
             log_payload["morph/expert_train"] = avg_morph
@@ -864,15 +963,36 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
             "Checkpoint policy: best (lowest morph/expert_val + morph/contrast_val, else loss/train)"
         )
 
+    logging.info(
+        "Contrastive denom mode: %s | batch_size=%s accum_steps=%s "
+        "requested_anchors_per_optimizer_update≈%s (batch×accum; verify via shared_seed stats)",
+        (
+            "all_aligned_current_batch"
+            if num_neg_samples is None
+            else f"sampled_negs={num_neg_samples}"
+        ),
+        int(getattr(args, "batch_size", -1)),
+        int(accum_steps),
+        int(getattr(args, "batch_size", 0)) * int(accum_steps),
+    )
+
     for epoch in range(config.epochs):
         total_examples = 0
+        optimizer_steps = 0
+        requested_seed_sum = 0
+        shared_seed_sum = 0
         loss_sum = torch.zeros((), device=device)
+        contrastive_loss_sum = torch.zeros((), device=device)
         morph_loss_sum = torch.zeros((), device=device)
+        tf_loss_sum = torch.zeros((), device=device)
+        tf_diag_sums: Dict[str, float] = {}
+        tf_diag_count = 0
         morph_diag_accumulator = {} if morph_head is not None else None
         false_neg_stats = dict()
         multi_pos_stats = dict()
         knn_filter_stats = dict()
         knn_soft_pos_stats = dict()
+        tf_soft_pos_stats = dict()
         edge_drop_stats = dict()
         optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(tqdm.tqdm(tr_loader, disable=not args.tqdm)):
@@ -895,7 +1015,7 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
 
             view1, view2 = generate_views(
                 batch,
-                **_contrastive_view_kwargs(args, edge_drop_stats),
+                **_contrastive_view_kwargs(args, edge_drop_stats, seed_edge_ids=seed_edge_ids),
             )
 
             with autocast(enabled=use_amp):
@@ -930,6 +1050,8 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                 edge_id2,
                 seed_edge_ids,
             )
+            requested_seed_sum += int(seed_edge_ids.numel())
+            shared_seed_sum += int(seed_id1.numel())
             if not contrastive_symmetric:
                 z2_seed = z2_seed.detach().clone()
                 del out2, z2, view2
@@ -961,21 +1083,34 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                 if max_soft <= 0:
                     max_soft = None
                 z1_con, z2_con = project_seed_pair(proj_head, z1_seed, z2_seed)
-                knn_pos_ids, knn_pos_weights, knn_pos_valid, knn_pos_z2 = _prepare_knn_soft_positives(
-                    knn_soft_cache=knn_soft_cache,
-                    seed_ids=seed_id1,
-                    tr_loader=tr_loader,
-                    model=model,
-                    proj_head=proj_head,
-                    args=args,
-                    device=device,
-                    use_amp=use_amp,
-                    contrastive_symmetric=contrastive_symmetric,
-                    train_edge_index=train_edge_index,
-                    epoch=epoch,
-                    step=step,
-                    stats=knn_soft_pos_stats,
-                )
+                tf_soft_cfg = getattr(args, "temporal_flow_soft_pos_cfg", None)
+                tf_soft_ctx = getattr(args, "temporal_flow_soft_pos_ctx", None)
+                if tf_soft_cfg is not None and tf_soft_ctx is not None:
+                    knn_pos_ids, knn_pos_weights, knn_pos_valid, knn_pos_z2 = build_temporal_flow_soft_positive_batch(
+                        seed_id1,
+                        z2_con,
+                        tf_soft_cfg,
+                        tf_soft_ctx,
+                        epoch=epoch,
+                        step=step,
+                        stats=tf_soft_pos_stats,
+                    )
+                else:
+                    knn_pos_ids, knn_pos_weights, knn_pos_valid, knn_pos_z2 = _prepare_knn_soft_positives(
+                        knn_soft_cache=knn_soft_cache,
+                        seed_ids=seed_id1,
+                        tr_loader=tr_loader,
+                        model=model,
+                        proj_head=proj_head,
+                        args=args,
+                        device=device,
+                        use_amp=use_amp,
+                        contrastive_symmetric=contrastive_symmetric,
+                        train_edge_index=train_edge_index,
+                        epoch=epoch,
+                        step=step,
+                        stats=knn_soft_pos_stats,
+                    )
                 seed_endpoints = (
                     _edge_endpoints_for_ids(train_edge_index, seed_id1, device)
                     if false_neg_filter_mode != "none" or multi_positive_mode != "none"
@@ -1005,8 +1140,13 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                     knn_pos_weights=knn_pos_weights,
                     knn_pos_valid=knn_pos_valid,
                     knn_pos_z2=knn_pos_z2,
-                    knn_soft_pos_stats=knn_soft_pos_stats,
+                    knn_soft_pos_stats=(
+                        tf_soft_pos_stats
+                        if (tf_soft_cfg is not None and tf_soft_ctx is not None)
+                        else knn_soft_pos_stats
+                    ),
                 )
+                contrastive_loss_sum = contrastive_loss_sum + loss_raw.detach()
                 # M1/M1b: auxiliary morphology MSE on shared seed embeddings
                 if morph_head is not None and morph_cfg is not None:
                     morph_loss = morph_expert_loss_hetero_step(
@@ -1023,6 +1163,19 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                     )
                     loss_raw = loss_raw + morph_loss
                     morph_loss_sum = morph_loss_sum + morph_loss.detach()
+                tf_head = getattr(args, "temporal_flow_aux_head", None)
+                tf_cfg = getattr(args, "temporal_flow_aux_cfg", None)
+                tf_ctx = getattr(args, "temporal_flow_aux_ctx", None)
+                if tf_head is not None and tf_cfg is not None and tf_ctx is not None:
+                    tf_loss, tf_diag = temporal_flow_aux_loss(
+                        z1_seed, seed_id1, tf_head, tf_cfg, tf_ctx
+                    )
+                    loss_raw = loss_raw + tf_loss
+                    tf_loss_sum = tf_loss_sum + tf_loss.detach()
+                    for k, v in tf_diag.items():
+                        if isinstance(v, (int, float)):
+                            tf_diag_sums[k] = tf_diag_sums.get(k, 0.0) + float(v)
+                    tf_diag_count += 1
                 aux_weight = float(getattr(args, "masked_edge_aux_weight", 0.0))
                 masked_decoder = getattr(args, "masked_edge_decoder", None)
                 masked_spec = getattr(args, "masked_edge_spec", None)
@@ -1071,6 +1224,7 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                 else:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                optimizer_steps += 1
 
             if memory_queue is not None and seed_id2.numel() > 0:
                 z2_queue = project_seeds(proj_head, z2_seed)
@@ -1085,7 +1239,64 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
             total_examples += 1
 
         avg_loss = float((loss_sum / max(total_examples, 1)).cpu())
-        log_payload = {"loss/train": avg_loss}
+        avg_contrastive = float((contrastive_loss_sum / max(total_examples, 1)).cpu())
+        mean_requested = float(requested_seed_sum) / max(total_examples, 1)
+        mean_shared = float(shared_seed_sum) / max(total_examples, 1)
+        if num_neg_samples is None:
+            unique_negs_per_anchor = max(mean_shared - 1.0, 0.0)
+            duplicate_neg_count = 0.0
+            denom_mode = "all_aligned_current_batch"
+        else:
+            unique_negs_per_anchor = float("nan")
+            duplicate_neg_count = float("nan")
+            denom_mode = f"sampled_{num_neg_samples}"
+        logging.info(
+            "Contrastive epoch diagnostics: epoch=%s microbatches=%s optimizer_steps=%s "
+            "shared_anchors_total=%s mean_requested_seeds=%.2f mean_shared_seeds=%.2f "
+            "shared_anchors_per_opt_update≈%.1f denom_mode=%s unique_negs_per_anchor≈%.2f "
+            "duplicate_neg_count=%s",
+            epoch + 1,
+            total_examples,
+            optimizer_steps,
+            shared_seed_sum,
+            mean_requested,
+            mean_shared,
+            mean_shared * float(accum_steps),
+            denom_mode,
+            unique_negs_per_anchor,
+            duplicate_neg_count,
+        )
+        log_payload = {
+            "loss/train": avg_loss,
+            "loss/contrastive": avg_contrastive,
+            "contrastive/microbatches": float(total_examples),
+            "contrastive/optimizer_steps": float(optimizer_steps),
+            "contrastive/shared_anchors_total": float(shared_seed_sum),
+            "contrastive/mean_requested_seeds": mean_requested,
+            "contrastive/mean_shared_seeds": mean_shared,
+            "contrastive/shared_anchors_per_opt_update": mean_shared * float(accum_steps),
+            "contrastive/unique_negs_per_anchor": unique_negs_per_anchor,
+            "contrastive/duplicate_neg_count": duplicate_neg_count,
+        }
+        if float(tf_loss_sum.detach().cpu()) != 0.0 or getattr(args, "temporal_flow_aux_head", None) is not None:
+            avg_tf = float((tf_loss_sum / max(total_examples, 1)).cpu())
+            log_payload["loss/temporal_flow_aux"] = avg_tf
+            log_payload["tf_aux/lambda"] = float(getattr(getattr(args, "temporal_flow_aux_cfg", None), "weight", 0.0) or 0.0)
+            if tf_diag_count > 0:
+                for k, v in tf_diag_sums.items():
+                    if k.startswith("tf_aux/feat/"):
+                        log_payload[k] = v / float(tf_diag_count)
+            tf_cfg = getattr(args, "temporal_flow_aux_cfg", None)
+            if tf_cfg is not None:
+                logging.info(
+                    "tf_aux mode=%s weight=%.4f contrastive=%.4f aux=%.4f total=%.4f attach=%s",
+                    tf_cfg.mode,
+                    tf_cfg.weight,
+                    avg_contrastive,
+                    avg_tf,
+                    avg_loss,
+                    tf_cfg.attach_point,
+                )
         if morph_head is not None:
             avg_morph = float((morph_loss_sum / max(total_examples, 1)).cpu())
             log_payload["morph/expert_train"] = avg_morph
@@ -1104,6 +1315,11 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
         _log_multi_positive_stats("hetero/train", multi_pos_stats, multi_positive_mode, multi_positive_weight)
         _log_knn_filter_stats("hetero/train", knn_filter_stats)
         _log_knn_soft_pos_stats("hetero/train", knn_soft_pos_stats)
+        _log_tf_soft_pos_stats("hetero/train", tf_soft_pos_stats)
+        if tf_soft_pos_stats.get("anchors", 0.0) > 0:
+            log_payload["tf_soft_pos/avg"] = float(tf_soft_pos_stats.get("avg_soft_positives", 0.0))
+            log_payload["tf_soft_pos/zero_rate"] = float(tf_soft_pos_stats.get("zero_soft_positive_rate", 0.0))
+            log_payload["tf_soft_pos/max_obs"] = float(tf_soft_pos_stats.get("max_soft_positives_observed", 0.0))
         _log_edge_drop_stats("hetero/train", edge_drop_stats)
         if (
             morph_contrast_cfg is not None
@@ -1397,6 +1613,19 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
     validate_masked_edge_args(args, setup)
     log_training_setup(setup, args)
 
+    # Persist TF-encoder-input meta into checkpoints via save_model.
+    args.temporal_flow_edge_features_meta = getattr(
+        te_data, "temporal_flow_edge_features_meta", None
+    )
+    if bool(getattr(args, "include_temporal_flow_edge_features", False)):
+        meta = args.temporal_flow_edge_features_meta or {}
+        logging.info(
+            "TF encoder edge features ON: edge_dim %s -> %s features=%s",
+            meta.get("edge_dim_before"),
+            meta.get("edge_dim_after"),
+            meta.get("feature_names"),
+        )
+
     #set device
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -1471,6 +1700,12 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
             "mask_edge_attr_token_strategy": getattr(args, "mask_edge_attr_token_strategy", "zero"),
             "masked_edge_decoder_hidden_dim": int(getattr(args, "masked_edge_decoder_hidden_dim", 128)),
             "masked_edge_seed": int(getattr(args, "masked_edge_seed", 1)),
+            "include_temporal_flow_edge_features": bool(
+                getattr(args, "include_temporal_flow_edge_features", False)
+            ),
+            "temporal_flow_edge_features_meta": getattr(
+                args, "temporal_flow_edge_features_meta", None
+            ),
             "masked_edge_aux_weight": float(getattr(args, "masked_edge_aux_weight", 0.0)),
         }
     )
@@ -1507,6 +1742,37 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
     proj_head = setup_contrastive_projection(args, device, embedding_dim=model_embedding_dim)
     args.contrast_projection_module = proj_head
     args._val_data_for_morph = val_data
+
+    tf_head, tf_cfg, tf_ctx = setup_temporal_flow_aux(
+        args,
+        device,
+        data_name=str(args.data),
+        embedding_dim=model_embedding_dim,
+    )
+    args.temporal_flow_aux_head = tf_head
+    args.temporal_flow_aux_cfg = tf_cfg
+    args.temporal_flow_aux_ctx = tf_ctx
+
+    tf_soft_cfg, tf_soft_ctx = setup_temporal_flow_soft_positives(
+        args, device, data_name=str(args.data)
+    )
+    args.temporal_flow_soft_pos_cfg = tf_soft_cfg
+    args.temporal_flow_soft_pos_ctx = tf_soft_ctx
+    if tf_soft_cfg is not None:
+        if morph_contrast_cfg is not None:
+            raise ValueError("Temporal-flow soft positives cannot be combined with --morph_contrast.")
+        if bool(getattr(args, "enable_knn_soft_positives", False)):
+            raise ValueError(
+                "Temporal-flow soft positives cannot be combined with --enable_knn_soft_positives."
+            )
+        if str(getattr(args, "multi_positive_mode", "none")) != "none":
+            raise ValueError(
+                "Temporal-flow soft positives cannot be combined with --multi_positive_mode."
+            )
+        if not bool(getattr(args, "contrastive_asymmetric", False)):
+            raise ValueError(
+                "Temporal-flow soft positives require asymmetric contrastive training (--contrastive_asymmetric)."
+            )
 
     args.masked_edge_spec = None
     args.masked_edge_decoder = None
@@ -1551,6 +1817,8 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
             opt_params += list(morph_head.parameters())
         if proj_head is not None:
             opt_params += list(proj_head.parameters())
+        if tf_head is not None:
+            opt_params += list(tf_head.parameters())
         masked_decoder = getattr(args, "masked_edge_decoder", None)
         if masked_decoder is not None:
             opt_params += list(masked_decoder.parameters())
@@ -1564,6 +1832,8 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
             opt_params += list(morph_head.parameters())
         if proj_head is not None:
             opt_params += list(proj_head.parameters())
+        if tf_head is not None:
+            opt_params += list(tf_head.parameters())
         masked_decoder = getattr(args, "masked_edge_decoder", None)
         if masked_decoder is not None:
             opt_params += list(masked_decoder.parameters())
@@ -1584,6 +1854,13 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
             args.edge_drop_policy,
             float(args.edge_drop_target_rate),
             int(args.edge_drop_cache.drop_prob.shape[0]),
+        )
+    if setup.is_contrastive:
+        logging.info(
+            "Contrastive view aug: edge_drop_target_rate=%.4f edge_attr_mask_rate=%.4f policy=%s",
+            float(getattr(args, "edge_drop_target_rate", 0.1)),
+            float(getattr(args, "edge_attr_mask_rate", 0.1)),
+            getattr(args, "edge_drop_policy", "random"),
         )
 
     sample_batch.to(device)
@@ -1618,7 +1895,12 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
     )
 
     if setup.is_hetero and setup.is_contrastive:
-        model = train_hetero_contrastive(*train_kwargs)
+        if bool(getattr(args, "enable_edge_neighbor_positives", False)):
+            from edge_neighbor_positives_train import train_hetero_edge_neighbor_positives
+
+            model = train_hetero_edge_neighbor_positives(*train_kwargs)
+        else:
+            model = train_hetero_contrastive(*train_kwargs)
     elif setup.is_hetero and setup.is_masked_edge:
         model = train_hetero_masked_edge(*train_kwargs)
     elif setup.is_hetero:

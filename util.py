@@ -58,6 +58,17 @@ def create_parser():
     )
     parser.add_argument("--ports", action='store_true', help="Use port numberings in GNN training")
     parser.add_argument("--tds", action='store_true', help="Use time deltas (i.e. the time between subsequent transactions) in GNN training")
+    parser.add_argument(
+        "--correct_reverse_edge_features",
+        action="store_true",
+        help=(
+            "Opt-in: give reverse MP independent edge_attr storage and swap named "
+            "directional columns (in_port/out_port and, when present, in_td/out_td) "
+            "resolved from the feature construction schema. Default off preserves "
+            "inherited upstream aliasing + trailing-column swap (paper Multi-GIN+EU "
+            "ports-only path unchanged). Does not relabel historical TDS runs."
+        ),
+    )
     parser.add_argument("--ego", action='store_true', help="Use ego IDs in GNN training")
 
     #Model parameters
@@ -145,6 +156,16 @@ def create_parser():
         type=int,
         default=10,
         help="CPU workers for LinkNeighborLoader prefetch/sampling (0 = single process). Often 8–12 is enough even on many-core nodes; use 0 to debug or on memory-tight login nodes.",
+    )
+    parser.add_argument(
+        "--train_fit_edge_znorm",
+        action="store_true",
+        help=(
+            "Fit edge_attr mean/std on the train graph only and apply the same "
+            "stats to val/test (inductive). Default off preserves legacy independent "
+            "per-graph z_norm (transductive; must NOT be used for inductive transfer "
+            "claims such as AMLWorld→PaySim frozen D+)."
+        ),
     )
 
     # Contrastive / memory (homogeneous training path)
@@ -267,6 +288,74 @@ def create_parser():
         help="Chunk size for auxiliary LinkNeighborLoader forwards that materialize KNN positives.",
     )
     parser.add_argument(
+        "--enable_edge_neighbor_positives",
+        action="store_true",
+        help=(
+            "Edge-centric GCPAL-inspired neighbor-positive transfer (NOT exact GCPAL; "
+            "distinct from --enable_knn_soft_positives). Uses positive-complete seed "
+            "retrieval + supcon_mean_logprob over identity∪flow∪KNN across two random views."
+        ),
+    )
+    parser.add_argument(
+        "--edge_neighbor_positive_mode",
+        type=str,
+        default="neighbor",
+        choices=["neighbor", "identity"],
+        help=(
+            "neighbor=identity∪directed-flow∪KNN positives; identity=matched poscomplete "
+            "batching with identity-only mask (required control when batching differs from D+)."
+        ),
+    )
+    parser.add_argument(
+        "--edge_neighbor_positive_aggregation",
+        type=str,
+        default="supcon_mean_logprob",
+        choices=["supcon_mean_logprob", "sum_logsumexp", "logmeanexp_count_normalized"],
+        help="Multipositive aggregation; default is val-selected SupCon from txn-node ablation.",
+    )
+    parser.add_argument(
+        "--edge_neighbor_max_total",
+        type=int,
+        default=2048,
+        help="Cap on transaction edges per poscomplete batch (anchors+retrieved positives).",
+    )
+    parser.add_argument(
+        "--edge_neighbor_max_batches_per_epoch",
+        type=int,
+        default=None,
+        help=(
+            "Microbatches per epoch for edge neighbor-positive training. Default: "
+            "ceil(n_train / --batch_size) to match D+ LinkNeighborLoader step count "
+            "(full positive-complete epoch coverage is infeasible under the 6h envelope)."
+        ),
+    )
+    parser.add_argument(
+        "--edge_neighbor_knn_k",
+        type=int,
+        default=15,
+        help="KNN neighbors used as hard positives (train-split cache).",
+    )
+    parser.add_argument(
+        "--edge_neighbor_flow_policy",
+        type=str,
+        default="immediate_next",
+        choices=["immediate_next", "capped_next_k"],
+        help="Directed-flow structural neighbor policy (receiver→next-sender).",
+    )
+    parser.add_argument(
+        "--edge_neighbor_knn_cache",
+        type=str,
+        default=None,
+        help="Train-split sparse KNN .npz (defaults to morphology_cache Small-HI k15).",
+    )
+    parser.add_argument(
+        "--edge_neighbor_checkpoint_epochs",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Extra epoch checkpoints to save as _epNN (default: 1 3 5 10).",
+    )
+    parser.add_argument(
         "--multi_positive_mode",
         type=str,
         default="none",
@@ -318,6 +407,25 @@ def create_parser():
         type=float,
         default=0.1,
         help="Target mean edge-drop rate for contrastive views (default 0.1, matching legacy behavior).",
+    )
+    parser.add_argument(
+        "--preserve_seed_edges",
+        action="store_true",
+        help=(
+            "Opt-in: force-keep contrastive seed/target edge_ids in both augmented views during "
+            "edge dropping. Retains seed relations in the message-passing graph (approximation of "
+            "seed-as-query retention). Default off preserves legacy seed-drop behavior."
+        ),
+    )
+    parser.add_argument(
+        "--edge_attr_mask_rate",
+        type=float,
+        default=0.1,
+        help=(
+            "Bernoulli edge-attribute mask rate applied independently to each contrastive view "
+            "(GraphCL-style; default 0.1 matches the previous hardcoded rate). "
+            "Distinct from --mask_edge_attr_rate (masked-edge reconstruction objective)."
+        ),
     )
     parser.add_argument(
         "--edge_drop_min_prob",
@@ -394,6 +502,104 @@ def create_parser():
         type=float,
         default=0.0,
         help="Optional auxiliary masked-edge loss weight during contrastive training (0 disables).",
+    )
+
+    # Temporal-flow auxiliary objective (contrastive pretrain; off by default)
+    parser.add_argument(
+        "--aux_temporal_flow",
+        type=str,
+        default="none",
+        choices=["none", "regression", "bins"],
+        help="Optional temporal_flow_causal auxiliary objective during contrastive pretraining. "
+        "Default none leaves existing runs unchanged. Attaches to post-embedding_head z_seed "
+        "(before contrastive projection).",
+    )
+    parser.add_argument(
+        "--aux_temporal_flow_weight",
+        type=float,
+        default=0.1,
+        help="Weight lambda_tf on temporal-flow aux loss (ignored when --aux_temporal_flow none).",
+    )
+    parser.add_argument(
+        "--aux_temporal_flow_loss",
+        type=str,
+        default="huber",
+        choices=["huber", "mse"],
+        help="Regression loss for --aux_temporal_flow regression (default huber).",
+    )
+    parser.add_argument(
+        "--aux_temporal_flow_bins",
+        type=int,
+        default=5,
+        help="Number of quantile bins for --aux_temporal_flow bins (fit on train only).",
+    )
+    parser.add_argument(
+        "--aux_temporal_flow_hidden",
+        type=int,
+        default=64,
+        help="Hidden width of temporal-flow aux MLP head.",
+    )
+    parser.add_argument(
+        "--aux_temporal_flow_cache",
+        type=str,
+        default=None,
+        help="Directory with temporal_flow_causal features.npy/meta.json "
+        "(default: results/cache/temporal_flow_causal/{data}).",
+    )
+    parser.add_argument(
+        "--include_temporal_flow_edge_features",
+        action="store_true",
+        help="Append label-free temporal_flow_causal features to GNN edge_attr during "
+        "data loading (encoder inputs). Default off preserves prior edge_dim. "
+        "Must also be set for embedding extraction of matching checkpoints.",
+    )
+    parser.add_argument(
+        "--temporal_flow_edge_features_cache",
+        type=str,
+        default=None,
+        help="Override temporal_flow_causal cache dir for --include_temporal_flow_edge_features "
+        "(default: --aux_temporal_flow_cache or results/cache/temporal_flow_causal/{data}).",
+    )
+
+    # Temporal-flow soft positives (contrastive InfoNCE; off by default)
+    parser.add_argument(
+        "--temporal_flow_soft_positives",
+        type=str,
+        default="false",
+        choices=["true", "false", "1", "0", "yes", "no", "on", "off"],
+        help="Enable temporal_flow_causal soft positives in InfoNCE (default false). "
+        "Identity pair remains primary; soft positives are low-weight extras. No labels.",
+    )
+    parser.add_argument(
+        "--temporal_flow_soft_positive_weight",
+        type=float,
+        default=0.05,
+        help="Total soft-positive weight mass per anchor (split across selected soft positives).",
+    )
+    parser.add_argument(
+        "--temporal_flow_soft_positive_bins",
+        type=int,
+        default=5,
+        help="Quantile bins per temporal-flow feature (fit on train split only).",
+    )
+    parser.add_argument(
+        "--temporal_flow_soft_positive_min_shared_bins",
+        type=int,
+        default=3,
+        help="Minimum shared feature-bins required for a soft positive.",
+    )
+    parser.add_argument(
+        "--temporal_flow_soft_positive_max_per_anchor",
+        type=int,
+        default=16,
+        help="Cap on soft positives per anchor (hub avoidance / dilution control).",
+    )
+    parser.add_argument(
+        "--temporal_flow_soft_positive_cache",
+        type=str,
+        default=None,
+        help="Override temporal_flow_causal cache dir for soft positives "
+        "(default: same as --aux_temporal_flow_cache or results/cache/temporal_flow_causal/{data}).",
     )
 
     # Morphology expert head (contrastive pretrain, Phase M1)

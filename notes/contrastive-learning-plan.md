@@ -1,5 +1,7 @@
 # Contrastive Learning Implementation Plan for Multi-GNN
 
+> **Canonical protocols (2026-07-22):** edge-centric A/B/C/D, batch E/F, and txn-node GCPAL-inspired path are defined in [`thesis_protocol_families.md`](thesis_protocol_families.md). Evaluation rules (argmax / 0.5 / val-tuned; temporal vs random-40): [`evaluation_protocols.md`](evaluation_protocols.md). This plan remains design history — do not treat status tables here as current leaderboard.
+
 ## References
 - Hanbin et al. (2024): "Graph Contrastive Pre-training for Anti-money Laundering" - Source of graph augmentation techniques and InfoNCE application to AML graphs.
 - Papagei (PPG foundation model) - Reference protocol for downstream evaluation: **extract frozen representations** after SSL pretrain, then **linear probing** (e.g. logistic regression for binary tasks) rather than end-to-end fine-tuning on the downstream loss. Subject-level splits in Papagei; we use **temporal** train/val/test on transactions (document when comparing).

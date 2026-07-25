@@ -1,0 +1,17 @@
+\begin{table}[t]
+\centering
+\caption{Compact supervised versus frozen SSL}
+\begin{tabular}{lrrrrrr}
+\toprule
+Dataset & Method & AUPRC & F1 & P@100 & R@100 & Caveat \\
+\midrule
+Small-HI & SSL pre-3h + raw + temporal-flow & 0.501 & 0.465 & 0.940 & 0.058 & val-tuned F1; frozen linear probe \\
+Small-HI & Legacy supervised GIN & 0.663 & 0.660 & --- & --- & paper\_argmax F1 mean (seeds 1–3); supervised CE; not comparable to SSL val-tuned F1 \\
+Small-LI & SSL pre-3h + raw + temporal-flow & 0.128 ± 0.027 & 0.092 ± 0.029 & 0.600 ± 0.056 & 0.075 ± 0.007 & val-tuned F1; frozen linear probe; mean ± sample SD (n=3) \\
+Small-LI & Legacy supervised GIN & 0.292 & 0.357 & 0.970 & 0.121 & paper\_argmax F1; supervised CE; not comparable to SSL val-tuned F1 \\
+\bottomrule
+\end{tabular}
+\footnotetext[1]{SSL uses frozen linear probe with validation-tuned threshold.}
+\footnotetext[2]{Supervised uses end-to-end supervised CE and paper\_argmax F1.}
+\footnotetext[3]{F1 values are not directly comparable without the protocol caveat.}
+\end{table}

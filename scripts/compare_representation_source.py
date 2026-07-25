@@ -47,8 +47,8 @@ from linear_probe import (
     tune_threshold_max_f1,
 )
 from util import logger_setup, set_seed
+from ranking_metrics import ALERT_BUDGET_KS, ranking_metrics
 
-ALERT_BUDGET_KS = (100, 500, 1000)
 SPLITS = ("train", "val", "test")
 REPRESENTATIONS = ("post_embedding_128", "pre_embedding_3h")
 
@@ -97,25 +97,7 @@ def _align_by_edge_id(
 
 def _alert_budget_metrics(clf, x: np.ndarray, y: np.ndarray) -> Dict[str, float]:
     proba = clf.predict_proba(x)[:, 1]
-    y = y.astype(np.int64)
-    n = int(y.shape[0])
-    positives = int(y.sum())
-    prevalence = float(y.mean()) if n else float("nan")
-    out: Dict[str, float] = {}
-    if n == 0:
-        return out
-    order = np.argsort(-proba)
-    for k in ALERT_BUDGET_KS:
-        kk = min(k, n)
-        top = order[:kk]
-        tp = int(y[top].sum())
-        precision = float(tp / kk) if kk else float("nan")
-        recall = float(tp / positives) if positives else float("nan")
-        lift = float(precision / prevalence) if prevalence > 0 else float("nan")
-        out[f"precision_at_{k}"] = precision
-        out[f"recall_at_{k}"] = recall
-        out[f"lift_at_{k}"] = lift
-    return out
+    return ranking_metrics(y, proba)
 
 
 def _build_group_features(

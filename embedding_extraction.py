@@ -78,7 +78,13 @@ def run_embedding_extraction(
     transform = AddEgoIds() if args.ego else None
     add_arange_ids([tr_data, val_data, te_data])
 
-    tr_loader, val_loader, te_loader = get_loaders(
+    # Build a throwaway loader for model construction only. Never reuse a
+    # multi-worker loader after next(iter(...)) once CUDA has been initialized —
+    # persistent_workers + CUDA can deadlock on the first extraction batch
+    # (observed: job 18719616 hung at extract hetero 0/397 for ~6h).
+    sample_args = SimpleNamespace(**vars(args))
+    sample_args.loader_num_workers = 0
+    sample_loader, _, _ = get_loaders(
         tr_data,
         val_data,
         te_data,
@@ -86,11 +92,11 @@ def run_embedding_extraction(
         val_inds,
         te_inds,
         transform,
-        args,
+        sample_args,
         train_shuffle=False,
     )
-
-    sample_batch = next(iter(tr_loader))
+    sample_batch = next(iter(sample_loader))
+    del sample_loader
     model = get_model(sample_batch, config, args)
 
     representation_source = getattr(args, "representation_source", "post_embedding")
@@ -140,6 +146,19 @@ def run_embedding_extraction(
 
     model.eval()
 
+    # Fresh loaders after CUDA init (never reuse a consumed multi-worker iterator).
+    tr_loader, val_loader, te_loader = get_loaders(
+        tr_data,
+        val_data,
+        te_data,
+        tr_inds,
+        val_inds,
+        te_inds,
+        transform,
+        args,
+        train_shuffle=False,
+    )
+
     embed_name = getattr(args, "embeddings_subdir", None) or args.unique_name
     if finetuned and embed_name == args.unique_name:
         embed_name = f"{args.unique_name}_finetuned"
@@ -150,11 +169,19 @@ def run_embedding_extraction(
         out_dir = out_dir / representation_source
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    splits = (
+    split_filter = {
+        s.strip().lower()
+        for s in str(getattr(args, "extract_splits", "train,val,test") or "train,val,test").split(",")
+        if s.strip()
+    }
+    all_splits = (
         ("train", tr_loader, tr_inds, tr_data),
         ("val", val_loader, val_inds, val_data),
         ("test", te_loader, te_inds, te_data),
     )
+    splits = tuple(s for s in all_splits if s[0] in split_filter)
+    if not splits:
+        raise ValueError(f"No extract splits selected from {sorted(split_filter)}")
 
     embedding_dim: int | None = None
     split_checksums: dict = {}
@@ -221,6 +248,12 @@ def run_embedding_extraction(
         "tds": bool(args.tds),
         "ego": bool(args.ego),
         "emlps": bool(args.emlps),
+        "include_temporal_flow_edge_features": bool(
+            getattr(args, "include_temporal_flow_edge_features", False)
+        ),
+        "temporal_flow_edge_features_meta": getattr(
+            te_data, "temporal_flow_edge_features_meta", None
+        ),
         "checkpoint_path": str(ckpt_path) if ckpt_path is not None else None,
     }
     dataset_spec = getattr(te_data, "dataset_spec_summary", None)
@@ -271,6 +304,12 @@ def main() -> None:
             "(cat(src_node, dst_node, edge_attr) = 3*n_hidden) into a 'pre_embedding_3h/' subdir. "
             "Neither uses the contrastive projection-head output."
         ),
+    )
+    parser.add_argument(
+        "--extract_splits",
+        type=str,
+        default="train,val,test",
+        help="Comma-separated subset of {train,val,test} to extract (default: all).",
     )
     args = parser.parse_args()
 

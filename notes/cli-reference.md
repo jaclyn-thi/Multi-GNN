@@ -1,48 +1,56 @@
 # Command-line reference
 
+Status: **canonical** · Synced 2026-07-22 against `util.py` / extraction / probe / `scripts/gcpal_txn_node_*.py`.
+
 Hyperparameters for each architecture come from [`model_settings.json`](../model_settings.json). Most training examples use hetero Multi-GIN with `--reverse_mp --ego --ports`.
 
----
+**Owning command:** flags below belong to `main.py` (via `util.get_args`) unless a section header says otherwise. Transaction-node flags are **not** on `main.py`.
 
-## Required
-
-| Argument | Description |
-|----------|-------------|
-| `--data` | Dataset folder name under `aml_data` (e.g. `Small-HI`) |
-| `--model` | Architecture: `gin`, `gat`, `pna`, or `rgcn` |
+Automated check: `python scripts/check_documented_flags.py` (no AMLWorld / GPU required).
 
 ---
 
-## Graph form and Multi-GNN adaptations
+## Required (`main.py`)
 
-| Argument | Description |
-|----------|-------------|
-| `--reverse_mp` | Heterogeneous graph with reverse message passing |
-| `--ego` | Ego IDs on center nodes |
-| `--ports` | Port numberings on edges |
-| `--emlps` | Edge updates via MLPs |
-| `--tds` | Time-delta edge features |
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--data` | str | required | Dataset folder under `aml-data` (e.g. `Small-HI`) |
+| `--model` | str | required | `gin`, `gat`, `pna`, or `rgcn` |
 
 ---
 
-## Training objective
+## Graph form and Multi-GNN adaptations (`main.py`)
 
-| Argument | Description |
-|----------|-------------|
-| `--objective contrastive` | Self-supervised contrastive pretraining **(default)** |
-| `--objective supervised` | Supervised AML edge classification |
+| Argument | Type | Default | Changes training? | Description |
+|----------|------|---------|-------------------|-------------|
+| `--reverse_mp` | flag | off | yes | Heterogeneous graph with reverse message passing |
+| `--ego` | flag | off | yes | Ego IDs on center nodes |
+| `--ports` | flag | off | yes | Port numberings on edges |
+| `--emlps` | flag | off | yes | Edge updates via MLPs |
+| `--tds` | flag | off | yes | Time-delta edge features (paper Multi-GIN+EU **omits** this) |
+| `--correct_reverse_edge_features` | flag | off | yes | Opt-in: independent reverse `edge_attr` + named directional swap (`in_port`/`out_port`, `in_td`/`out_td`). Default off = inherited alias + trailing-column swap. Experimental relative to historical SSL; required for semantically valid TDS-on reverse. |
+| `--preserve_seed_edges` | flag | off | yes | Opt-in: force-keep contrastive seed `edge_id`s through edge drop in both views. Default off = legacy seed-drop. Experimental. |
 
 ---
 
-## Run identity, checkpoints, and modes
+## Training objective (`main.py`)
 
-| Argument | Description |
-|----------|-------------|
-| `--unique_name` | Run identifier; names checkpoints and embedding folders |
-| `--save_model` | Save checkpoint(s) to `model_to_save` |
-| `--checkpoint_policy` | `last` (overwrite each epoch) or `best` (lowest morph val / train loss → main checkpoint; final epoch → `_last.tar`) |
-| `--finetune` | Load `checkpoint_{unique_name}.tar` before training; saves `_finetuned` when combined with `--save_model` |
-| `--inference` | Load checkpoint and run evaluation only (no training) |
+| Argument | Type | Default | Valid values | Description |
+|----------|------|---------|--------------|-------------|
+| `--objective` | str | `contrastive` | `contrastive`, `supervised`, `masked_edge` | Training objective |
+| `--supervised_head` | str | `embedding` | `embedding`, `legacy` | Only with `--objective supervised`. `legacy` = Egressy Multi-GNN head (paper parity). `embedding` = 128-d bottleneck control. |
+
+---
+
+## Run identity, checkpoints, and modes (`main.py`)
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--unique_name` | str | None | Run identifier; names checkpoints and embedding folders |
+| `--save_model` | flag | off | Save checkpoint(s) under `model_to_save` |
+| `--checkpoint_policy` | str | (see help) | `last` or `best` (supervised: best **validation minority F1**; contrastive morph: morph val / train loss). Diagnostics only for selection rule documentation — changes which weights are kept. |
+| `--finetune` | flag | off | Load `checkpoint_{unique_name}.tar` before training |
+| `--inference` | flag | off | Load checkpoint and evaluate only |
 
 ---
 
@@ -64,10 +72,10 @@ Hyperparameters for each architecture come from [`model_settings.json`](../model
 |----------|---------|-------------|
 | `--amp` | off | CUDA automatic mixed precision |
 | `--gradient_checkpointing` | off | Gradient checkpointing in GIN layers (GIN only) |
-| `--contrastive_num_neg_samples` | `8192` | InfoNCE negatives per anchor (`0` = all negatives, chunked) |
+| `--contrastive_num_neg_samples` | `8192` | InfoNCE negatives per anchor. **`0` = use all aligned in-batch negatives** (chunked for memory). Changes training semantics. |
 | `--contrastive_temperature` | `0.5` | InfoNCE logit temperature; lower values sharpen positive/negative separation |
 | `--contrastive_asymmetric` | off | **Asymmetric InfoNCE:** loss = `L(z1→z2)` only; view2 under `no_grad`. Saves ~half backward VRAM vs symmetric |
-| `--contrastive_accum_steps` | `1` | Gradient accumulation steps before `optimizer.step` |
+| `--contrastive_accum_steps` | `1` | Gradient accumulation steps before `optimizer.step` (effective anchors/update ≈ batch × accum when loaders align) |
 | `--contrastive_memory_bank_size` | `0` | FIFO queue of past view2 embeddings as extra negatives (MoCo-style). `0` = disabled and is currently recommended for asym + projection on Small-HI |
 | `--contrast_projection_head` | off | GraphCL-style MLP before InfoNCE only; extraction uses encoder `z` |
 | `--contrast_projection_hidden` | `128` | Hidden width when projection head enabled |
@@ -101,6 +109,15 @@ These flags are optional experiments for the edge-level contrastive loss. Defaul
 | `--enable_knn_negative_filter` | off | Exclude cached KNN neighbors from contrastive negatives |
 | `--knn_filter_k` | `0` | Use first K cached neighbors for exclusion (`0` = all cached neighbors) |
 | `--enable_knn_soft_positives` | off | Add cached KNN neighbors as low-weight InfoNCE positives (requires `--contrastive_asymmetric`) |
+| `--enable_edge_neighbor_positives` | off | **Distinct** GCPAL-inspired edge multipositive path (NOT exact GCPAL). Positive-complete seed retrieval + hard identity∪flow∪KNN positives with `supcon_mean_logprob`. Do **not** combine with `--enable_knn_soft_positives` |
+| `--edge_neighbor_positive_mode` | `neighbor` | `neighbor` (identity∪flow∪KNN) or `identity` (matched poscomplete control) |
+| `--edge_neighbor_positive_aggregation` | `supcon_mean_logprob` | Val-selected aggregation from txn-node ablation (`sum_logsumexp`, `logmeanexp_count_normalized` also available) |
+| `--edge_neighbor_max_total` | `2048` | Cap on transaction edges per poscomplete batch |
+| `--edge_neighbor_max_batches_per_epoch` | `ceil(n_train/batch_size)` | Microbatches/epoch; default matches D+ LinkNeighborLoader step count (full-stream coverage is infeasible in 6h) |
+| `--edge_neighbor_knn_k` | `15` | KNN positives from train-split cache |
+| `--edge_neighbor_flow_policy` | `immediate_next` | Directed receiver→next-sender structural neighbors |
+| `--edge_neighbor_knn_cache` | Small-HI k15 default | Train-split sparse KNN `.npz` |
+| `--edge_neighbor_checkpoint_epochs` | `1 3 5 10` | Extra `_epNN` checkpoint suffixes |
 | `--knn_pos_source_k` | `15` | Use top-k cached neighbors as positive candidates |
 | `--knn_pos_m` | `1` | KNN positives sampled per anchor per step |
 | `--knn_pos_weight` | `0.025` | Total KNN positive mass per anchor (split across `m`, not multiplied) |
@@ -262,9 +279,41 @@ Metric column definitions: [`morphology-reference.md`](morphology-reference.md).
 | `--unique_name` | — | Embedding subfolder under `--embeddings_dir` |
 | `--embeddings_dir` | `embeddings` | Root directory from extraction |
 | `--class_weight` | `balanced` | `balanced`, `none`, or `model` (reads CE weights from `model_settings.json`) |
-| `--threshold_tuning` | `max_f1_val` | `max_f1_val` or `fixed_0.5` |
+| `--threshold_tuning` | `max_f1_val` | `max_f1_val` (validation-selected) or `fixed_0.5`. **Do not mix F1 numbers across these rules.** Diagnostics-only for which F1 is reported; does not retrain the GNN. |
 | `--probe_max_iter` | `1000` | Max iterations for sklearn logistic regression |
 | `--testing` | off | Disable W&B |
+
+---
+
+## Embedding extraction (`embedding_extraction.py`)
+
+Shares many `util.get_args` graph flags with `main.py`. Graph flags must match the checkpoint.
+
+| Argument | Default | Valid values | Changes training? | Description |
+|----------|---------|--------------|-------------------|-------------|
+| `--representation_source` | `post_embedding` | `post_embedding`, `pre_embedding_3h` | extraction only | Which frozen tensor to export. `post_embedding` = embedding_head output (128-d). `pre_embedding_3h` = concat into embedding_head (`3 * n_hidden`). Never the contrastive projection head. |
+| `--unique_name` | — | — | — | Checkpoint / output folder name |
+
+---
+
+## Transaction-node GCPAL-inspired scripts (**not** `main.py`)
+
+Package: `gcpal_txn_node/`. Scripts: `scripts/gcpal_txn_node_smoke.py`, `gcpal_txn_node_scout.py`, `gcpal_txn_node_poscomplete_smoke.py`, `gcpal_txn_node_poscomplete_scout.py`, `gcpal_txn_node_poscomplete_resume_20ep.py`.
+
+| Argument | Owning script(s) | Default | Notes |
+|----------|------------------|---------|-------|
+| `--mode` | scout / poscomplete scout / resume | required | `control`/`gcpal` (ordinary scout) or `A_identity`/`B_gcpal` (poscomplete). Naming is convenient — **not** exact GCPAL reproduction. |
+| `--max_total_nodes` | poscomplete* | `2048` | Unique-node cap for positive-complete batching (training semantics). |
+| `--batch_size` | ordinary smoke/scout | `2048` | Ordinary minibatch size (not positive-complete). |
+| `--adjacency_policy` | smoke* | `immediate_next` | Flow adjacency policy. |
+| `--knn_cache` | all | project default cache path | Global sparse feature KNN. |
+| `--n_epochs` | scouts | `5` | Epochs (preliminary horizon). |
+| `--seed` | varies | `2` (scouts) | |
+| `--data_config` | all | `data_config.json` | |
+| `--output_json` / `--output_md` | all | script-specific | Diagnostics outputs. |
+| `--device` | all | `cuda:0` | |
+
+Fixed λ=0.3, τ=0.5, k=15 are package constants / spec (`gcpal_txn_node/spec.py`), not `main.py` flags. Evaluation emits F1@0.5 and val-selected threshold separately — see [`evaluation_protocols.md`](evaluation_protocols.md).
 
 ---
 
@@ -288,3 +337,37 @@ python scripts/label_efficiency_probe.py \
 ```
 
 **Outputs:** `embeddings/{unique_name}/label_efficiency_results.json`, `embeddings/label_efficiency_summary.json`. Results: [`results.md`](results.md).
+
+---
+
+## D+ partial fine-tune (`scripts/run_dplus_partial_finetune.py`)
+
+**Distinct path** from `main.py --finetune` (full E2E CE), contrastive D+ pretrain, txn-node GCPAL, and neighbor-poscomplete. Locked protocol: [`final_dplus_experiment_preflight.md`](final_dplus_experiment_preflight.md).
+
+Init: D+ seed-2 epoch-40 checkpoint (`correct_reverse` + `preserve_seed`). Classifier stack **H_pre3h ∥ X ∥ TF** (dim 227), StandardScaler fit on train only, plain BCE MLP (same recipe as job 18678029; weights were not saved → from-scratch init).
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--seed` | `2` | Downstream / RNG seed |
+| `--warmup_epochs` | `5` | Stage 1: encoder frozen, classifier-only |
+| `--max_epochs` | `20` | Hard cap on total epochs (warmup + partial); cannot exceed 20 |
+| `--early_stop_patience` | `5` | Temporal **val AUPRC** early stop (F1 secondary tie-break); test never used for selection |
+| `--loader_num_workers` | `0` | Prefer 0 (hang-safe) |
+| `--unique_name` | `dplus_partial_finetune_hxxtf_seed2` | Run id / checkpoint folder label |
+| `--init_checkpoint` | D+ seed-2 `.tar` | Must match locked sha256 |
+| `--output_dir` | `saved-models/dplus_partial_finetune_hxxtf_seed2` | Checkpoints + `summary.json` |
+| `--resume` | off | Resume from `checkpoint_last.tar` in `--output_dir` |
+| `--skip_equivalence` | off | Skip live vs cached pre-3h equivalence gate |
+| `--eval_test_after_lock` | off | Optional **post-hoc** test only after training ends (never for selection) |
+
+**Fixed (not CLI-swept):** clf LR `1e-3`, encoder LR `1e-4`, stage-2 trainable prefixes `convs.1.` / `emlps.1.` / `batch_norms.1.` (forward + reverse), `embedding_head` frozen.
+
+Smoke (GPU, bounded): `scripts/smoke_dplus_partial_finetune.py` → `notes/dplus_partial_finetune_smoke.md`.
+
+```bash
+python scripts/run_dplus_partial_finetune.py \
+  --seed 2 --warmup_epochs 5 --max_epochs 20 \
+  --early_stop_patience 5 --loader_num_workers 0 \
+  --unique_name dplus_partial_finetune_hxxtf_seed2 \
+  --output_dir saved-models/dplus_partial_finetune_hxxtf_seed2
+```

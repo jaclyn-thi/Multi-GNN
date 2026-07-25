@@ -38,31 +38,19 @@ from linear_probe import (
 from morphology.temporal_flow_causal import TEMPORAL_FLOW_CAUSAL_FEATURE_NAMES
 from util import logger_setup, set_seed
 
-ALERT_BUDGET_KS = (100, 500, 1000)
+from ranking_metrics import (
+    ALERT_BUDGET_KS,
+    ranking_metrics,
+)
+
 SPLITS = ("train", "val", "test")
 ARMS = ("A_embedding", "B_embedding_raw", "C_embedding_temporal_flow", "D_embedding_raw_temporal_flow")
 
 
 def _alert_budget_metrics(clf, x: np.ndarray, y: np.ndarray) -> Dict[str, float]:
+    """Alert-budget + precision-constrained recall from probe scores."""
     proba = clf.predict_proba(x)[:, 1]
-    y = y.astype(np.int64)
-    n = int(y.shape[0])
-    positives = int(y.sum())
-    prevalence = float(y.mean()) if n else float("nan")
-    out: Dict[str, float] = {}
-    if n == 0:
-        return out
-    order = np.argsort(-proba)
-    for k in ALERT_BUDGET_KS:
-        kk = min(k, n)
-        top = order[:kk]
-        tp = int(y[top].sum())
-        out[f"precision_at_{k}"] = float(tp / kk) if kk else float("nan")
-        out[f"recall_at_{k}"] = float(tp / positives) if positives else float("nan")
-        out[f"lift_at_{k}"] = (
-            float(out[f"precision_at_{k}"] / prevalence) if prevalence > 0 else float("nan")
-        )
-    return out
+    return ranking_metrics(y, proba)
 
 
 def _load_temporal_flow_cache(cache_dir: Path) -> Tuple[np.ndarray, Dict[str, Any]]:
@@ -273,6 +261,10 @@ def _deltas(arms: Dict[str, Dict[str, Any]], arm_a: str, arm_b: str) -> Dict[str
         "precision_at_1000",
         "recall_at_1000",
         "lift_at_1000",
+        "recall_at_precision_ge_0.95",
+        "recall_at_precision_ge_0.90",
+        "recall_at_precision_ge_0.80",
+        "recall_at_precision_ge_0.70",
     ]
     return {k: float(tb.get(k, float("nan")) - ta.get(k, float("nan"))) for k in keys}
 

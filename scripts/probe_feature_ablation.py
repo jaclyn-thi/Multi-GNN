@@ -43,6 +43,7 @@ from transaction_knn.features import (
     resolve_amount_column,
 )
 from util import logger_setup, set_seed
+from ranking_metrics import ALERT_BUDGET_KS, ranking_metrics
 
 FEATURE_MODES = (
     "raw",
@@ -52,7 +53,6 @@ FEATURE_MODES = (
     "embedding+raw",
     "embedding+raw+morph",
 )
-ALERT_BUDGET_KS = (100, 500, 1000)
 
 RAW_GROUPS = ("edge_native",)
 MORPH_GROUPS = ("degree_fan", "flow_balance", "temporal_behavior")
@@ -434,25 +434,7 @@ def run_probe_for_mode(
 
     def _alert_budget_metrics(x: np.ndarray, y: np.ndarray) -> Dict[str, float]:
         proba = clf.predict_proba(x)[:, 1]
-        y = y.astype(np.int64)
-        n = int(y.shape[0])
-        positives = int(y.sum())
-        prevalence = float(y.mean()) if n else float("nan")
-        out: Dict[str, float] = {}
-        if n == 0:
-            return out
-        order = np.argsort(-proba)
-        for k in ALERT_BUDGET_KS:
-            kk = min(k, n)
-            top = order[:kk]
-            tp = int(y[top].sum())
-            precision = float(tp / kk) if kk else float("nan")
-            recall = float(tp / positives) if positives else float("nan")
-            lift = float(precision / prevalence) if prevalence > 0 else float("nan")
-            out[f"precision_at_{k}"] = precision
-            out[f"recall_at_{k}"] = recall
-            out[f"lift_at_{k}"] = lift
-        return out
+        return ranking_metrics(y, proba)
 
     result: Dict[str, Any] = {
         "features": features,

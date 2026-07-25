@@ -1,0 +1,15 @@
+\begin{table}[t]
+\centering
+\caption{Compact PNA diagnostic}
+\begin{tabular}{lrrr}
+\toprule
+Encoder / setup & Representation + features & Small-HI AUPRC & Takeaway \\
+\midrule
+GIN main stack & pre-3h + raw + temporal-flow & 0.501 & main encoder/result \\
+PNA width-aligned & post-128 embedding only & 0.147 & post-128 understates PNA \\
+PNA width-aligned & pre-3h + raw + temporal-flow & 0.407 & competitive but below GIN; one-seed diagnostic \\
+\bottomrule
+\end{tabular}
+\footnotetext[1]{PNA rows are one-seed width-aligned scouts; not a full architecture ranking.}
+\footnotetext[2]{Best-stack PNA row is downstream-only (no PNA SSL retraining).}
+\end{table}

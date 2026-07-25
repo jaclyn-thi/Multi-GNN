@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import torch
 import logging
+import time
 from pathlib import Path
 
 from data_util import (
@@ -13,10 +14,19 @@ from data_util import (
 )
 from dataset_specs import get_dataset_spec, spec_summary
 from dataset_splits import log_split_label_stats, temporal_edge_split
+from morphology.temporal_flow_edge_features import maybe_append_temporal_flow_edge_features
 from pattern_metadata import (
     load_laundering_pattern_metadata,
     resolve_pattern_metadata_path,
 )
+
+
+def _stage_tick(args, name: str, t0: float) -> float:
+    """Record elapsed seconds for ``name`` on ``args._stage_timings`` if present."""
+    timings = getattr(args, "_stage_timings", None)
+    if isinstance(timings, dict):
+        timings[name] = float(time.perf_counter() - t0)
+    return time.perf_counter()
 
 
 def get_data(args, data_config):
@@ -28,12 +38,17 @@ def get_data(args, data_config):
     4. PyG Data objects for each split.
     '''
 
+    if getattr(args, "record_stage_timings", False) and not hasattr(args, "_stage_timings"):
+        args._stage_timings = {}
+
+    t_all = time.perf_counter()
     spec = get_dataset_spec(args.data)
     spec.validate_edge_feature_cols()
     logging.info("Dataset spec: %s", spec_summary(spec))
 
     aml_root = Path(str(data_config["paths"]["aml_data"]))
     transaction_file = aml_root / args.data / spec.formatted_csv_name()
+    t_csv = time.perf_counter()
     if not transaction_file.is_file():
         raise FileNotFoundError(
             f"Missing {transaction_file}. "
@@ -42,6 +57,7 @@ def get_data(args, data_config):
         )
 
     df_edges = pd.read_csv(transaction_file)
+    t_csv = _stage_tick(args, "data_loading_csv_sec", t_csv)
 
     logging.info(f'Available Edge Features: {df_edges.columns.tolist()}')
 
@@ -152,29 +168,67 @@ def get_data(args, data_config):
     #Adding ports and time-deltas if applicable
     if args.ports:
         logging.info(f"Start: adding ports")
+        t_ports = time.perf_counter()
         tr_data.add_ports()
         val_data.add_ports()
         te_data.add_ports()
+        _stage_tick(args, "ports_construction_sec", t_ports)
         logging.info(f"Done: adding ports")
     if args.tds:
         logging.info(f"Start: adding time-deltas")
+        t_tds = time.perf_counter()
         tr_data.add_time_deltas()
         val_data.add_time_deltas()
         te_data.add_time_deltas()
+        _stage_tick(args, "tds_construction_sec", t_tds)
         logging.info(f"Done: adding time-deltas")
 
     #Normalize data
+    # Node x: always train-fit (clone to val/test) — inductive for nodes.
     tr_data.x = z_norm(tr_data.x)
     val_data.x = tr_data.x.clone()
     te_data.x = tr_data.x.clone()
 
-    tr_data.edge_attr, val_data.edge_attr, te_data.edge_attr = (
-        z_norm(tr_data.edge_attr),
-        z_norm(val_data.edge_attr),
-        z_norm(te_data.edge_attr),
-    )
+    # Edge attr z-norm:
+    # - Default (legacy): independent per-graph z_norm on train / train∪val / all.
+    #   Transductive w.r.t. split-graph edge statistics; must NOT be used for
+    #   inductive transfer claims (e.g. AMLWorld→PaySim frozen D+).
+    # - --train_fit_edge_znorm: fit mean/std on train edge_attr only; apply to val/test.
+    train_fit_edge = bool(getattr(args, "train_fit_edge_znorm", False))
+    if train_fit_edge:
+        logging.info(
+            "Edge attr z-norm: train-fit inductive "
+            "(fit mean/std on train edge_attr only; apply to val/test). "
+            "Independent per-graph z_norm is the legacy/transductive path."
+        )
+        mean = tr_data.edge_attr.mean(0).unsqueeze(0)
+        std = tr_data.edge_attr.std(0).unsqueeze(0)
+        std = torch.where(std == 0, torch.tensor(1, dtype=torch.float32).cpu(), std)
+        tr_data.edge_attr = (tr_data.edge_attr - mean) / std
+        val_data.edge_attr = (val_data.edge_attr - mean) / std
+        te_data.edge_attr = (te_data.edge_attr - mean) / std
+    else:
+        logging.info(
+            "Edge attr z-norm: independent per-graph (legacy/transductive). "
+            "For inductive PaySim transfer use --train_fit_edge_znorm."
+        )
+        tr_data.edge_attr, val_data.edge_attr, te_data.edge_attr = (
+            z_norm(tr_data.edge_attr),
+            z_norm(val_data.edge_attr),
+            z_norm(te_data.edge_attr),
+        )
 
     if args.reverse_mp:
+        correct_rev = bool(getattr(args, "correct_reverse_edge_features", False))
+        logging.info(
+            "Hetero reverse-edge feature semantics: mode=%s "
+            "(correct_reverse_edge_features=%s ports=%s tds=%s edge_dim=%d)",
+            "corrected" if correct_rev else "inherited_legacy",
+            correct_rev,
+            bool(getattr(args, "ports", False)),
+            bool(getattr(args, "tds", False)),
+            int(tr_data.edge_attr.shape[1]),
+        )
         tr_data = create_hetero_obj(
             tr_data.x, tr_data.y, tr_data.edge_index, tr_data.edge_attr, tr_data.timestamps, args
         )
@@ -189,6 +243,32 @@ def get_data(args, data_config):
         te_data = create_hetero_obj(
             te_data.x, te_data.y, te_data.edge_index, te_data.edge_attr, te_data.timestamps, args
         )
+        schema = getattr(tr_data, "edge_feature_schema", None)
+        if schema is not None:
+            logging.info(
+                "Edge feature schema (pre-ID): names=%s indices=%s swap_pairs=%s",
+                schema.get("names"),
+                schema.get("indices"),
+                schema.get("swap_pairs"),
+            )
+            # Persist on args for checkpoint / summary metadata.
+            args.edge_feature_schema = schema
+            args.reverse_edge_feature_semantics = getattr(
+                tr_data, "reverse_edge_feature_semantics", None
+            )
+
+    # Append causal temporal-flow encoder inputs after base z_norm / hetero port swap
+    # so TF columns are not mistaken for ports in create_hetero_obj.
+    maybe_append_temporal_flow_edge_features(
+        tr_data,
+        val_data,
+        te_data,
+        e_tr=e_tr,
+        e_val=e_val,
+        args=args,
+        data_name=args.data,
+        n_edges_full=int(edge_attr.shape[0]),
+    )
 
     if args.model == "rgcn":
         append_rgcn_relation_type(tr_data, args.reverse_mp)
@@ -207,6 +287,7 @@ def get_data(args, data_config):
     te_data.pattern_metadata_by_edge_id = pattern_metadata_by_edge_id
     te_data.dataset_spec_summary = spec_summary(spec)
 
+    _stage_tick(args, "get_data_total_sec", t_all)
     return tr_data, val_data, te_data, tr_inds, val_inds, te_inds
 
 

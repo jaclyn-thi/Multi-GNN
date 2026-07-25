@@ -138,6 +138,65 @@ def z_norm(data):
     std = torch.where(std == 0, torch.tensor(1, dtype=torch.float32).cpu(), std)
     return (data - data.mean(0).unsqueeze(0)) / std
 
+
+def resolve_directional_edge_feature_schema(edge_dim: int, *, ports: bool, tds: bool) -> dict:
+    """Resolve named edge-feature columns from construction order (not trailing indices).
+
+    Homogeneous AML construction in ``data_loading.get_data`` appends:
+      base edge features → [in_port, out_port] if ports → [in_td, out_td] if tds
+
+    Both port and TDS pairs are source/destination directional: under reverse MP the
+    destination becomes the source and vice versa, so each pair must swap once on the
+    reverse relation when corrected semantics are enabled.
+    """
+    n_extra = (2 if ports else 0) + (2 if tds else 0)
+    if edge_dim < n_extra:
+        raise ValueError(
+            f"edge_dim={edge_dim} too small for ports={ports} tds={tds} (need >= {n_extra})"
+        )
+    base_dim = int(edge_dim) - n_extra
+    names = [f"base_{i}" for i in range(base_dim)]
+    indices: dict = {}
+    col = base_dim
+    swap_pairs = []
+    if ports:
+        names.extend(["in_port", "out_port"])
+        indices["in_port"] = col
+        indices["out_port"] = col + 1
+        swap_pairs.append(("in_port", "out_port", col, col + 1))
+        col += 2
+    if tds:
+        names.extend(["in_td", "out_td"])
+        indices["in_td"] = col
+        indices["out_td"] = col + 1
+        swap_pairs.append(("in_td", "out_td", col, col + 1))
+        col += 2
+    return {
+        "edge_dim": int(edge_dim),
+        "base_dim": base_dim,
+        "ports": bool(ports),
+        "tds": bool(tds),
+        "names": names,
+        "indices": indices,
+        "swap_pairs": swap_pairs,
+    }
+
+
+def apply_corrected_reverse_edge_attr(edge_attr: torch.Tensor, *, ports: bool, tds: bool):
+    """Clone ``edge_attr`` and swap directional source/dest pairs for reverse MP.
+
+    Does not mutate ``edge_attr``. Nondirectional (base) columns are unchanged.
+    """
+    schema = resolve_directional_edge_feature_schema(
+        int(edge_attr.shape[1]), ports=ports, tds=tds
+    )
+    rev = edge_attr.clone()
+    for _name_a, _name_b, i, j in schema["swap_pairs"]:
+        # Swap exactly once per directional pair.
+        rev[:, [i, j]] = rev[:, [j, i]]
+    return rev, schema
+
+
 def create_hetero_obj(x,  y,  edge_index,  edge_attr, timestamps, args):
     '''Creates a heterogenous graph object for reverse message passing'''
     data = HeteroGraphData()
@@ -145,14 +204,40 @@ def create_hetero_obj(x,  y,  edge_index,  edge_attr, timestamps, args):
     data['node'].x = x
     data['node', 'to', 'node'].edge_index = edge_index
     data['node', 'rev_to', 'node'].edge_index = edge_index.flipud()
-    data['node', 'to', 'node'].edge_attr = edge_attr
-    data['node', 'rev_to', 'node'].edge_attr = edge_attr
-    if args.ports:
-        #swap the in- and outgoing port numberings for the reverse edges
-        data['node', 'rev_to', 'node'].edge_attr[:, [-1, -2]] = data['node', 'rev_to', 'node'].edge_attr[:, [-2, -1]]
+    ports = bool(getattr(args, "ports", False))
+    tds = bool(getattr(args, "tds", False))
+    correct = bool(getattr(args, "correct_reverse_edge_features", False))
+
+    if correct:
+        # Independent reverse storage; forward stays in original orientation.
+        data['node', 'to', 'node'].edge_attr = edge_attr
+        rev_attr, schema = apply_corrected_reverse_edge_attr(
+            edge_attr, ports=ports, tds=tds
+        )
+        data['node', 'rev_to', 'node'].edge_attr = rev_attr
+        semantics = "corrected"
+    else:
+        # Inherited upstream behavior (default / paper Multi-GIN+EU path):
+        # forward and reverse alias the same storage; if ports=True, an in-place
+        # swap of the trailing two columns mutates both relations. With ports+TDS
+        # those trailing columns are TDS, not ports.
+        data['node', 'to', 'node'].edge_attr = edge_attr
+        data['node', 'rev_to', 'node'].edge_attr = edge_attr
+        if ports:
+            #swap the in- and outgoing port numberings for the reverse edges
+            data['node', 'rev_to', 'node'].edge_attr[:, [-1, -2]] = data['node', 'rev_to', 'node'].edge_attr[:, [-2, -1]]
+        schema = resolve_directional_edge_feature_schema(
+            int(edge_attr.shape[1]), ports=ports, tds=tds
+        )
+        semantics = "inherited_legacy"
+
     data['node', 'to', 'node'].y = y
     data['node', 'to', 'node'].timestamps = timestamps
-    
+    # Diagnostics only (HeteroData allows custom attributes).
+    data.reverse_edge_feature_semantics = semantics
+    data.edge_feature_schema = schema
+    data.correct_reverse_edge_features = correct
+
     return data
 
 

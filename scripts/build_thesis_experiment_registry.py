@@ -27,6 +27,13 @@ FIELDS = [
     "paired_test_n", "source_json", "source_note", "checkpoint_path", "status",
     "scout_or_formal", "superseded", "thesis_role", "validation_status",
     "table_eligible", "table_group", "duplicate_resolution", "caveats",
+    # Provenance / comparability (2026-07-22 sync)
+    "protocol_family", "split_protocol", "graph_representation",
+    "batch_size", "accum_steps", "negative_pool_semantics",
+    "reverse_feature_semantics", "preserve_seed_edges",
+    "positive_set_definition", "knn_scope", "job_id", "paper_comparable",
+    # D+ partial fine-tune schema (2026-07-24); empty on historical rows until filled
+    "finetune_protocol", "classifier_lr", "encoder_lr", "partial_unfreeze_modules",
 ]
 
 TEMPORAL_ARM_STACK = {
@@ -58,6 +65,95 @@ PNA_FOLLOWUP_SOURCES = [
     "results/diagnostics/pna_width_aligned_probe.json",
     "results/diagnostics/pna_width65_temporal_flow_probe.json",
     "results/diagnostics/pna_width65_best_stack_comparison.json",
+]
+
+TF_AUX_OBJECTIVE_SOURCES = [
+    "results/diagnostics/temporal_flow_aux_objective_scout.json",
+    "results/diagnostics/tf_aux_tf_bins5_w0.10_post128_seed1.json",
+    "results/diagnostics/tf_aux_tf_bins5_w0.10_pre3h_seed1.json",
+    "results/diagnostics/tf_aux_tf_reg_w0.10_post128_seed1.json",
+    "results/diagnostics/tf_aux_tf_reg_w0.10_pre3h_seed1.json",
+    "results/diagnostics/tf_aux_tf_bins10_w0.10_post128_seed1.json",
+    "results/diagnostics/tf_aux_tf_bins10_w0.10_pre3h_seed1.json",
+    "results/diagnostics/tf_aux_tf_reg_w0.05_post128_seed1.json",
+    "results/diagnostics/tf_aux_tf_reg_w0.05_pre3h_seed1.json",
+]
+
+TF_AUX_PROBE_FILES = [
+    "tf_aux_tf_bins5_w0.10_post128_seed1.json",
+    "tf_aux_tf_bins5_w0.10_pre3h_seed1.json",
+    "tf_aux_tf_reg_w0.10_post128_seed1.json",
+    "tf_aux_tf_reg_w0.10_pre3h_seed1.json",
+    "tf_aux_tf_bins10_w0.10_post128_seed1.json",
+    "tf_aux_tf_bins10_w0.10_pre3h_seed1.json",
+    "tf_aux_tf_reg_w0.05_post128_seed1.json",
+    "tf_aux_tf_reg_w0.05_pre3h_seed1.json",
+]
+
+TF_SOFT_OBJECTIVE_SOURCES = [
+    "results/diagnostics/temporal_flow_soft_positive_scout.json",
+    "results/diagnostics/tf_soft_tf_soft_bins5_min3_cap16_w0.05_post128_seed1.json",
+    "results/diagnostics/tf_soft_tf_soft_bins5_min3_cap16_w0.05_pre3h_seed1.json",
+    "results/diagnostics/tf_soft_tf_soft_bins5_min4_cap16_w0.10_post128_seed1.json",
+    "results/diagnostics/tf_soft_tf_soft_bins5_min4_cap16_w0.10_pre3h_seed1.json",
+    "results/diagnostics/tf_soft_tf_soft_bins10_min4_cap32_w0.05_post128_seed1.json",
+    "results/diagnostics/tf_soft_tf_soft_bins10_min4_cap32_w0.05_pre3h_seed1.json",
+    "results/diagnostics/tf_soft_tf_soft_strict_bins10_min5_cap4_w0.01_post128_seed1.json",
+    "results/diagnostics/tf_soft_tf_soft_strict_bins10_min5_cap4_w0.01_pre3h_seed1.json",
+]
+
+TF_SOFT_PROBE_FILES = [
+    "tf_soft_tf_soft_bins5_min3_cap16_w0.05_post128_seed1.json",
+    "tf_soft_tf_soft_bins5_min3_cap16_w0.05_pre3h_seed1.json",
+    "tf_soft_tf_soft_bins5_min4_cap16_w0.10_post128_seed1.json",
+    "tf_soft_tf_soft_bins5_min4_cap16_w0.10_pre3h_seed1.json",
+    "tf_soft_tf_soft_bins10_min4_cap32_w0.05_post128_seed1.json",
+    "tf_soft_tf_soft_bins10_min4_cap32_w0.05_pre3h_seed1.json",
+    "tf_soft_tf_soft_strict_bins10_min5_cap4_w0.01_post128_seed1.json",
+    "tf_soft_tf_soft_strict_bins10_min5_cap4_w0.01_pre3h_seed1.json",
+]
+
+MORPH_OBJ_RECALL_PROBE_FILES = [
+    "morph_obj_baseline_pre3h_seed1.json",
+    "morph_obj_baseline_post128_seed1.json",
+    "morph_obj_degflow_pre3h_seed1.json",
+    "morph_obj_degflow_post128_seed1.json",
+    "morph_obj_clustering_pre3h_seed1.json",
+    "morph_obj_clustering_post128_seed1.json",
+    "morph_obj_degflow_tfreg_pre3h_seed1.json",
+    "morph_obj_degflow_tfreg_post128_seed1.json",
+]
+
+# Focused degflow multiseed replication (seeds 2–3 + optional seed2 baseline).
+# Seed-1 degflow/baseline remain in MORPH_OBJ_RECALL_PROBE_FILES above.
+DEGFLOW_MULTISEED_PROBE_FILES = [
+    "morph_obj_baseline_pre3h_seed2.json",
+    "morph_obj_baseline_post128_seed2.json",
+    "morph_obj_degflow_pre3h_seed2.json",
+    "morph_obj_degflow_post128_seed2.json",
+    "morph_obj_degflow_pre3h_seed3.json",
+    "morph_obj_degflow_post128_seed3.json",
+]
+
+# Temporal-flow regression aux multiseed confirmation (seeds 2–3).
+# Seed-1 tf_reg probes remain in TF_AUX_PROBE_FILES above.
+TF_REG_AUX_MULTISEED_PROBE_FILES = [
+    "tf_aux_tf_reg_w0.10_pre3h_seed2.json",
+    "tf_aux_tf_reg_w0.10_post128_seed2.json",
+    "tf_aux_tf_reg_w0.10_pre3h_seed3.json",
+    "tf_aux_tf_reg_w0.10_post128_seed3.json",
+    "tf_aux_tf_reg_w0.05_pre3h_seed2.json",
+    "tf_aux_tf_reg_w0.05_post128_seed2.json",
+    "tf_aux_tf_reg_w0.05_pre3h_seed3.json",
+    "tf_aux_tf_reg_w0.05_post128_seed3.json",
+]
+
+# Contrastive objective resource scout (seed2 large_bs + edge_drop).
+CTR_RES_PROBE_FILES = [
+    "ctr_res_large_bs_pre3h_seed2.json",
+    "ctr_res_large_bs_post128_seed2.json",
+    "ctr_res_edge_drop_pre3h_seed2.json",
+    "ctr_res_edge_drop_post128_seed2.json",
 ]
 
 STACK_MAP = {
@@ -96,13 +192,40 @@ THESIS_ROLE_RULES_MD = """
 
 | Value | Rule |
 |-------|------|
-| `thesis_primary` | Small-LI multiseed pre/post rows; formal legacy supervised (paper_argmax); Small-HI strong-run paired pre/post (`pre3h_strong_run_comparison.json`) for gin 40ep s2 and FNF HI |
-| `thesis_supporting` | Architecture sweep; alert-budget diagnostics; feature ablation; single-file HI pre/post JSON; 20ep baseline rows; FNF/LI strong-run secondary rows |
-| `diagnostic` | emb198 scout; legacy supervised val-tuned row; legacy 20ep scout |
-| `negative_result` | degree-aware edge-drop ablation; superseded non-legacy supervised |
+| `thesis_primary` | Small-LI multiseed pre/post; **paper-faithful** Small-HI ports TDS-off supervised (paper_argmax); Small-HI strong-run paired pre/post for gin 40ep s2 and FNF HI |
+| `thesis_supporting` | Architecture sweep; alert-budget; feature ablation; single-file HI pre/post; 20ep baseline; FNF/LI secondary |
+| `diagnostic` | emb198; val-tuned supervised; batch-size E/F; GCPAL audits; A/B/C/D contrastive arms; txn-node scouts; random-40 |
+| `negative_result` | degree-aware edge-drop; superseded non-legacy supervised |
 | `historical` | Rows from superseded protocols not marked superseded=true |
-| `superseded` | `superseded=true` |
+| `superseded` | `superseded=true` (includes old Small-HI TDS-on supervised for paper table) |
+
+### `paper_comparable` (Multi-GIN+EU)
+
+`true` only for Small-HI legacy supervised with ports, **tds=False**, paper_argmax, formal seeds/aggregate.
+Old TDS-on supervised → `false`. Contrastive / txn-node / random-40 → `false`.
 """
+
+HI_PORTS_AGG_SOURCE = (
+    "results/diagnostics/eval_small_hi_legacy_supervised_gin_emlps_ports_50ep_seeds1-3_formal_aggregate.json"
+)
+
+JUL22_ABCD_PROBES = [
+    ("probe_feature_ablation_current_protocol_gin_40ep_seed2_tds_off.json",
+     "tds_off", False, "inherited_or_n_a", False, "B_tds_off"),
+    ("probe_feature_ablation_current_protocol_gin_40ep_seed2_tds_off_preserve_seed.json",
+     "tds_off_preserve", False, "inherited_or_n_a", True, "C_tds_off_preserve"),
+    ("probe_feature_ablation_current_protocol_gin_40ep_seed2_tds_corrected.json",
+     "tds_corrected", True, "corrected_named_swap", False, "D_tds_corrected"),
+    ("probe_feature_ablation_current_protocol_gin_40ep_seed2_tds_corrected_preserve_seed.json",
+     "tds_corrected_preserve", True, "corrected_named_swap", True, "Dplus_corrected_preserve"),
+]
+
+JUL22_BATCH_EF_PROBES = [
+    ("probe_feature_ablation_gin_emlps_ports_tds_corrected_preserve_seed_asym_proj_allneg_bs8192_accum4_10ep_seed2.json",
+     8192, 4, "E_bs8192_accum4"),
+    ("probe_feature_ablation_gin_emlps_ports_tds_corrected_preserve_seed_asym_proj_allneg_bs2048_accum16_10ep_seed2.json",
+     2048, 16, "F_bs2048_accum16"),
+]
 
 
 def _blank_row() -> Dict[str, Any]:
@@ -491,6 +614,298 @@ def ingest_temporal_flow_ablation(rows, path: Path, source_note: Optional[str] =
     return True
 
 
+def _parse_tf_aux_variant(run_name: str) -> str:
+    m = re.search(r"hi_tf_aux_(tf_(?:reg|bins)[^_]*(?:_w[\d.]+)?)_gin", run_name)
+    if m:
+        return m.group(1)
+    m = re.search(r"tf_aux_(tf_(?:reg|bins)[\w.]+)_", run_name)
+    return m.group(1) if m else "unknown"
+
+
+def _tf_aux_selected_epochs() -> Dict[str, Optional[int]]:
+    scout = _load(DIAG / "temporal_flow_aux_objective_scout.json") or {}
+    out: Dict[str, Optional[int]] = {}
+    for v in scout.get("variants") or []:
+        rn = v.get("run_name")
+        if rn:
+            out[rn] = v.get("checkpoint_epoch")
+    return out
+
+
+def ingest_temporal_flow_aux_probe(
+    rows,
+    path: Path,
+    *,
+    selected_epochs: Optional[Dict[str, Optional[int]]] = None,
+    table_group: str = "temporal_flow_aux_objective",
+    source_note: str = "notes/temporal_flow_aux_objective_scout.md",
+    thesis_role: str = "diagnostic",
+    caveats_extra: str = "single-seed",
+) -> bool:
+    """Ingest SSL temporal-flow auxiliary objective scout probe JSONs (post-128 and pre-3h)."""
+    data = _load(path)
+    if not data or "arms" not in data:
+        return False
+    if "tf_aux" not in path.name and "hi_tf_aux" not in str(data.get("run_name", "")):
+        return False
+    rel = str(path.relative_to(ROOT))
+    note = source_note
+    max_iter = _temporal_probe_max_iter(data)
+    ds = data.get("data", "Small-HI")
+    rn = data["run_name"]
+    meta = _parse_run_meta(rn)
+    variant = _parse_tf_aux_variant(rn)
+    selected = None
+    if selected_epochs:
+        selected = selected_epochs.get(rn)
+    if selected is None:
+        selected = (data.get("extraction_meta") or {}).get("checkpoint_epoch")
+    raw_rep = data.get("representation") or data.get("representation_source") or "pre_embedding_3h"
+    if "post" in str(raw_rep):
+        rep_name = "post_embedding_128"
+        default_dim = 128
+    else:
+        rep_name = "pre_embedding_3h"
+        default_dim = 198
+    rep_dim = data.get("representation_dim") or default_dim
+    test_n = (data.get("split_pairing") or {}).get("test", {}).get("rows")
+    for arm_key, (arm_label, stack) in TEMPORAL_ARM_STACK.items():
+        arm = data["arms"].get(arm_key)
+        if not arm:
+            continue
+        test = _temporal_arm_test_block(arm)
+        if not test:
+            continue
+        metrics = _metrics_from_test_block(test)
+        if test_n and metrics.get("paired_test_n") is None:
+            metrics["paired_test_n"] = test_n
+        proto = _ssl_proto(
+            thesis_role=thesis_role,
+            scout_or_formal="scout",
+            table_group=table_group,
+            validation_status="diagnostic_only",
+            table_eligible=False,
+            morphology_auxiliary_loss="temporal_flow_causal:{0}".format(variant),
+        )
+        proto.pop("caveats", None)
+        for k, v in meta.items():
+            if k in FIELDS and k not in ("dataset", "seed"):
+                proto[k] = v
+        rows.append(_row(
+            **proto,
+            **metrics,
+            run_id="{0}|{1}|{2}|tf_aux_{3}|arm{4}|maxiter{5}".format(
+                rn, stack, rep_name, variant, arm_label, max_iter
+            ),
+            dataset=ds,
+            seed=meta.get("seed", 1),
+            selected_epoch=selected,
+            representation_source=rep_name,
+            representation_dim=rep_dim,
+            probe_feature_stack=stack,
+            source_json=rel,
+            source_note=note,
+            checkpoint_path=data.get("embedding_dir"),
+            caveats=(
+                "temporal_flow_aux SSL scout variant={0}; attach=post_embedding_head_pre_projection; "
+                "no labels in SSL; arm {1}; probe_max_iter={2}; {3}; "
+                "primary evidence uses A/B not D-only; table_eligible=false"
+            ).format(variant, arm_label, max_iter, caveats_extra),
+        ))
+    return True
+
+
+def _parse_tf_soft_variant(run_name: str) -> str:
+    m = re.search(r"hi_tf_soft_(tf_soft_[\w.]+?)_optv2_gin", run_name)
+    if m:
+        return m.group(1)
+    m = re.search(r"tf_soft_(tf_soft_[\w.]+?)_(?:pre3h|post128)", run_name)
+    return m.group(1) if m else "unknown"
+
+
+def ingest_temporal_flow_soft_positive_probe(rows, path: Path) -> bool:
+    """Ingest SSL temporal-flow soft-positive scout probe JSONs (post-128 + pre-3h).
+
+    Diagnostic/negative-result scout: identity pair remains the primary positive;
+    low-weight temporal-flow soft positives are added. No labels are used in SSL.
+    """
+    data = _load(path)
+    if not data or "arms" not in data:
+        return False
+    if "tf_soft" not in path.name and "hi_tf_soft" not in str(data.get("run_name", "")):
+        return False
+    rel = str(path.relative_to(ROOT))
+    note = "notes/temporal_flow_soft_positive_scout.md"
+    max_iter = _temporal_probe_max_iter(data)
+    ds = data.get("data", "Small-HI")
+    rn = data["run_name"]
+    meta = _parse_run_meta(rn)
+    variant = _parse_tf_soft_variant(rn)
+    raw_rep = data.get("representation") or data.get("representation_source") or "pre_embedding_3h"
+    if "post" in str(raw_rep):
+        rep_name = "post_embedding_128"
+        default_dim = 128
+    else:
+        rep_name = "pre_embedding_3h"
+        default_dim = 198
+    rep_dim = data.get("representation_dim") or default_dim
+    test_n = (data.get("split_pairing") or {}).get("test", {}).get("rows")
+    for arm_key, (arm_label, stack) in TEMPORAL_ARM_STACK.items():
+        arm = data["arms"].get(arm_key)
+        if not arm:
+            continue
+        test = _temporal_arm_test_block(arm)
+        if not test:
+            continue
+        metrics = _metrics_from_test_block(test)
+        if test_n and metrics.get("paired_test_n") is None:
+            metrics["paired_test_n"] = test_n
+        proto = _ssl_proto(
+            thesis_role="negative_result",
+            scout_or_formal="scout",
+            table_group="temporal_flow_soft_positive_objective",
+            validation_status="diagnostic_only",
+            table_eligible=False,
+            morphology_auxiliary_loss="temporal_flow_soft_positive:{0}".format(variant),
+        )
+        proto.pop("caveats", None)
+        for k, v in meta.items():
+            if k in FIELDS and k not in ("dataset", "seed"):
+                proto[k] = v
+        rows.append(_row(
+            **proto,
+            **metrics,
+            run_id="{0}|{1}|{2}|tf_soft_{3}|arm{4}|maxiter{5}".format(
+                rn, stack, rep_name, variant, arm_label, max_iter
+            ),
+            dataset=ds,
+            seed=meta.get("seed", 1),
+            selected_epoch=None,
+            representation_source=rep_name,
+            representation_dim=rep_dim,
+            probe_feature_stack=stack,
+            source_json=rel,
+            source_note=note,
+            checkpoint_path=data.get("embedding_dir"),
+            caveats=(
+                "temporal_flow soft-positive SSL scout variant={0}; identity pair primary, "
+                "low-weight TF soft positives; no labels in SSL; arm {1}; probe_max_iter={2}; "
+                "single-seed; NEGATIVE RESULT: pre-3h A/B AUPRC below baseline (~0.224/0.274), "
+                "P@100 and precision-constrained recall collapse; caps fully saturated"
+            ).format(variant, arm_label, max_iter),
+        ))
+    return True
+
+
+def _parse_morph_obj_variant(run_name: str, path_name: str) -> str:
+    m = re.search(r"morph_obj_(baseline|degflow_tfreg|degflow|clustering)_", path_name)
+    if m:
+        return m.group(1)
+    if "hi_morph_obj_degflow_tfreg" in run_name:
+        return "degflow_tfreg"
+    if "hi_morph_obj_degflow" in run_name:
+        return "degflow"
+    if "hi_morph_obj_clustering" in run_name:
+        return "clustering"
+    if "hi_contrastive_gin_emlps_tds" in run_name and "proj_asym_8192neg" in run_name:
+        return "baseline"
+    return "unknown"
+
+
+def ingest_morphology_objective_recall_probe(
+    rows,
+    path: Path,
+    *,
+    table_group: str = "morphology_objective_recall_scout",
+    source_note: str = "notes/morphology_objective_recall_scout.md",
+) -> bool:
+    """Ingest morphology-objective recall scout probe JSONs (diagnostic_only).
+
+    Regression expert heads only (no M2 contrast, no TF soft positives, no tier2).
+    No labels in SSL. Not table-eligible for main thesis tables.
+    """
+    data = _load(path)
+    if not data or "arms" not in data:
+        return False
+    if "morph_obj" not in path.name and "hi_morph_obj" not in str(data.get("run_name", "")):
+        # baseline re-probe uses plain contrastive run name; require morph_obj path prefix
+        if "morph_obj_baseline" not in path.name:
+            return False
+    rel = str(path.relative_to(ROOT))
+    note = source_note
+    max_iter = _temporal_probe_max_iter(data)
+    ds = data.get("data", "Small-HI")
+    rn = data["run_name"]
+    meta = _parse_run_meta(rn)
+    variant = _parse_morph_obj_variant(rn, path.name)
+    raw_rep = data.get("representation") or data.get("representation_source") or "pre_embedding_3h"
+    if "post" in str(raw_rep):
+        rep_name = "post_embedding_128"
+        default_dim = 128
+    else:
+        rep_name = "pre_embedding_3h"
+        default_dim = 198
+    rep_dim = data.get("representation_dim") or default_dim
+    test_n = (data.get("split_pairing") or {}).get("test", {}).get("rows")
+    aux_label = {
+        "baseline": "none",
+        "degflow": "morph_expert:degree_fan+flow_balance",
+        "clustering": "morph_expert:local+global_clustering",
+        "degflow_tfreg": "morph_expert:degree_fan+flow_balance+tf_reg_w0.05",
+    }.get(variant, "morph_expert:{0}".format(variant))
+    # Prefer seed from run_name / filename over default
+    seed_from_name = meta.get("seed")
+    m_seed = re.search(r"_seed(\d+)\.json$", path.name)
+    if m_seed:
+        seed_from_name = int(m_seed.group(1))
+    elif variant == "baseline" and seed_from_name is None:
+        seed_from_name = 1
+    for arm_key, (arm_label, stack) in TEMPORAL_ARM_STACK.items():
+        arm = data["arms"].get(arm_key)
+        if not arm:
+            continue
+        test = _temporal_arm_test_block(arm)
+        if not test:
+            continue
+        metrics = _metrics_from_test_block(test)
+        if test_n and metrics.get("paired_test_n") is None:
+            metrics["paired_test_n"] = test_n
+        proto = _ssl_proto(
+            thesis_role="diagnostic_or_scout",
+            scout_or_formal="scout",
+            table_group=table_group,
+            validation_status="diagnostic_only",
+            table_eligible=False,
+            morphology_auxiliary_loss=aux_label,
+        )
+        proto.pop("caveats", None)
+        for k, v in meta.items():
+            if k in FIELDS and k not in ("dataset", "seed"):
+                proto[k] = v
+        rows.append(_row(
+            **proto,
+            **metrics,
+            run_id="{0}|{1}|{2}|morph_obj_{3}|arm{4}|maxiter{5}".format(
+                rn, stack, rep_name, variant, arm_label, max_iter
+            ),
+            dataset=ds,
+            seed=seed_from_name if seed_from_name is not None else 1,
+            selected_epoch=None,
+            representation_source=rep_name,
+            representation_dim=rep_dim,
+            probe_feature_stack=stack,
+            source_json=rel,
+            source_note=note,
+            checkpoint_path=data.get("embedding_dir"),
+            caveats=(
+                "morphology-objective scout variant={0}; expert regression only; "
+                "no M2/soft-positives/tier2; no labels in SSL; arm {1}; probe_max_iter={2}; "
+                "table_group={3}; diagnostic_only / not table-eligible"
+            ).format(variant, arm_label, max_iter, table_group),
+        ))
+    return True
+
+
 def ingest_pna_width_aligned_probe(rows, path: Path) -> bool:
     data = _load(path)
     if not data:
@@ -686,9 +1101,29 @@ def assign_table_metadata(rows: List[Dict[str, Any]], tf_validation: Dict[str, A
             r["table_eligible"] = (
                 r.get("validation_status") == "validated"
                 and not r.get("superseded")
-                and r.get("thesis_role") not in ("diagnostic", "negative_result", "superseded")
-                and r.get("status") not in ("audit_only",)
+                and r.get("thesis_role") not in (
+                    "diagnostic",
+                    "diagnostic_or_scout",
+                    "negative_result",
+                    "superseded",
+                )
+                and r.get("status") not in ("audit_only", "failed", "preliminary")
+                and r.get("split_protocol") != "random_40"
             )
+        # Hard guards
+        if r.get("split_protocol") == "random_40" or r.get("status") in (
+            "failed", "audit_only"
+        ):
+            r["table_eligible"] = False
+        if r.get("paper_comparable") is False and r.get("protocol_family") == (
+            "supervised_legacy_tds_on_not_paper"
+        ):
+            r["table_eligible"] = False
+        if r.get("objective") == "supervised" and r.get("tds") is True and (
+            r.get("dataset") == "Small-HI"
+        ):
+            r["paper_comparable"] = False
+
 
         if r.get("table_group") is None:
             if is_temporal:
@@ -717,7 +1152,7 @@ def assign_table_metadata(rows: List[Dict[str, Any]], tf_validation: Dict[str, A
 
 def collect_pending_sources() -> List[str]:
     pending = []
-    for rel in TEMPORAL_FLOW_SOURCES + PNA_FOLLOWUP_SOURCES:
+    for rel in TEMPORAL_FLOW_SOURCES + PNA_FOLLOWUP_SOURCES + TF_AUX_OBJECTIVE_SOURCES + TF_SOFT_OBJECTIVE_SOURCES:
         p = ROOT / rel
         if not p.is_file():
             pending.append(rel)
@@ -782,7 +1217,7 @@ def ingest_ablation_runs(rows, path, tag, fnf):
         )
 
 
-def ingest_legacy(rows, summary_path, eval_path, superseded=False):
+def ingest_legacy(rows, summary_path, eval_path, superseded=False, **overrides):
     summary = _load(summary_path)
     ev = _load(eval_path) or {}
     if not summary:
@@ -797,6 +1232,20 @@ def ingest_legacy(rows, summary_path, eval_path, superseded=False):
         caveats_extra = (
             "; Small-HI legacy supervised reference; compare to SSL temporal-flow with protocol caveats"
         )
+    tds = overrides.get("tds", True)
+    paper_comparable = overrides.get(
+        "paper_comparable",
+        bool(dataset == "Small-HI" and not tds and not superseded),
+    )
+    graph_flags = overrides.get(
+        "graph_flags",
+        "emlps,reverse_mp,ports,ego" + (",tds" if tds else ""),
+    )
+    protocol_family = overrides.get(
+        "protocol_family",
+        "supervised_multigin_eu_ports_no_tds" if (dataset == "Small-HI" and not tds)
+        else "supervised_legacy",
+    )
     # Always use eval JSON for ranking metrics when available
     base = dict(
         run_id="{0}|supervised|paper_argmax".format(summary["run_name"]),
@@ -806,8 +1255,8 @@ def ingest_legacy(rows, summary_path, eval_path, superseded=False):
         training_epochs=summary.get("n_epochs", 100),
         selected_epoch=summary.get("best_validation_epoch"),
         checkpoint_policy="best_val_minority_f1", supervised_head="legacy",
-        graph_flags="emlps,reverse_mp,ports,tds,ego",
-        emlps=True, tds=True, reverse_mp=True, ego=True, ports=True,
+        graph_flags=graph_flags,
+        emlps=True, tds=tds, reverse_mp=True, ego=True, ports=True,
         representation_source="logits_direct", probe_feature_stack="in_gnn_end_to_end",
         threshold_rule="paper_argmax",
         AUROC=test.get("auroc"),
@@ -827,13 +1276,25 @@ def ingest_legacy(rows, summary_path, eval_path, superseded=False):
         scout_or_formal="formal" if not superseded else "scout",
         superseded=superseded,
         thesis_role="superseded" if superseded else "thesis_primary",
-        table_group="main_results" if dataset == "Small-HI" else None,
+        table_group="main_results" if dataset == "Small-HI" and not superseded else None,
+        protocol_family=protocol_family,
+        split_protocol="temporal",
+        graph_representation="account_nodes_transaction_edges",
+        reverse_feature_semantics=overrides.get(
+            "reverse_feature_semantics",
+            "inherited_trailing_swap" if tds else "ports_only_inherited",
+        ),
+        paper_comparable=paper_comparable,
         caveats=(
             "paper_argmax in-GNN; NOT frozen probe; best-val checkpoint ep{0} only"
             + caveats_extra
         ).format(summary.get("best_validation_epoch", "?"))
-        + ("; SUPERSEDED by 100ep formal" if superseded else ""),
+        + ("; SUPERSEDED — not paper-compatible (TDS-on)" if superseded and dataset == "Small-HI" and tds else "")
+        + ("; SUPERSEDED by 100ep formal" if superseded and dataset == "Small-LI" else ""),
     )
+    for k, v in overrides.items():
+        if k in FIELDS:
+            base[k] = v
     rows.append(_row(**base))
     if val_tuned.get("f1") is not None:
         rows.append(_row(
@@ -843,7 +1304,689 @@ def ingest_legacy(rows, summary_path, eval_path, superseded=False):
                    F1=val_tuned.get("f1"), precision=val_tuned.get("precision"),
                    recall=val_tuned.get("recall"),
                    thesis_role="diagnostic",
+                   paper_comparable=False,
+                   table_eligible=False,
                    caveats="val-tuned threshold; NOT paper-compatible; diagnostic only")))
+
+
+def ingest_ports_hi_aggregate(rows, path: Path):
+    data = _load(path)
+    if not data:
+        return
+    agg = (data.get("formal_test_aggregate") or {})
+    f1 = agg.get("paper_argmax_f1") or {}
+    rows.append(_row(
+        run_id="small_hi_legacy_supervised_gin_emlps_ports_50ep_seeds1-3|supervised|paper_argmax|aggregate",
+        dataset="Small-HI",
+        objective="supervised", encoder="gin", seed=None,
+        training_epochs=50, supervised_head="legacy",
+        graph_flags="emlps,reverse_mp,ports,ego",
+        emlps=True, tds=False, reverse_mp=True, ego=True, ports=True,
+        representation_source="logits_direct", probe_feature_stack="in_gnn_end_to_end",
+        threshold_rule="paper_argmax",
+        AUROC=(agg.get("auroc") or {}).get("mean"),
+        AUPRC=(agg.get("auprc") or {}).get("mean"),
+        F1=f1.get("mean"),
+        precision=(agg.get("precision") or {}).get("mean"),
+        recall=(agg.get("recall") or {}).get("mean"),
+        source_json=str(path.relative_to(ROOT)),
+        source_note="notes/eval_small_hi_legacy_supervised_gin_emlps_ports_50ep_seeds1-3_formal_aggregate.md",
+        status="evaluated", scout_or_formal="formal", superseded=False,
+        thesis_role="thesis_primary", validation_status="validated",
+        table_eligible=True, table_group="main_results",
+        protocol_family="supervised_multigin_eu_ports_no_tds",
+        split_protocol="temporal",
+        graph_representation="account_nodes_transaction_edges",
+        reverse_feature_semantics="ports_only_inherited",
+        paper_comparable=True,
+        caveats=(
+            "formal aggregate seeds 1-3 paper_argmax; mean F1 0.660±0.060 vs paper "
+            "0.6479±0.0122; mean reproduced, low variance not; F1 field is mean only"
+        ),
+    ))
+
+
+def ingest_jul22_probe_arm(
+    rows, rel, tag, tds, reverse_sem, preserve, arm_id, *,
+    batch_size=None, accum=None, thesis_role="diagnostic", table_eligible=False,
+    protocol_family="edge_centric_contrastive_ablation",
+    negative_pool="sampled_8192",
+    training_epochs=40,
+):
+    path = DIAG / rel
+    data = _load(path)
+    if not data:
+        return
+    note = "notes/" + rel.replace(".json", ".md")
+    for item in data.get("runs", []):
+        test = item.get("splits_at_selected_threshold", {}).get("test") or item.get("test", {})
+        if not test and "auroc" in item:
+            test = item
+        feats = item.get("features", "embedding")
+        ed = item.get("embedding_dir") or data.get("embedding_dir", tag)
+        run_name = _run_name_from_embedding_dir(str(ed))
+        fixed = item.get("splits_at_threshold_0_5", {}).get("test") or {}
+        rows.append(_row(
+            **_ssl_proto(
+                run_id="{0}|{1}|{2}|val_tuned".format(run_name, arm_id, feats),
+                dataset=data.get("data", "Small-HI"),
+                seed=2,
+                training_epochs=training_epochs,
+                tds=tds,
+                graph_flags=(
+                    "emlps,reverse_mp,ports,ego"
+                    + (",tds" if tds else "")
+                    + (",correct_reverse" if reverse_sem == "corrected_named_swap" else "")
+                    + (",preserve_seed" if preserve else "")
+                ),
+                representation_source="post_embedding_128",
+                probe_feature_stack=feats,
+                AUROC=test.get("auroc"),
+                AUPRC=test.get("auprc"),
+                F1=test.get("f1") or test.get("f1_at_selected_threshold"),
+                F1_fixed=fixed.get("f1") or fixed.get("f1_at_0_5"),
+                precision=test.get("precision"),
+                recall=test.get("recall"),
+                source_json=str(path.relative_to(ROOT)),
+                source_note=note,
+                status="evaluated",
+                scout_or_formal="scout",
+                thesis_role=thesis_role,
+                validation_status="diagnostic_only",
+                table_eligible=table_eligible,
+                table_group="contrastive_ablations",
+                protocol_family=protocol_family,
+                split_protocol="temporal",
+                graph_representation="account_nodes_transaction_edges",
+                reverse_feature_semantics=reverse_sem,
+                preserve_seed_edges=preserve,
+                batch_size=batch_size,
+                accum_steps=accum,
+                negative_pool_semantics=negative_pool,
+                paper_comparable=False,
+                caveats=(
+                    "Jul21-22 arm {0}; val-tuned F1 separate from F1_fixed; "
+                    "not GCPAL reproduction; not paper Multi-GIN row"
+                ).format(arm_id),
+            )
+        ))
+
+
+def ingest_gcpal_audit_only(rows, path: Path, note: str):
+    data = _load(path)
+    if not data:
+        return
+    rows.append(_row(
+        run_id="{0}|gcpal_positive_audit".format(path.stem),
+        dataset="Small-HI",
+        objective="contrastive",
+        status="audit_only",
+        scout_or_formal="scout",
+        thesis_role="diagnostic",
+        validation_status="diagnostic_only",
+        table_eligible=False,
+        paper_comparable=False,
+        protocol_family="gcpal_positive_set_audit",
+        split_protocol="temporal",
+        graph_representation="account_nodes_transaction_edges",
+        source_json=str(path.relative_to(ROOT)),
+        source_note=note,
+        caveats="positive-set / KNN coverage audit only; no performance metrics ingested",
+    ))
+
+
+def ingest_txn_node_poscomplete(rows, path: Path):
+    data = _load(path)
+    if not data:
+        return
+    mode = data.get("mode", path.stem)
+    note = "notes/" + path.name.replace(".json", ".md")
+    for split_key, split_protocol, eligible_note in (
+        ("temporal_primary", "temporal", "preliminary five-epoch; temporal primary"),
+        ("random40_diagnostic", "random_40", "DIAGNOSTIC random-40; never primary table"),
+    ):
+        block = data.get(split_key) or {}
+        for stack, metrics in block.items():
+            if not isinstance(metrics, dict):
+                continue
+            thr05 = metrics.get("threshold_0.5") or metrics.get("fixed_0.5") or {}
+            val_thr = (
+                metrics.get("threshold_val_selected")
+                or metrics.get("val_selected_threshold")
+                or {}
+            )
+            # Prefer AUPRC/AUROC from thr05 block if present; keep F1 protocols separate rows
+            base_m = thr05 if thr05 else metrics
+            common = dict(
+                dataset="Small-HI",
+                objective="contrastive",
+                encoder="gin_txn_node",
+                seed=data.get("seed", 2),
+                training_epochs=data.get("n_epochs", 5),
+                batch_size=data.get("max_total_nodes", 2048),
+                probe_feature_stack=stack,
+                representation_source="txn_node_embedding",
+                status="preliminary",
+                scout_or_formal="scout",
+                thesis_role="diagnostic",
+                validation_status="diagnostic_only",
+                table_eligible=False,
+                paper_comparable=False,
+                protocol_family="txn_node_gcpal_inspired_poscomplete",
+                split_protocol=split_protocol,
+                graph_representation="transaction_nodes",
+                positive_set_definition=mode,
+                knn_scope="global_cached_k15",
+                source_json=str(path.relative_to(ROOT)),
+                source_note=note,
+                caveats=(
+                    "NOT AN EXACT GCPAL REPRODUCTION; {0}; "
+                    "positive-complete batching; λ=0.3 τ=0.5 k=15"
+                ).format(eligible_note),
+            )
+            if base_m.get("auroc") is not None or base_m.get("auprc") is not None:
+                rows.append(_row(
+                    **common,
+                    run_id="{0}|{1}|{2}|f1_fixed_0.5".format(path.stem, split_protocol, stack),
+                    threshold_rule="fixed_0.5",
+                    AUROC=base_m.get("auroc"),
+                    AUPRC=base_m.get("auprc"),
+                    F1=thr05.get("f1"),
+                    F1_fixed=thr05.get("f1"),
+                    precision=thr05.get("precision"),
+                    recall=thr05.get("recall"),
+                ))
+            if val_thr.get("f1") is not None or val_thr.get("auroc") is not None:
+                rows.append(_row(
+                    **common,
+                    run_id="{0}|{1}|{2}|f1_val_selected".format(path.stem, split_protocol, stack),
+                    threshold_rule="max_f1_on_val",
+                    AUROC=val_thr.get("auroc", base_m.get("auroc")),
+                    AUPRC=val_thr.get("auprc", base_m.get("auprc")),
+                    F1=val_thr.get("f1"),
+                    precision=val_thr.get("precision"),
+                    recall=val_thr.get("recall"),
+                ))
+
+
+def ingest_failed_forensic_provenance(rows):
+    """Failed forensic jobs — provenance only, no metrics."""
+    for job_id, note in (
+        ("18558352", "forensic extract TypeError infer_pre_embedding_dim"),
+        ("18566110", "forensic extract TypeError log_seed_coverage(split=)"),
+    ):
+        rows.append(_row(
+            run_id="forensic_gcpal_eval_protocol_audit|failed|{0}".format(job_id),
+            dataset="Small-HI",
+            status="failed",
+            scout_or_formal="scout",
+            thesis_role="diagnostic",
+            validation_status="diagnostic_only",
+            table_eligible=False,
+            paper_comparable=False,
+            protocol_family="gcpal_forensic_eval_protocol",
+            job_id=job_id,
+            caveats=(
+                "FAILED diagnostic; no scientific conclusion; no metrics; {0}"
+            ).format(note),
+            source_note="notes/documentation_audit_2026-07-22.md",
+        ))
+
+
+def ingest_final_dplus_multiseed_and_finetune(rows, path: Path):
+    """Primary frozen D+ multiseed + secondary partial-FT locked eval."""
+    data = _load(path)
+    if not data or not data.get("per_seed"):
+        return
+    note = "notes/final_dplus_multiseed_and_finetune_analysis.md"
+    common = dict(
+        dataset="Small-HI",
+        objective="downstream_probe",
+        status="evaluated",
+        scout_or_formal="formal",
+        encoder="gin",
+        representation_source="pre_embedding_3h",
+        representation_dim=198,
+        probe_feature_stack="H+X+TF|mlp|none",
+        split_protocol="temporal",
+        graph_representation="account_nodes_transaction_edges",
+        graph_flags="emlps,reverse_mp,ports,ego,tds,correct_reverse,preserve_seed",
+        reverse_feature_semantics="corrected_named_swap",
+        preserve_seed_edges=True,
+        emlps=True,
+        tds=True,
+        reverse_mp=True,
+        ego=True,
+        ports=True,
+        source_json=str(path.relative_to(ROOT)),
+        source_note=note,
+        paper_comparable=False,
+    )
+    for r in data.get("per_seed") or []:
+        seed = r.get("encoder_seed")
+        rows.append(_row(
+            **common,
+            run_id="final_dplus_frozen|seed{0}|H+X+TF|mlp|f1_fixed_0.5".format(seed),
+            seed=seed,
+            selected_epoch=r.get("checkpoint_epoch"),
+            checkpoint_path=None,
+            thesis_role="primary_result",
+            validation_status="formal",
+            table_eligible=True,
+            table_group="final_dplus_frozen_multiseed_primary",
+            protocol_family="edge_dplus_frozen_hxxtf_mlp_multiseed",
+            threshold_rule="fixed_0.5",
+            AUROC=r.get("test_auroc"),
+            AUPRC=r.get("test_auprc"),
+            F1_fixed=r.get("test_f1_0.5"),
+            F1=r.get("test_f1_0.5"),
+            precision=r.get("test_precision_0.5"),
+            recall=r.get("test_recall_0.5"),
+            precision_at_100=r.get("P100"),
+            precision_at_500=r.get("P500"),
+            precision_at_1000=r.get("P1000"),
+            finetune_protocol="none_encoder_frozen",
+            caveats=(
+                "PRIMARY: SSL contrastive encoder frozen; supervised downstream MLP uses AML labels; "
+                "checkpoint_policy best from contrastive score (predeclared); never test selection."
+            ),
+        ))
+        rows.append(_row(
+            **common,
+            run_id="final_dplus_frozen|seed{0}|H+X+TF|mlp|f1_val_selected".format(seed),
+            seed=seed,
+            selected_epoch=r.get("checkpoint_epoch"),
+            thesis_role="primary_result",
+            validation_status="formal",
+            table_eligible=True,
+            table_group="final_dplus_frozen_multiseed_primary",
+            protocol_family="edge_dplus_frozen_hxxtf_mlp_multiseed",
+            threshold_rule="val_selected",
+            AUROC=r.get("test_auroc"),
+            AUPRC=r.get("test_auprc"),
+            F1=r.get("test_f1_val_thr"),
+            precision=r.get("test_precision_val_thr"),
+            recall=r.get("test_recall_val_thr"),
+            finetune_protocol="none_encoder_frozen",
+            caveats="Val-selected threshold F1; keep separate from fixed-0.5.",
+        ))
+    ft = data.get("finetune_secondary") or {}
+    t05 = ft.get("test_metrics_threshold_0.5") or {}
+    tv = ft.get("test_metrics_val_threshold") or {}
+    if t05:
+        rows.append(_row(
+            **common,
+            run_id="final_dplus_partial_finetune|seed2|H+X+TF|mlp|f1_fixed_0.5",
+            seed=2,
+            selected_epoch=ft.get("best_epoch"),
+            thesis_role="secondary_sensitivity",
+            validation_status="formal",
+            table_eligible=True,
+            table_group="final_dplus_partial_finetune_secondary",
+            protocol_family="edge_dplus_partial_finetune_hxxtf",
+            threshold_rule="fixed_0.5",
+            AUROC=t05.get("auroc"),
+            AUPRC=t05.get("auprc"),
+            F1_fixed=t05.get("f1"),
+            F1=t05.get("f1"),
+            precision=t05.get("precision"),
+            recall=t05.get("recall"),
+            precision_at_100=t05.get("precision_at_100"),
+            precision_at_500=t05.get("precision_at_500"),
+            precision_at_1000=t05.get("precision_at_1000"),
+            finetune_protocol="partial_final_block",
+            classifier_lr=1e-3,
+            encoder_lr=1e-4,
+            partial_unfreeze_modules="convs.1,emlps.1,batch_norms.1",
+            caveats=(
+                "SECONDARY: SSL-pretrained D+ with supervised partial fine-tuning; "
+                "AML labels update classifier + final encoder block; not the primary thesis claim."
+            ),
+        ))
+        rows.append(_row(
+            **common,
+            run_id="final_dplus_partial_finetune|seed2|H+X+TF|mlp|f1_val_selected",
+            seed=2,
+            selected_epoch=ft.get("best_epoch"),
+            thesis_role="secondary_sensitivity",
+            validation_status="formal",
+            table_eligible=True,
+            table_group="final_dplus_partial_finetune_secondary",
+            protocol_family="edge_dplus_partial_finetune_hxxtf",
+            threshold_rule="val_selected",
+            AUROC=tv.get("auroc"),
+            AUPRC=tv.get("auprc"),
+            F1=tv.get("f1"),
+            precision=tv.get("precision"),
+            recall=tv.get("recall"),
+            finetune_protocol="partial_final_block",
+            classifier_lr=1e-3,
+            encoder_lr=1e-4,
+            partial_unfreeze_modules="convs.1,emlps.1,batch_norms.1",
+            caveats="Stored validation threshold from FT selection; test not used for selection.",
+        ))
+
+
+def ingest_edge_dplus_neighbor_positive(rows, path: Path):
+    """10ep poscomplete identity vs neighbor SupCon scout (val-gated; no GNN retrain)."""
+    data = _load(path)
+    if not data or not data.get("val_rows"):
+        return
+    note = "notes/edge_dplus_neighbor_positive_10ep_seed2.md"
+    job_id = str(data.get("valgate_job_id") or "")
+    common = dict(
+        dataset="Small-HI",
+        objective="downstream_probe",
+        seed=2,
+        status="evaluated",
+        scout_or_formal="scout",
+        thesis_role="diagnostic",
+        validation_status="diagnostic_only",
+        table_eligible=False,
+        paper_comparable=False,
+        protocol_family="edge_dplus_neighbor_positive_10ep",
+        graph_flags="emlps,reverse_mp,ports,ego,tds,correct_reverse",
+        reverse_feature_semantics="corrected_named_swap",
+        preserve_seed_edges=False,
+        source_json=str(path.relative_to(ROOT)),
+        source_note=note,
+        job_id=job_id or None,
+        caveats=(
+            "NOT exact GCPAL; matched identity poscomplete required; selection=max H+X+TF "
+            "val AUPRC (never SSL loss / never test); 10ep horizon; unequal batching vs D+ 40ep; "
+            "recommend_40ep={0}"
+        ).format(data.get("recommend_40ep")),
+    )
+    for role, key in (
+        ("selected_identity", "selected_identity"),
+        ("selected_neighbor", "selected_neighbor"),
+        ("winner", "winner"),
+    ):
+        sel = data.get(key) or {}
+        if not sel:
+            continue
+        rows.append(_row(
+            **common,
+            run_id="edge_dplus_neighbor_positive|{0}|{1}|val".format(role, sel.get("tag")),
+            encoder="gin",
+            representation_source="pre_embedding_3h",
+            representation_dim=198,
+            probe_feature_stack="{0}|mlp|none".format(sel.get("stack")),
+            split_protocol="temporal",
+            graph_representation="account_nodes_transaction_edges",
+            threshold_rule="val_selected",
+            AUPRC=sel.get("val_auprc"),
+            AUROC=sel.get("val_auroc"),
+            F1=sel.get("val_f1_at_selected"),
+            epochs=sel.get("epoch"),
+            unique_name=sel.get("arm"),
+        ))
+    for tr in data.get("test_rows") or []:
+        rows.append(_row(
+            **common,
+            run_id="edge_dplus_neighbor_positive|{0}|test_fixed_0.5".format(tr.get("tag")),
+            encoder="gin",
+            representation_source="pre_embedding_3h",
+            representation_dim=198,
+            probe_feature_stack="{0}|mlp|none".format(tr.get("stack")),
+            split_protocol="temporal",
+            graph_representation="account_nodes_transaction_edges",
+            threshold_rule="fixed_0.5",
+            AUROC=tr.get("test_auroc"),
+            AUPRC=tr.get("test_auprc"),
+            F1=tr.get("test_f1_0.5"),
+            F1_fixed=tr.get("test_f1_0.5"),
+            precision=tr.get("test_p_0.5"),
+            recall=tr.get("test_r_0.5"),
+            precision_at_100=tr.get("p_at_100"),
+            precision_at_500=tr.get("p_at_500"),
+            precision_at_1000=tr.get("p_at_1000"),
+            epochs=tr.get("epoch"),
+            unique_name=tr.get("arm"),
+        ))
+        rows.append(_row(
+            **common,
+            run_id="edge_dplus_neighbor_positive|{0}|test_val_thr".format(tr.get("tag")),
+            encoder="gin",
+            representation_source="pre_embedding_3h",
+            representation_dim=198,
+            probe_feature_stack="{0}|mlp|none".format(tr.get("stack")),
+            split_protocol="temporal",
+            graph_representation="account_nodes_transaction_edges",
+            threshold_rule="val_selected",
+            AUROC=tr.get("test_auroc"),
+            AUPRC=tr.get("test_auprc"),
+            F1=tr.get("test_f1_val_thr"),
+            precision=tr.get("test_p_val_thr"),
+            recall=tr.get("test_r_val_thr"),
+            epochs=tr.get("epoch"),
+            unique_name=tr.get("arm"),
+        ))
+
+
+def ingest_gcpal_challenge_fullstack(rows, path: Path):
+    """No-GNN full-stack challenge eval (temporal primary + reconstructed random 40/60)."""
+    data = _load(path)
+    if not data:
+        return
+    note = "notes/gcpal_challenge_fullstack_eval.md"
+    job_id = str(data.get("slurm_job_id") or "")
+    gate = (data.get("comparability_gate") or {}).get("verdict", "PARTIAL")
+    common = dict(
+        dataset="Small-HI",
+        objective="downstream_probe",
+        seed=2,
+        status="evaluated",
+        scout_or_formal="scout",
+        thesis_role="diagnostic",
+        validation_status="diagnostic_only",
+        table_eligible=False,
+        paper_comparable=False,
+        protocol_family="gcpal_challenge_fullstack",
+        graph_flags="emlps,reverse_mp,ports,ego,tds,correct_reverse,preserve_seed",
+        reverse_feature_semantics="corrected_named_swap",
+        preserve_seed_edges=True,
+        source_json=str(path.relative_to(ROOT)),
+        source_note=note,
+        job_id=job_id or None,
+        caveats=(
+            "NOT exact GCPAL reproduction; no GNN training; selection=max val AUPRC "
+            "(never test); comparability_gate={0}; fixed-0.5 and val-threshold separate"
+        ).format(gate),
+    )
+
+    sel = (data.get("temporal_primary") or {}).get("selected") or {}
+    metrics = sel.get("metrics") or {}
+    thr05 = metrics.get("threshold_0.5") or {}
+    thr_val = metrics.get("threshold_val_selected") or {}
+    tag = sel.get("tag") or "unknown"
+    cand = sel.get("candidate") or ""
+    stack = sel.get("stack") or ""
+    if cand.startswith("edge_pre3h"):
+        rep = "pre_embedding_3h"
+        dim = 198
+        enc = "gin"
+        graph_rep = "account_nodes_transaction_edges"
+    elif cand.startswith("edge_post128"):
+        rep = "post_embedding_128"
+        dim = 128
+        enc = "gin"
+        graph_rep = "account_nodes_transaction_edges"
+    elif "txn" in cand:
+        rep = "txn_node_embedding"
+        dim = None
+        enc = "gin_txn_node"
+        graph_rep = "transaction_nodes"
+    else:
+        rep = "features_only"
+        dim = None
+        enc = None
+        graph_rep = "transaction_features"
+
+    if thr05.get("auprc") is not None or thr05.get("auroc") is not None:
+        rows.append(_row(
+            **common,
+            run_id="gcpal_challenge_fullstack|{0}|temporal|f1_fixed_0.5".format(tag),
+            encoder=enc,
+            representation_source=rep,
+            representation_dim=dim,
+            probe_feature_stack="{0}|{1}|{2}".format(
+                stack, sel.get("learner"), sel.get("weight"),
+            ),
+            split_protocol="temporal",
+            graph_representation=graph_rep,
+            threshold_rule="fixed_0.5",
+            AUROC=thr05.get("auroc"),
+            AUPRC=thr05.get("auprc"),
+            F1=thr05.get("f1"),
+            F1_fixed=thr05.get("f1"),
+            precision=thr05.get("precision"),
+            recall=thr05.get("recall"),
+            precision_at_100=thr05.get("precision_at_100"),
+            recall_at_100=thr05.get("recall_at_100"),
+            lift_at_100=thr05.get("lift_at_100"),
+            precision_at_500=thr05.get("precision_at_500"),
+            recall_at_500=thr05.get("recall_at_500"),
+            lift_at_500=thr05.get("lift_at_500"),
+            precision_at_1000=thr05.get("precision_at_1000"),
+            recall_at_1000=thr05.get("recall_at_1000"),
+            lift_at_1000=thr05.get("lift_at_1000"),
+            paired_test_n=thr05.get("n"),
+            table_group="gcpal_challenge_temporal_primary",
+        ))
+    if thr_val.get("f1") is not None:
+        rows.append(_row(
+            **common,
+            run_id="gcpal_challenge_fullstack|{0}|temporal|f1_val_selected".format(tag),
+            encoder=enc,
+            representation_source=rep,
+            representation_dim=dim,
+            probe_feature_stack="{0}|{1}|{2}".format(
+                stack, sel.get("learner"), sel.get("weight"),
+            ),
+            split_protocol="temporal",
+            graph_representation=graph_rep,
+            threshold_rule="max_f1_on_val",
+            AUROC=thr_val.get("auroc", thr05.get("auroc")),
+            AUPRC=thr_val.get("auprc", thr05.get("auprc")),
+            F1=thr_val.get("f1"),
+            precision=thr_val.get("precision"),
+            recall=thr_val.get("recall"),
+            precision_at_100=thr_val.get("precision_at_100"),
+            recall_at_100=thr_val.get("recall_at_100"),
+            lift_at_100=thr_val.get("lift_at_100"),
+            precision_at_500=thr_val.get("precision_at_500"),
+            recall_at_500=thr_val.get("recall_at_500"),
+            lift_at_500=thr_val.get("lift_at_500"),
+            precision_at_1000=thr_val.get("precision_at_1000"),
+            recall_at_1000=thr_val.get("recall_at_1000"),
+            lift_at_1000=thr_val.get("lift_at_1000"),
+            paired_test_n=thr_val.get("n"),
+            table_group="gcpal_challenge_temporal_primary",
+        ))
+
+    rp = data.get("random_protocols") or {}
+    for ratio_key, split_name, target in (
+        ("random_40", "random_40", 0.581),
+        ("random_60", "random_60", 0.658),
+    ):
+        block = rp.get(ratio_key) or {}
+        sel_tag = block.get("selected_by_val_auprc")
+        after = block.get("selected_test_metrics_after_selection") or {}
+        if not sel_tag or not after:
+            continue
+        f05 = after.get("agg_test_f1_0.5") or {}
+        fvt = after.get("agg_test_f1_val_thr") or {}
+        auprc = after.get("agg_test_auprc") or {}
+        base_caveat = common["caveats"]
+        rows.append(_row(
+            **{k: v for k, v in common.items() if k != "caveats"},
+            run_id="gcpal_challenge_fullstack|{0}|{1}|mean_f1_fixed_0.5".format(
+                sel_tag, split_name,
+            ),
+            encoder="gin",
+            representation_source="pre_embedding_3h",
+            representation_dim=198,
+            probe_feature_stack=sel_tag,
+            split_protocol=split_name,
+            graph_representation="account_nodes_transaction_edges",
+            threshold_rule="fixed_0.5",
+            AUPRC=auprc.get("mean"),
+            F1=f05.get("mean"),
+            F1_fixed=f05.get("mean"),
+            table_group="gcpal_challenge_random_diagnostic",
+            caveats=(
+                base_caveat
+                + "; reconstructed {0} label ratio; target F1={1}; "
+                "mean over seeds {2}; exceeds_target={3}; "
+                "edge H=temporal-extract then re-label (PARTIAL scope)"
+            ).format(
+                split_name,
+                target,
+                (block.get("split_seeds") or []),
+                bool(after.get("exceeds_target_f1_0.5_mean")),
+            ),
+        ))
+        rows.append(_row(
+            **{k: v for k, v in common.items() if k != "caveats"},
+            run_id="gcpal_challenge_fullstack|{0}|{1}|mean_f1_val_selected".format(
+                sel_tag, split_name,
+            ),
+            encoder="gin",
+            representation_source="pre_embedding_3h",
+            representation_dim=198,
+            probe_feature_stack=sel_tag,
+            split_protocol=split_name,
+            graph_representation="account_nodes_transaction_edges",
+            threshold_rule="max_f1_on_val",
+            AUPRC=auprc.get("mean"),
+            F1=fvt.get("mean"),
+            table_group="gcpal_challenge_random_diagnostic",
+            caveats=(
+                base_caveat
+                + "; reconstructed {0} label ratio; target F1={1}; "
+                "mean over seeds {2}; exceeds_target={3}; "
+                "edge H=temporal-extract then re-label (PARTIAL scope)"
+            ).format(
+                split_name,
+                target,
+                (block.get("split_seeds") or []),
+                bool(after.get("exceeds_target_f1_val_thr_mean")),
+            ),
+        ))
+
+
+def ingest_gcpal_posagg_provenance(rows, path: Path):
+    """Positive-aggregation ablation provenance (selected D SupCon on val)."""
+    data = _load(path)
+    if not data:
+        return
+    sel = data.get("selected_condition") or data.get("selected_aggregation") or ""
+    rows.append(_row(
+        run_id="gcpal_txn_node_posagg_ablation|selected|{0}".format(sel or "unknown"),
+        dataset="Small-HI",
+        objective="contrastive",
+        encoder="gin_txn_node",
+        seed=2,
+        training_epochs=5,
+        status="evaluated",
+        scout_or_formal="scout",
+        thesis_role="diagnostic",
+        validation_status="diagnostic_only",
+        table_eligible=False,
+        paper_comparable=False,
+        protocol_family="txn_node_gcpal_inspired_posagg",
+        split_protocol="temporal",
+        graph_representation="transaction_nodes",
+        positive_set_definition=str(sel),
+        source_json=str(path.relative_to(ROOT)),
+        source_note="notes/gcpal_txn_node_posagg_ablation.md",
+        job_id=",".join(str(x) for x in (data.get("job_ids") or [])),
+        caveats=(
+            "NOT exact GCPAL reproduction; selection=temporal val HxX AUPRC among "
+            "B/C/D aggregations; no test-driven selection; feeds challenge eval candidate"
+        ),
+    ))
 
 
 def ingest_supervised_nonlegacy(rows, path):
@@ -876,7 +2019,12 @@ def classify_thesis_roles(rows):
         if r.get("superseded"):
             r["thesis_role"] = "superseded"
             continue
-        if r.get("thesis_role") in ("diagnostic", "negative_result", "superseded"):
+        if r.get("thesis_role") in (
+            "diagnostic",
+            "diagnostic_or_scout",
+            "negative_result",
+            "superseded",
+        ):
             continue
         src = str(r.get("source_json", ""))
         rid = (r.get("run_id") or "").split("|")[0]
@@ -1077,7 +2225,118 @@ def build_registry():
     hi_summary = DIAG / "supervised_Small-HI_small_hi_legacy_supervised_gin_emlps_tds_100ep_seed1_summary.json"
     hi_eval = DIAG / "eval_small_hi_legacy_supervised_gin_emlps_tds_100ep_seed1.json"
     if hi_summary.is_file() and hi_eval.is_file():
-        ingest_legacy(rows, hi_summary, hi_eval)
+        # Historical TDS-on formal — retain for provenance; not paper-comparable.
+        ingest_legacy(
+            rows, hi_summary, hi_eval, superseded=True,
+            tds=True, paper_comparable=False,
+            protocol_family="supervised_legacy_tds_on_not_paper",
+            reverse_feature_semantics="inherited_malformed_under_tds",
+            table_group=None,
+            table_eligible=False,
+        )
+    for seed in (1, 2, 3):
+        ingest_legacy(
+            rows,
+            DIAG / (
+                "supervised_Small-HI_small_hi_legacy_supervised_gin_emlps_ports_50ep_seed{0}_summary.json"
+                .format(seed)
+            ),
+            DIAG / (
+                "eval_small_hi_legacy_supervised_gin_emlps_ports_50ep_seed{0}.json"
+                .format(seed)
+            ),
+            superseded=False,
+            tds=False,
+            paper_comparable=True,
+            protocol_family="supervised_multigin_eu_ports_no_tds",
+            reverse_feature_semantics="ports_only_inherited",
+            table_group="main_results",
+            table_eligible=True,
+        )
+    ingest_ports_hi_aggregate(rows, DIAG / Path(HI_PORTS_AGG_SOURCE).name)
+    for rel, tag, tds, rev, preserve, arm in JUL22_ABCD_PROBES:
+        ingest_jul22_probe_arm(
+            rows, rel, tag, tds, rev, preserve, arm,
+            thesis_role="diagnostic", table_eligible=False,
+        )
+    for rel, bs, accum, arm in JUL22_BATCH_EF_PROBES:
+        ingest_jul22_probe_arm(
+            rows, rel, arm, True, "corrected_named_swap", True, arm,
+            batch_size=bs, accum=accum,
+            thesis_role="diagnostic", table_eligible=False,
+            protocol_family="edge_centric_batch_size_diagnostic",
+            negative_pool="all_inbatch_num_neg_0",
+            training_epochs=10,
+        )
+    ingest_gcpal_audit_only(
+        rows, DIAG / "gcpal_positive_set_audit.json",
+        "notes/gcpal_positive_set_audit.md",
+    )
+    multibatch = DIAG / "gcpal_positive_set_multibatch_audit.json"
+    if multibatch.is_file():
+        ingest_gcpal_audit_only(
+            rows, multibatch, "notes/gcpal_positive_set_audit.md",
+        )
+    for smoke in (
+        "gcpal_txn_node_smoke.json",
+        "gcpal_txn_node_poscomplete_smoke.json",
+    ):
+        p = DIAG / smoke
+        if p.is_file():
+            rows.append(_row(
+                run_id="{0}|smoke".format(p.stem),
+                dataset="Small-HI",
+                status="diagnostic",
+                thesis_role="diagnostic",
+                validation_status="diagnostic_only",
+                table_eligible=False,
+                paper_comparable=False,
+                protocol_family="txn_node_gcpal_inspired",
+                graph_representation="transaction_nodes",
+                source_json=str(p.relative_to(ROOT)),
+                source_note="notes/{0}.md".format(p.stem),
+                caveats="smoke only; NOT exact GCPAL reproduction",
+            ))
+    for scout in (
+        "gcpal_txn_node_scout_control_5ep_seed2.json",
+        "gcpal_txn_node_scout_gcpal_5ep_seed2.json",
+    ):
+        p = DIAG / scout
+        if p.is_file():
+            rows.append(_row(
+                run_id="{0}|ordinary_batch_scout".format(p.stem),
+                dataset="Small-HI",
+                status="preliminary",
+                thesis_role="diagnostic",
+                validation_status="diagnostic_only",
+                table_eligible=False,
+                paper_comparable=False,
+                protocol_family="txn_node_gcpal_inspired_ordinary_batch",
+                graph_representation="transaction_nodes",
+                knn_scope="global_cached_but_ordinary_batch_low_hit_rate",
+                source_json=str(p.relative_to(ROOT)),
+                source_note="notes/{0}.md".format(p.stem),
+                caveats=(
+                    "ordinary batching ~1.3% KNN coverage; NOT exact GCPAL reproduction; "
+                    "superseded for positive design by poscomplete scouts"
+                ),
+            ))
+    for pc in (
+        "gcpal_txn_node_poscomplete_scout_A_identity_5ep_seed2.json",
+        "gcpal_txn_node_poscomplete_scout_B_gcpal_5ep_seed2.json",
+    ):
+        ingest_txn_node_poscomplete(rows, DIAG / pc)
+    ingest_gcpal_posagg_provenance(rows, DIAG / "gcpal_txn_node_posagg_ablation.json")
+    ingest_gcpal_challenge_fullstack(
+        rows, DIAG / "gcpal_challenge_fullstack_eval.json",
+    )
+    ingest_edge_dplus_neighbor_positive(
+        rows, DIAG / "edge_dplus_neighbor_positive_10ep_seed2.json",
+    )
+    ingest_final_dplus_multiseed_and_finetune(
+        rows, DIAG / "final_dplus_multiseed_and_finetune_analysis.json",
+    )
+    ingest_failed_forensic_provenance(rows)
     ingest_legacy(
         rows,
         DIAG / "supervised_Small-LI_small_li_legacy_supervised_gin_emlps_tds_seed1_scout_summary.json",
@@ -1140,6 +2399,67 @@ def build_registry():
                     (r.get("caveats") or "")
                     + "; width65 PNA; one seed; downstream-only best-stack probe"
                 )
+    tf_aux_epochs = _tf_aux_selected_epochs()
+    for rel in TF_AUX_PROBE_FILES:
+        ingest_temporal_flow_aux_probe(
+            rows, DIAG / rel, selected_epochs=tf_aux_epochs
+        )
+    for rel in TF_SOFT_PROBE_FILES:
+        ingest_temporal_flow_soft_positive_probe(rows, DIAG / rel)
+    for rel in MORPH_OBJ_RECALL_PROBE_FILES:
+        ingest_morphology_objective_recall_probe(rows, DIAG / rel)
+    for rel in DEGFLOW_MULTISEED_PROBE_FILES:
+        p = DIAG / rel
+        if not p.is_file():
+            continue
+        ingest_morphology_objective_recall_probe(
+            rows,
+            p,
+            table_group="degflow_morphology_multiseed_scout",
+            source_note="notes/degflow_morphology_multiseed_scout.md",
+        )
+    for rel in TF_REG_AUX_MULTISEED_PROBE_FILES:
+        p = DIAG / rel
+        if not p.is_file():
+            continue
+        ingest_temporal_flow_aux_probe(
+            rows,
+            p,
+            selected_epochs=tf_aux_epochs,
+            table_group="temporal_flow_regression_aux_multiseed",
+            source_note="notes/temporal_flow_regression_aux_multiseed.md",
+            thesis_role="diagnostic_or_scout",
+            caveats_extra="multiseed_confirmation",
+        )
+    for rel in CTR_RES_PROBE_FILES:
+        p = DIAG / rel
+        if not p.is_file():
+            continue
+        before = len(rows)
+        ingest_temporal_flow_ablation(
+            rows,
+            p,
+            source_note="notes/contrastive_objective_resource_scout.md",
+        )
+        rep_name = "post_embedding_128" if "post128" in rel else "pre_embedding_3h"
+        default_dim = 128 if rep_name == "post_embedding_128" else 198
+        for r in rows[before:]:
+            r["thesis_role"] = "diagnostic_or_scout"
+            r["validation_status"] = "diagnostic_only"
+            r["table_eligible"] = False
+            r["table_group"] = "contrastive_objective_resource_scout"
+            r["scout_or_formal"] = "scout"
+            r["representation_source"] = rep_name
+            r["representation_dim"] = r.get("representation_dim") or default_dim
+            # Fix run_id representation token hardcoded by ablation ingest.
+            rid = str(r.get("run_id") or "")
+            r["run_id"] = rid.replace("|pre_embedding_3h|", f"|{rep_name}|", 1)
+            cave = r.get("caveats") or ""
+            r["caveats"] = (
+                cave
+                + "; contrastive objective resource scout (large_bs / edge_drop); "
+                "no labels in SSL; diagnostic_only; not main-table eligible"
+            )
     classify_thesis_roles(rows)
     resolve_duplicates(rows)
     tf_validation = _temporal_flow_validation_state()
