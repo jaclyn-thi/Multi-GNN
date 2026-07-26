@@ -38,6 +38,10 @@ DEFAULT_EDGE_FEATURE_COLS: Tuple[str, ...] = (
     "Payment Format",
 )
 
+# Historical PaySim notes (documentation only). Runtime behavior is controlled by
+# ``--feature_contract`` (see feature_contracts.py). Omitting the flag preserves
+# the legacy_duplicate mapping described below.
+
 
 @dataclass(frozen=True)
 class EdgeDatasetSpec:

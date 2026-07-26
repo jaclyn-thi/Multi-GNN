@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import statistics
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -17,6 +18,12 @@ import numpy as np
 from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score, roc_auc_score
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# Repo-root imports (Slurm ``python scripts/...`` does not put ROOT on sys.path by default).
+from ranking_metrics import alert_budget_metrics  # noqa: E402
+
 RESULTS_DIR = ROOT / "results" / "diagnostics" / "paysim_dplus_transfer_final"
 PROBA_DIR = RESULTS_DIR / "proba"
 FINAL_JSON = ROOT / "results" / "diagnostics" / "paysim_dplus_transfer_final.json"
@@ -48,8 +55,6 @@ def _stack_metric(role: Dict[str, Any], stack: str, *keys, default=None):
 
 
 def _metrics_block(y: np.ndarray, proba: np.ndarray, thr: float) -> Dict[str, float]:
-    from ranking_metrics import alert_budget_metrics
-
     y = y.astype(np.int64)
     pred = (proba >= float(thr)).astype(np.int64)
     tp = int(((pred == 1) & (y == 1)).sum())
@@ -76,17 +81,26 @@ def _metrics_block(y: np.ndarray, proba: np.ndarray, thr: float) -> Dict[str, fl
 
 
 def _select_threshold_f1(y_val: np.ndarray, proba_val: np.ndarray) -> float:
-    if len(np.unique(y_val)) < 2:
+    """Validation F1 grid search (vectorized counts; safe on ~1e6 rows)."""
+    y = y_val.astype(np.int64)
+    if len(np.unique(y)) < 2:
         return 0.5
+    # Quantile-based candidates keep walltime bounded on large PaySim splits.
+    qs = np.linspace(0.01, 0.99, 99)
+    thrs = np.unique(np.quantile(proba_val.astype(np.float64), qs))
     best_thr, best_f1 = 0.5, -1.0
-    for thr in np.linspace(0.01, 0.99, 99):
-        pred = (proba_val >= thr).astype(np.int64)
-        f1 = float(f1_score(y_val.astype(np.int64), pred, zero_division=0))
+    for thr in thrs:
+        pred = (proba_val >= float(thr)).astype(np.int64)
+        tp = int(((pred == 1) & (y == 1)).sum())
+        fp = int(((pred == 1) & (y == 0)).sum())
+        fn = int(((pred == 0) & (y == 1)).sum())
+        prec = tp / max(tp + fp, 1)
+        rec = tp / max(tp + fn, 1)
+        f1 = 0.0 if (prec + rec) == 0 else (2.0 * prec * rec / (prec + rec))
         if f1 > best_f1:
             best_f1 = f1
             best_thr = float(thr)
     return best_thr
-
 
 def equal_weight_ensemble(
     run_tags: List[str],
@@ -100,20 +114,31 @@ def equal_weight_ensemble(
             raise FileNotFoundError(path)
         packs.append(np.load(path))
 
-    # Common intersection (order = sorted common IDs for determinism)
-    val_sets = [set(p["val_ids"].astype(np.int64).tolist()) for p in packs]
-    te_sets = [set(p["test_ids"].astype(np.int64).tolist()) for p in packs]
-    common_val = sorted(set.intersection(*val_sets))
-    common_te = sorted(set.intersection(*te_sets))
-    common_val_arr = np.asarray(common_val, dtype=np.int64)
-    common_te_arr = np.asarray(common_te, dtype=np.int64)
+    def _common_sorted(arrays: List[np.ndarray]) -> np.ndarray:
+        common = arrays[0].astype(np.int64)
+        for a in arrays[1:]:
+            common = np.intersect1d(common, a.astype(np.int64), assume_unique=False)
+        return np.sort(common)
+
+    common_val_arr = _common_sorted([p["val_ids"] for p in packs])
+    common_te_arr = _common_sorted([p["test_ids"] for p in packs])
 
     def align(pack, split: str, common: np.ndarray):
         ids = pack[f"{split}_ids"].astype(np.int64)
         proba = pack[f"{split}_proba"].astype(np.float64)
         y = pack[f"{split}_y"].astype(np.int64)
-        pos = {int(i): j for j, i in enumerate(ids.tolist())}
-        idx = np.asarray([pos[int(i)] for i in common.tolist()], dtype=np.int64)
+        # Stable align via searchsorted on sorted unique ids; IDs may be unsorted in npz.
+        order = np.argsort(ids)
+        ids_s = ids[order]
+        # Deduplicate if needed (keep first)
+        if ids_s.size and np.any(ids_s[1:] == ids_s[:-1]):
+            uniq, first = np.unique(ids_s, return_index=True)
+            ids_s = uniq
+            order = order[first]
+        idx_s = np.searchsorted(ids_s, common)
+        if np.any(idx_s >= ids_s.size) or not np.array_equal(ids_s[idx_s], common):
+            raise RuntimeError(f"Failed to align {split} IDs for ensemble")
+        idx = order[idx_s]
         return proba[idx], y[idx]
 
     val_probs = []
@@ -140,8 +165,8 @@ def equal_weight_ensemble(
         "weights": "equal",
         "learned_weights": False,
         "logit_average": False,
-        "n_val_intersection": int(len(common_val)),
-        "n_test_intersection": int(len(common_te)),
+        "n_val_intersection": int(len(common_val_arr)),
+        "n_test_intersection": int(len(common_te_arr)),
         "val_ids_sha256": hashlib.sha256(common_val_arr.tobytes()).hexdigest(),
         "test_ids_sha256": hashlib.sha256(common_te_arr.tobytes()).hexdigest(),
         "n_test_positives": int(y_te.sum()),

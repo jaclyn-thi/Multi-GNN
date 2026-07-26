@@ -1,0 +1,81 @@
+# PaySim frozen D+ transfer — final
+
+**PRIMARY:** frozen AMLWorld D+ seeds 1–3 → PaySim pre-3h H+X MLP.
+**SECONDARY:** equal-weight ensemble; AML partial-FT seed-2 transfer.
+**CONTROLS:** X-only, H-only, H+X, random-init D+.
+
+Jobs: smoke 18854060; A 18855316; B 18855317; C 18855318; D 18855319 (all COMPLETED 0:0).
+Slurm aggregate 18855320 failed (`ranking_metrics` import); this note produced by local re-aggregate.
+
+## PRIMARY — pre-3h H+X (three frozen seeds)
+
+| Metric | Mean ± sample SD | Median | Per-seed |
+|--------|-----------------:|-------:|----------|
+| test AUPRC | 0.1116 ± 0.0265 | 0.1090 | [0.1393, 0.0864, 0.109] |
+| test AUROC | 0.6443 ± 0.0851 | 0.6698 | [0.7138, 0.6698, 0.5494] |
+| F1@0.5 | 0.0704 ± 0.0478 | 0.0750 | [0.075, 0.0205, 0.1156] |
+| F1@val-thr | 0.0889 ± 0.0393 | 0.0986 | [0.0986, 0.0456, 0.1224] |
+
+### Per-seed detail (test @0.5)
+
+| Seed | AUROC | AUPRC | F1 | P | R | PPR | P@100/500/1000 | n / pos |
+|-----:|------:|------:|---:|--:|--:|----:|---------------:|--------:|
+| 1 | 0.7138 | 0.1393 | 0.0750 | 1.0000 | 0.0390 | 0.0001 | 1.000/0.760/0.497 | 1293523/4258 |
+| 2 | 0.6698 | 0.0864 | 0.0205 | 1.0000 | 0.0103 | 0.0000 | 0.870/0.518/0.327 | 1293522/4258 |
+| 3 | 0.5494 | 0.1090 | 0.1156 | 0.9597 | 0.0615 | 0.0002 | 1.000/0.716/0.459 | 1293523/4258 |
+
+## CONTROLS / ablations
+
+- **X-only:** AUROC 0.8517, AUPRC 0.0961, F1@0.5 0.0000, F1@val 0.0481
+- **pre-3h H-only** mean AUPRC 0.1068 ± 0.0561 (vs X: higher)
+- **post-128 H+X** mean AUPRC 0.1056 ± 0.0177 (vs pre-3h: worse/similar)
+- **post-128 H-only** mean AUPRC 0.1151 ± 0.0654
+- **random-init** pre3h H AUPRC 0.1076; H+X AUPRC 0.1396
+
+## SECONDARY
+
+- **Equal-weight pre-3h H+X ensemble:** test AUPRC 0.1325, F1@0.5 0.0711; common test IDs 1293522, positives 4258; improves vs mean AUPRC: True
+- **post-128 ensemble:** AUPRC 0.1187, F1@0.5 0.0570
+- **AML partial-FT seed2** pre3h H+X AUPRC 0.0751 vs frozen seed2 0.0864 → FT helps: **False**
+
+## Transfer interpretation
+
+- Incremental H+X AUPRC over X-only is small (~+0.015 mean) with high seed SD.
+- Mean H+X **AUROC is below** X-only AUROC — ranking transfer is not uniformly supportive.
+- Seed2 H-only beats random H on AUPRC; random H+X remains competitive with the primary mean.
+- Cross-dataset transfer is at best **weakly supported on AUPRC**, not a strong absolute claim.
+
+## Claim / limitations
+
+A self-supervised contrastive Multi-GIN encoder (D+) pretrained on AMLWorld Small-HI and evaluated frozen on PaySim with a supervised downstream MLP on pre-3h H+X yields test AUPRC 0.1116 ± 0.0265 and F1@0.5 0.0704 ± 0.0478 over three encoder seeds. Relative to PaySim X-only (AUPRC 0.0961), incremental transfer value is small and unstable across seeds; this is not the historical ports-only ~0.866 logistic diagnostic.
+
+Schema placeholders map PaySim type into AML currency/payment slots without semantic alignment; ports/TDS recomputed on PaySim; test MP uses full timeline; TF deferred; no protocol-compatible published PaySim numerical baseline; random and AML FT encoders are secondary/controls and excluded from the primary mean.
+
+## Final answers
+
+1. Primary pre-3h H+X: AUPRC **0.1116 ± 0.0265**; AUROC **0.6443 ± 0.0851**; F1@0.5 **0.0704 ± 0.0478**
+2. X-only: AUPRC 0.0961, AUROC 0.8517, F1@0.5 0.0000
+3. pre-3h H-only > X-only (AUPRC)? **True**
+4. pre-3h H+X > X-only (AUPRC)? **True**
+5. post-128 better than pre-3h (H+X AUPRC)? **False**
+6. Seed variability (AUPRC SD): **0.0265**; AUROC SD **0.0851**
+7. Pretrained H > random H (seed2)? **True**
+8. pre-3h ensemble improves vs mean? **True** (AUPRC 0.1325)
+9. post-128 ensemble improves vs mean? **True**
+10. FT helps vs frozen seed2? **False**
+11. Cross-dataset transfer supported? **True** (AUPRC H+X mean slightly exceeds X-only, but AUROC mean is below X-only and seed variability is large; random HxX also competitive. Claim is weak/partial.)
+12. Caveats: PaySim type→currency/payment placeholders; ports/TDS on PaySim; train-fit edge z-norm; full-timeline test MP graph; no TF; AML scalers not transferred.
+13. Published comparisons: None protocol-compatible. Do not cite historical ~0.866 ports-only logistic as D+ transfer.
+14. No PaySim labels updated encoders: **True**
+15. No automatic follow-up training: **True**
+
+## Artifact index
+
+- Final note: `notes/paysim_dplus_transfer_final.md`
+- Final JSON: `results/diagnostics/paysim_dplus_transfer_final.json`
+- Role JSONs: `results/diagnostics/paysim_dplus_transfer_final/role_{seed1,seed2,seed3,random_init,ft_seed2}.json`
+- Smoke: `results/diagnostics/paysim_dplus_transfer_final/smoke_seed2.md`
+- Preflight: `notes/paysim_frozen_transfer_preflight.md`
+- Submission status: `notes/paysim_dplus_transfer_submission_status.md`
+- Embeddings: `embeddings/paysim_dplus_transfer_final/`
+- Probabilities: `results/diagnostics/paysim_dplus_transfer_final/proba/`

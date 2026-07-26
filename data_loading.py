@@ -14,6 +14,10 @@ from data_util import (
 )
 from dataset_specs import get_dataset_spec, spec_summary
 from dataset_splits import log_split_label_stats, temporal_edge_split
+from feature_contracts import (
+    apply_feature_contract_to_base_edge_attr,
+    resolve_feature_contract_id,
+)
 from morphology.temporal_flow_edge_features import maybe_append_temporal_flow_edge_features
 from pattern_metadata import (
     load_laundering_pattern_metadata,
@@ -112,6 +116,23 @@ def get_data(args, data_config):
     x = torch.tensor(df_nodes.loc[:, node_features].to_numpy()).float()
     edge_index = torch.LongTensor(df_edges.loc[:, ["from_id", "to_id"]].to_numpy().T)
     edge_attr = torch.tensor(df_edges.loc[:, edge_features].to_numpy()).float()
+
+    # PaySim feature contracts act on base semantic columns only. Omitted flag ⇒
+    # no transform (bit-exact historical path). AMLWorld datasets ignore PaySim IDs.
+    contract_id = resolve_feature_contract_id(getattr(args, "feature_contract", None))
+    contract_summary = None
+    if contract_id is not None:
+        if args.data != "PaySim":
+            raise ValueError(
+                f"--feature_contract={contract_id} is PaySim-only; got --data={args.data}"
+            )
+        edge_attr, contract_summary = apply_feature_contract_to_base_edge_attr(
+            edge_attr, contract_id
+        )
+        logging.info(
+            "Applied feature_contract=%s (neutral→raw 0.0 before ports/TDS/z-norm)",
+            contract_id,
+        )
 
     bucket_sec = 24 * 3600 if spec.split_mode == "calendar_day" else 3600
     n_buckets = int(timestamps.max() / bucket_sec + 1)
@@ -286,6 +307,11 @@ def get_data(args, data_config):
     te_data.csv_edge_ids = torch.LongTensor(df_edges["EdgeID"].astype(np.int64).to_numpy())
     te_data.pattern_metadata_by_edge_id = pattern_metadata_by_edge_id
     te_data.dataset_spec_summary = spec_summary(spec)
+    if contract_summary is not None:
+        tr_data.feature_contract = contract_summary
+        val_data.feature_contract = contract_summary
+        te_data.feature_contract = contract_summary
+        args.feature_contract_summary = contract_summary
 
     _stage_tick(args, "get_data_total_sec", t_all)
     return tr_data, val_data, te_data, tr_inds, val_inds, te_inds

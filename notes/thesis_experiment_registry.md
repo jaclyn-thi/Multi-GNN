@@ -131,3 +131,9 @@ Distinct evaluations (same checkpoint, different stack/rep/threshold) are **not*
 1. HI 40ep seed2: `training_epochs=40`, `selected_epoch=36` (best ckpt) — both fields preserved.
 2. Feature ablation F1 on full test vs paired strong-run — use strong-run for pre/post tables only.
 3. PNA capacity-matched comparison still pending (separate workstream).
+
+
+## PaySim preserve/normalization ablation (diagnostic)
+
+- See `/orcd/home/002/jthi/ondemand/data/sys/myjobs/projects/Multi-GNN/notes/paysim_preserve_normalization_ablation.md` / `/orcd/home/002/jthi/ondemand/data/sys/myjobs/projects/Multi-GNN/results/diagnostics/paysim_preserve_normalization_ablation.json`
+- A train-fit AUROC=0.8668; B per-graph AUROC=0.8331

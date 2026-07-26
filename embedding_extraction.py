@@ -167,7 +167,13 @@ def run_embedding_extraction(
     # the current 128-d embeddings are never overwritten.
     if representation_source != "post_embedding":
         out_dir = out_dir / representation_source
-    out_dir.mkdir(parents=True, exist_ok=True)
+    contract_id = getattr(args, "feature_contract", None)
+    if contract_id:
+        from feature_contracts import ensure_contract_output_dir
+
+        ensure_contract_output_dir(out_dir, str(contract_id))
+    else:
+        out_dir.mkdir(parents=True, exist_ok=True)
 
     split_filter = {
         s.strip().lower()
@@ -248,6 +254,13 @@ def run_embedding_extraction(
         "tds": bool(args.tds),
         "ego": bool(args.ego),
         "emlps": bool(args.emlps),
+        "correct_reverse_edge_features": bool(
+            getattr(args, "correct_reverse_edge_features", False)
+        ),
+        "train_fit_edge_znorm": bool(getattr(args, "train_fit_edge_znorm", False)),
+        "feature_contract_id": getattr(args, "feature_contract", None),
+        "feature_contract": getattr(args, "feature_contract_summary", None)
+        or getattr(te_data, "feature_contract", None),
         "include_temporal_flow_edge_features": bool(
             getattr(args, "include_temporal_flow_edge_features", False)
         ),

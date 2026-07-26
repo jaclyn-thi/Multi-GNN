@@ -167,6 +167,17 @@ def create_parser():
             "claims such as AMLWorld→PaySim frozen D+)."
         ),
     )
+    parser.add_argument(
+        "--feature_contract",
+        type=str,
+        default=None,
+        help=(
+            "Optional versioned PaySim edge-feature contract ID "
+            "(e.g. paysim_type_only_v1). Omit for bit-exact historical PaySim "
+            "loading (type duplicated into currency + payment-format). "
+            "PaySim-only; does not alter AMLWorld datasets."
+        ),
+    )
 
     # Contrastive / memory (homogeneous training path)
     parser.add_argument(
