@@ -137,3 +137,9 @@ Distinct evaluations (same checkpoint, different stack/rep/threshold) are **not*
 
 - See `/orcd/home/002/jthi/ondemand/data/sys/myjobs/projects/Multi-GNN/notes/paysim_preserve_normalization_ablation.md` / `/orcd/home/002/jthi/ondemand/data/sys/myjobs/projects/Multi-GNN/results/diagnostics/paysim_preserve_normalization_ablation.json`
 - A train-fit AUROC=0.8668; B per-graph AUROC=0.8331
+
+
+## final_corrected_no_preserve_multiseed
+
+- See `/orcd/home/002/jthi/ondemand/data/sys/myjobs/projects/Multi-GNN/notes/final_corrected_no_preserve_multiseed.md` / `/orcd/home/002/jthi/ondemand/data/sys/myjobs/projects/Multi-GNN/results/diagnostics/final_corrected_no_preserve_multiseed.json`
+- Appended 2 registry row(s); historical rows unchanged.

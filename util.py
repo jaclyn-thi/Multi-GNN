@@ -74,6 +74,16 @@ def create_parser():
     #Model parameters
     parser.add_argument("--batch_size", default=8192, type=int, help="Select the batch size for GNN training")
     parser.add_argument("--n_epochs", default=100, type=int, help="Select the number of epochs for GNN training")
+    parser.add_argument(
+        "--max_optimizer_steps",
+        type=int,
+        default=0,
+        help=(
+            "If >0, stop contrastive training after this many optimizer.step() calls "
+            "(across epochs). 0 = run all --n_epochs. Used for fixed-budget continuation "
+            "scouts and short smokes."
+        ),
+    )
     parser.add_argument('--num_neighs', nargs='+', type=int, default=[100,100], help='Pass the number of neighors to be sampled in each hop (descending).')
 
     #Misc
@@ -439,6 +449,25 @@ def create_parser():
         ),
     )
     parser.add_argument(
+        "--semantic_group_mask",
+        action="store_true",
+        help=(
+            "Enable schema-level categorical group masking on contrastive views: "
+            "independently zero the currency and/or payment-format columns for all edges "
+            "in a view (forward/reverse share the decision). Clean extraction never applies this."
+        ),
+    )
+    parser.add_argument(
+        "--categorical_group_mask_prob",
+        type=float,
+        default=0.0,
+        help=(
+            "Per-group Bernoulli probability for --semantic_group_mask "
+            "(independent for currency and payment-format; independent across views). "
+            "0.0 is a no-op even when --semantic_group_mask is set."
+        ),
+    )
+    parser.add_argument(
         "--edge_drop_min_prob",
         type=float,
         default=0.01,
@@ -673,6 +702,16 @@ def create_parser():
         type=float,
         default=1.0,
         help="Weight for morphology expert loss vs InfoNCE.",
+    )
+    parser.add_argument(
+        "--morph_expert_init_seed",
+        type=int,
+        default=None,
+        help=(
+            "If set with --morph_expert, reseed RNG only while constructing the morphology "
+            "expert head, then restore --seed. Records a separate morph-head init seed for "
+            "continuation scouts where the base encoder is loaded from a checkpoint."
+        ),
     )
     parser.add_argument(
         "--morph_expert_hidden",

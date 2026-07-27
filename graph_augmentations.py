@@ -385,6 +385,116 @@ def mask_edge_attr(
     return out
 
 
+# Semantic base-slot indices within the ports/TDS schema (no synthetic ID column).
+# Layout after attach_edge_id_from_batch strips the arange id:
+#   [Timestamp, Amount, Currency, PaymentFormat] + [in_port, out_port]? + [in_td, out_td]?
+SEMANTIC_CURRENCY_BASE_INDEX = 2
+SEMANTIC_PAYMENT_FORMAT_BASE_INDEX = 3
+
+
+def resolve_semantic_categorical_indices(
+    edge_dim: int,
+    *,
+    ports: bool,
+    tds: bool,
+    id_column_present: bool = False,
+) -> Dict[str, int]:
+    """Map currency / payment-format slots using authoritative layout metadata.
+
+    Does **not** use trailing-column heuristics (ports/TDS follow the base slots).
+    """
+    from data_util import resolve_directional_edge_feature_schema
+
+    offset = 1 if id_column_present else 0
+    feature_dim = int(edge_dim) - offset
+    schema = resolve_directional_edge_feature_schema(feature_dim, ports=ports, tds=tds)
+    if schema["base_dim"] < 4:
+        raise ValueError(
+            f"semantic group mask requires base_dim>=4, got {schema['base_dim']} "
+            f"(edge_dim={edge_dim}, id_column_present={id_column_present})"
+        )
+    return {
+        "currency": offset + SEMANTIC_CURRENCY_BASE_INDEX,
+        "payment_format": offset + SEMANTIC_PAYMENT_FORMAT_BASE_INDEX,
+        "schema": schema,
+        "offset": offset,
+    }
+
+
+def sample_semantic_group_mask_state(
+    categorical_group_mask_prob: float,
+    *,
+    generator: Optional[torch.Generator] = None,
+    device: Optional[torch.device] = None,
+) -> Dict[str, bool]:
+    """One Bernoulli decision per categorical group for a whole view/batch."""
+    if not (0.0 <= float(categorical_group_mask_prob) <= 1.0):
+        raise ValueError(
+            f"categorical_group_mask_prob must be in [0, 1], got {categorical_group_mask_prob}"
+        )
+    p = float(categorical_group_mask_prob)
+    if p <= 0.0:
+        return {"mask_currency": False, "mask_payment_format": False}
+    # Sample two independent uniforms; keep device optional for CPU unit tests.
+    if generator is None:
+        u = torch.rand(2, device=device)
+    else:
+        u = torch.rand(2, generator=generator, device=device)
+    return {
+        "mask_currency": bool(u[0].item() < p),
+        "mask_payment_format": bool(u[1].item() < p),
+    }
+
+
+def apply_semantic_group_mask(
+    edge_attr: torch.Tensor,
+    state: Dict[str, bool],
+    *,
+    ports: bool,
+    tds: bool,
+    id_column_present: bool = False,
+    mask_value: float = 0.0,
+) -> torch.Tensor:
+    """Zero selected semantic columns for **all** edges (schema-level group mask).
+
+    Currency and/or payment-format columns only. Timestamp, Amount, ports, and TDS
+    are never modified by this mechanism.
+    """
+    if edge_attr is None or edge_attr.numel() == 0:
+        return edge_attr
+    if not state.get("mask_currency", False) and not state.get("mask_payment_format", False):
+        return edge_attr
+
+    idx = resolve_semantic_categorical_indices(
+        int(edge_attr.shape[1]),
+        ports=ports,
+        tds=tds,
+        id_column_present=id_column_present,
+    )
+    out = edge_attr.clone()
+    if state.get("mask_currency", False):
+        out[:, idx["currency"]] = mask_value
+    if state.get("mask_payment_format", False):
+        out[:, idx["payment_format"]] = mask_value
+    return out
+
+
+def _accumulate_semantic_mask_stats(
+    stats: Optional[Dict[str, float]],
+    *,
+    view_tag: str,
+    state: Dict[str, bool],
+) -> None:
+    if stats is None:
+        return
+    stats[f"semantic_mask_currency_{view_tag}"] = stats.get(
+        f"semantic_mask_currency_{view_tag}", 0.0
+    ) + float(bool(state.get("mask_currency", False)))
+    stats[f"semantic_mask_payment_format_{view_tag}"] = stats.get(
+        f"semantic_mask_payment_format_{view_tag}", 0.0
+    ) + float(bool(state.get("mask_payment_format", False)))
+
+
 def generate_views(
     data,
     edge_attr_mask_rate=0.1,
@@ -398,6 +508,11 @@ def generate_views(
     *,
     seed_edge_ids: Optional[torch.Tensor] = None,
     preserve_seed_edges: bool = False,
+    semantic_group_mask: bool = False,
+    categorical_group_mask_prob: float = 0.0,
+    semantic_mask_ports: bool = True,
+    semantic_mask_tds: bool = True,
+    semantic_mask_generator: Optional[torch.Generator] = None,
 ):
     """
     Two augmented views for edge-level contrastive learning.
@@ -409,7 +524,12 @@ def generate_views(
       ``degree_aware`` / ``degree_flow_aware`` use calibrated per-edge
       probabilities from ``edge_drop_cache``.
     - If ``edge_attr_mask_rate > 0``: independent edge-attribute masking on the
-      surviving edges of each view.
+      surviving edges of each view (GraphCL-style per-cell Bernoulli).
+    - If ``semantic_group_mask`` and ``categorical_group_mask_prob > 0``: once per
+      view, independently decide whether to zero the currency and/or payment-format
+      **entire columns** (all edges). Forward/reverse copies of a view share the
+      same schema state; view1 and view2 sample independently. Ports/TDS and
+      Timestamp/Amount are never masked by this mechanism.
     - If ``preserve_seed_edges`` is True, edges whose ``edge_id`` is in
       ``seed_edge_ids`` are force-kept in both views (opt-in). This retains the
       seed *relation* in the message-passing graph; it is an approximation of
@@ -419,8 +539,9 @@ def generate_views(
     Does not mutate ``data`` (including ``data.edge_attr`` / ``data.edge_id``).
 
     For ``HeteroData``, edge drops are synchronized across forward and reverse edge
-    types by transaction ``edge_id``; attribute masking is applied independently per
-    view on both edge types.
+    types by transaction ``edge_id``; GraphCL attribute masking is applied
+    independently per view on both edge types; semantic group masks are shared
+    across forward/reverse within each view.
     """
     if preserve_seed_edges and (seed_edge_ids is None or seed_edge_ids.numel() == 0):
         raise ValueError("preserve_seed_edges=True requires non-empty seed_edge_ids")
@@ -435,11 +556,15 @@ def generate_views(
         )
         edge_drop_stats["edge_drop_policy"] = edge_drop_policy
         edge_drop_stats["preserve_seed_edges"] = bool(preserve_seed_edges)
+        edge_drop_stats["semantic_group_mask"] = bool(semantic_group_mask)
+        edge_drop_stats["categorical_group_mask_prob"] = float(categorical_group_mask_prob)
 
     drop_kw = {
         "seed_edge_ids": seed_edge_ids,
         "preserve_seed_edges": bool(preserve_seed_edges),
     }
+
+    apply_semantic = bool(semantic_group_mask) and float(categorical_group_mask_prob) > 0.0
 
     if isinstance(data, HeteroData):
         if use_policy:
@@ -476,6 +601,39 @@ def generate_views(
                         mask_cols=mask_cols,
                         exclude_last_column=exclude_last_column,
                     )
+        if apply_semantic:
+            device = view1[FORWARD_EDGE_TYPE].edge_attr.device
+            state1 = sample_semantic_group_mask_state(
+                categorical_group_mask_prob, generator=semantic_mask_generator, device=device
+            )
+            state2 = sample_semantic_group_mask_state(
+                categorical_group_mask_prob, generator=semantic_mask_generator, device=device
+            )
+            for et in (FORWARD_EDGE_TYPE, REVERSE_EDGE_TYPE):
+                if view1[et].edge_attr is not None:
+                    view1[et].edge_attr = apply_semantic_group_mask(
+                        view1[et].edge_attr,
+                        state1,
+                        ports=semantic_mask_ports,
+                        tds=semantic_mask_tds,
+                        mask_value=mask_value,
+                    )
+                if view2[et].edge_attr is not None:
+                    view2[et].edge_attr = apply_semantic_group_mask(
+                        view2[et].edge_attr,
+                        state2,
+                        ports=semantic_mask_ports,
+                        tds=semantic_mask_tds,
+                        mask_value=mask_value,
+                    )
+            _accumulate_semantic_mask_stats(edge_drop_stats, view_tag="v1", state=state1)
+            _accumulate_semantic_mask_stats(edge_drop_stats, view_tag="v2", state=state2)
+            if edge_drop_stats is not None:
+                edge_drop_stats["semantic_mask_batches"] = (
+                    edge_drop_stats.get("semantic_mask_batches", 0.0) + 1.0
+                )
+                edge_drop_stats["last_semantic_state_v1"] = dict(state1)
+                edge_drop_stats["last_semantic_state_v2"] = dict(state2)
         return view1, view2
 
     if use_policy:
@@ -511,6 +669,36 @@ def generate_views(
             mask_cols=mask_cols,
             exclude_last_column=exclude_last_column,
         )
+    if apply_semantic and view1.edge_attr is not None:
+        device = view1.edge_attr.device
+        state1 = sample_semantic_group_mask_state(
+            categorical_group_mask_prob, generator=semantic_mask_generator, device=device
+        )
+        state2 = sample_semantic_group_mask_state(
+            categorical_group_mask_prob, generator=semantic_mask_generator, device=device
+        )
+        view1.edge_attr = apply_semantic_group_mask(
+            view1.edge_attr,
+            state1,
+            ports=semantic_mask_ports,
+            tds=semantic_mask_tds,
+            mask_value=mask_value,
+        )
+        view2.edge_attr = apply_semantic_group_mask(
+            view2.edge_attr,
+            state2,
+            ports=semantic_mask_ports,
+            tds=semantic_mask_tds,
+            mask_value=mask_value,
+        )
+        _accumulate_semantic_mask_stats(edge_drop_stats, view_tag="v1", state=state1)
+        _accumulate_semantic_mask_stats(edge_drop_stats, view_tag="v2", state=state2)
+        if edge_drop_stats is not None:
+            edge_drop_stats["semantic_mask_batches"] = (
+                edge_drop_stats.get("semantic_mask_batches", 0.0) + 1.0
+            )
+            edge_drop_stats["last_semantic_state_v1"] = dict(state1)
+            edge_drop_stats["last_semantic_state_v2"] = dict(state2)
     return view1, view2
 
 

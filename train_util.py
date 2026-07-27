@@ -1798,17 +1798,36 @@ def _write_supervised_summary_md(path: Path, summary: Dict[str, Any]) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def load_model(model, device, args, config, data_config):
+def load_model(model, device, args, config, data_config, *, load_optimizer: bool = True):
+    """Load ``checkpoint_{unique_name}.tar`` weights (and optionally Adam state).
+
+    Parameters
+    ----------
+    load_optimizer :
+        If True (default), restore ``optimizer_state_dict`` strictly — used for
+        true resume paths. If False, load weights only and return a freshly
+        initialized Adam on ``model.parameters()``; callers that continue with
+        projection/aux heads must rebuild Adam over the full param set
+        (``checkpoint_weight_continuation_with_optimizer_reset``).
+    """
     path = Path(data_config["paths"]["model_to_load"]) / f"checkpoint_{args.unique_name}.tar"
     checkpoint = torch.load(path, map_location=device)
     from morphology.temporal_flow_edge_features import assert_checkpoint_tf_edge_features_flag
 
     assert_checkpoint_tf_edge_features_flag(checkpoint, args, path=path)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-
+    if load_optimizer:
+        if "optimizer_state_dict" not in checkpoint:
+            raise KeyError(f"checkpoint missing optimizer_state_dict: {path}")
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    else:
+        logging.info(
+            "load_model: load_optimizer=False — weights loaded from %s; "
+            "Adam freshly initialized (weight continuation / optimizer reset)",
+            path,
+        )
     return model, optimizer
 
 

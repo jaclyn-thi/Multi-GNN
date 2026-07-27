@@ -9,11 +9,16 @@ Contrastive paths (``train_homo_contrastive``, ``train_hetero_contrastive``):
 Supervised paths retain original in-graph CE + F1 evaluation.
 """
 
+import hashlib
+import logging
+import random
+import numpy as np
 import torch
 import tqdm
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from torch.cuda.amp import GradScaler, autocast
 from sklearn.metrics import f1_score
+from util import set_seed
 from train_util import (
     AddEgoIds,
     extract_param,
@@ -93,7 +98,31 @@ from masked_edge import (
     setup_masked_edge_decoder,
 )
 import wandb
-import logging
+
+
+def _setup_morphology_expert_isolated_rng(args, tr_data, device, is_hetero: bool, morph_init_seed: int):
+    """Build the morph expert under an isolated RNG so global train RNG is unchanged.
+
+    Saves and restores complete CPU/CUDA torch RNG state plus numpy/python RNGs.
+    Does **not** call ``set_seed`` (which would mutate PYTHONHASHSEED / global state).
+    """
+    cpu_state = torch.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    np_state = np.random.get_state()
+    py_state = random.getstate()
+    try:
+        torch.manual_seed(int(morph_init_seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(morph_init_seed))
+        np.random.seed(int(morph_init_seed))
+        random.seed(int(morph_init_seed))
+        return setup_morphology_expert(args, tr_data, device, is_hetero)
+    finally:
+        torch.set_rng_state(cpu_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+        np.random.set_state(np_state)
+        random.setstate(py_state)
 
 
 def _log_tf_soft_pos_stats(prefix: str, stats: dict) -> None:
@@ -240,6 +269,12 @@ def _contrastive_view_kwargs(
         "edge_drop_stats": edge_drop_stats,
         "seed_edge_ids": seed_edge_ids,
         "preserve_seed_edges": bool(getattr(args, "preserve_seed_edges", False)),
+        "semantic_group_mask": bool(getattr(args, "semantic_group_mask", False)),
+        "categorical_group_mask_prob": float(
+            getattr(args, "categorical_group_mask_prob", 0.0)
+        ),
+        "semantic_mask_ports": bool(getattr(args, "ports", False)),
+        "semantic_mask_tds": bool(getattr(args, "tds", False)),
     }
 
 
@@ -250,6 +285,23 @@ def _log_edge_drop_stats(prefix: str, stats: dict) -> None:
     v2_dropped = float(stats.get("edges_dropped_v2", 0.0))
     v1_total = v1_kept + v1_dropped
     v2_total = v2_kept + v2_dropped
+    n_sem = float(stats.get("semantic_mask_batches", 0.0))
+    if n_sem > 0:
+        logging.info(
+            "%s semantic group mask: p=%.4f "
+            "currency_rate_v1=%.4f currency_rate_v2=%.4f "
+            "payment_format_rate_v1=%.4f payment_format_rate_v2=%.4f "
+            "last_v1=%s last_v2=%s batches=%d",
+            prefix,
+            float(stats.get("categorical_group_mask_prob", float("nan"))),
+            float(stats.get("semantic_mask_currency_v1", 0.0)) / n_sem,
+            float(stats.get("semantic_mask_currency_v2", 0.0)) / n_sem,
+            float(stats.get("semantic_mask_payment_format_v1", 0.0)) / n_sem,
+            float(stats.get("semantic_mask_payment_format_v2", 0.0)) / n_sem,
+            stats.get("last_semantic_state_v1"),
+            stats.get("last_semantic_state_v2"),
+            int(n_sem),
+        )
     if v1_total <= 0 and v2_total <= 0:
         return
     target = float(stats.get("target_drop_rate", float("nan")))
@@ -976,7 +1028,26 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
         int(getattr(args, "batch_size", 0)) * int(accum_steps),
     )
 
+    max_optimizer_steps = int(getattr(args, "max_optimizer_steps", 0) or 0)
+    total_optimizer_steps = 0
+    hit_max_optimizer_steps = False
+    if max_optimizer_steps > 0:
+        logging.info(
+            "Contrastive max_optimizer_steps=%s (will stop mid-run when reached)",
+            max_optimizer_steps,
+        )
+
+    # Common stream barrier for matched-configuration ablations: both C0 and M
+    # (and any morph-init isolation) start loader iteration from the same seed.
+    set_seed(int(getattr(args, "seed", 0)))
+    logging.info(
+        "Training-stream RNG barrier: set_seed(%s) immediately before loader iteration",
+        int(getattr(args, "seed", 0)),
+    )
+
     for epoch in range(config.epochs):
+        if hit_max_optimizer_steps:
+            break
         total_examples = 0
         optimizer_steps = 0
         requested_seed_sum = 0
@@ -996,8 +1067,20 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
         edge_drop_stats = dict()
         optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(tqdm.tqdm(tr_loader, disable=not args.tqdm)):
+            if hit_max_optimizer_steps:
+                break
             seed_edge_ids = get_hetero_seed_edge_ids(batch, tr_loader.data)
             attach_edge_id_from_batch(batch, tr_loader.data)
+            if max_optimizer_steps > 0 and step < 32:
+                ids_cpu = seed_edge_ids.detach().cpu().contiguous().numpy()
+                logging.info(
+                    "scout_batch_log epoch=%s step=%s seed_ids_sha256=%s n_seeds=%s "
+                    "(diagnostic only; exact_batch_pairing=false)",
+                    epoch,
+                    step,
+                    hashlib.sha256(ids_cpu.tobytes()).hexdigest(),
+                    int(ids_cpu.size),
+                )
 
             batch.to(device, non_blocking=True)
             seed_edge_ids = seed_edge_ids.to(device, non_blocking=True)
@@ -1225,6 +1308,15 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 optimizer_steps += 1
+                total_optimizer_steps += 1
+                if max_optimizer_steps > 0 and total_optimizer_steps >= max_optimizer_steps:
+                    hit_max_optimizer_steps = True
+                    logging.info(
+                        "Reached max_optimizer_steps=%s (epoch=%s microbatch=%s); stopping.",
+                        max_optimizer_steps,
+                        epoch + 1,
+                        step + 1,
+                    )
 
             if memory_queue is not None and seed_id2.numel() > 0:
                 z2_queue = project_seeds(proj_head, z2_seed)
@@ -1337,6 +1429,11 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
             )
         wandb.log(log_payload, step=epoch)
 
+    logging.info(
+        "Contrastive training finished: total_optimizer_steps=%s max_optimizer_steps=%s",
+        total_optimizer_steps,
+        max_optimizer_steps if max_optimizer_steps > 0 else "unlimited",
+    )
     ckpt_tracker.finalize(config.epochs - 1, model, optimizer, args, data_config)
     return model
 
@@ -1734,9 +1831,28 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
     if args.reverse_mp:
         model = to_hetero(model, te_data.metadata(), aggr='mean')
 
-    morph_head, morph_cfg = setup_morphology_expert(args, tr_data, device, setup.is_hetero)
+    morph_init_seed = getattr(args, "morph_expert_init_seed", None)
+    if morph_init_seed is not None and bool(getattr(args, "morph_expert", False)):
+        logging.info(
+            "Morphology expert head init seed=%s (isolated RNG save/restore; "
+            "global training RNG unchanged)",
+            int(morph_init_seed),
+        )
+        morph_head, morph_cfg = _setup_morphology_expert_isolated_rng(
+            args, tr_data, device, setup.is_hetero, int(morph_init_seed)
+        )
+    else:
+        morph_head, morph_cfg = setup_morphology_expert(args, tr_data, device, setup.is_hetero)
     args.morph_expert_head = morph_head
     args.morph_expert_cfg = morph_cfg
+    if morph_head is not None:
+        logging.info(
+            "Morphology expert present: target_groups=%s loss_weight=%.6f layout=%s init_seed=%s",
+            getattr(morph_cfg, "target_groups", ()),
+            float(getattr(morph_cfg, "loss_weight", 1.0)),
+            getattr(morph_cfg, "layout", "shared"),
+            morph_init_seed,
+        )
     morph_contrast_cfg = setup_morphology_contrast(args, device)
     args.morph_contrast_cfg = morph_contrast_cfg
     proj_head = setup_contrastive_projection(args, device, embedding_dim=model_embedding_dim)
@@ -1810,7 +1926,12 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
         args._morph_contrast_edge_native_dim = 0
 
     if args.finetune:
-        model, optimizer = load_model(model, device, args, config, data_config)
+        # Weight continuation: load encoder weights only; Adam is rebuilt below over the
+        # full trainable set (model + proj + optional morph). True resume must call
+        # load_model(..., load_optimizer=True) instead of this path.
+        model, optimizer = load_model(
+            model, device, args, config, data_config, load_optimizer=False
+        )
         load_checkpoint_auxiliary_modules(args, data_config, device)
         opt_params = list(model.parameters())
         if morph_head is not None:
@@ -1826,6 +1947,10 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
         if masked_spec is not None and masked_spec.learned_mask_tokens is not None:
             opt_params += list(masked_spec.learned_mask_tokens.parameters())
         optimizer = torch.optim.Adam(opt_params, lr=config.lr)
+        logging.info(
+            "Optimizer provenance: checkpoint_weight_continuation_with_optimizer_reset "
+            "(loaded weights via --finetune with load_optimizer=False; Adam state freshly constructed)"
+        )
     else:
         opt_params = list(model.parameters())
         if morph_head is not None:
@@ -1857,10 +1982,13 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
         )
     if setup.is_contrastive:
         logging.info(
-            "Contrastive view aug: edge_drop_target_rate=%.4f edge_attr_mask_rate=%.4f policy=%s",
+            "Contrastive view aug: edge_drop_target_rate=%.4f edge_attr_mask_rate=%.4f policy=%s "
+            "semantic_group_mask=%s categorical_group_mask_prob=%.4f",
             float(getattr(args, "edge_drop_target_rate", 0.1)),
             float(getattr(args, "edge_attr_mask_rate", 0.1)),
             getattr(args, "edge_drop_policy", "random"),
+            bool(getattr(args, "semantic_group_mask", False)),
+            float(getattr(args, "categorical_group_mask_prob", 0.0)),
         )
 
     sample_batch.to(device)
