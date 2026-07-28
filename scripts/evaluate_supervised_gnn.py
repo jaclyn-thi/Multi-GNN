@@ -90,9 +90,27 @@ def split_metrics(y: np.ndarray, proba: np.ndarray, tuned_threshold: float) -> D
     else:
         auroc = float(roc_auc_score(y, proba))
         auprc = float(average_precision_score(y, proba))
+
+    def _counts(pred: np.ndarray) -> Dict[str, float]:
+        tp = float(((pred == 1) & (y == 1)).sum())
+        fp = float(((pred == 1) & (y == 0)).sum())
+        tn = float(((pred == 0) & (y == 0)).sum())
+        fn = float(((pred == 0) & (y == 1)).sum())
+        return {
+            "tp": tp,
+            "fp": fp,
+            "tn": tn,
+            "fn": fn,
+            "positive_prediction_rate": float(pred.mean()) if y.size else 0.0,
+            "n_positives": float(int(y.sum())),
+        }
+
+    argmax_counts = _counts(argmax_pred)
+    tuned_counts = _counts(tuned_pred)
     return {
         "n": float(y.shape[0]),
         "positive_rate": float(y.mean()) if y.shape[0] else float("nan"),
+        "n_positives": float(int(y.sum())),
         "auroc": auroc,
         "auprc": auprc,
         "paper_argmax": {
@@ -101,6 +119,7 @@ def split_metrics(y: np.ndarray, proba: np.ndarray, tuned_threshold: float) -> D
             "recall": float(recall_score(y, argmax_pred, zero_division=0)),
             "decision_rule": "argmax over two-class logits",
             "note": "Primary reproduction metric (paper-compatible).",
+            **argmax_counts,
         },
         "validation_tuned_threshold": {
             "f1": float(f1_score(y, tuned_pred, zero_division=0)),
@@ -109,6 +128,7 @@ def split_metrics(y: np.ndarray, proba: np.ndarray, tuned_threshold: float) -> D
             "threshold": float(tuned_threshold),
             "threshold_source": "max_f1_on_validation_softmax_prob",
             "note": "NOT paper-compatible; do not compare to paper_argmax.",
+            **tuned_counts,
         },
         "alert_budget": alert_budget_metrics(y, proba),
     }
