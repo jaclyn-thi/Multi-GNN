@@ -496,9 +496,13 @@ def _infonce_row_chunk_for_neg_subsample(
     k_neg: int,
     embed_dim: int,
     *,
-    max_neg_tensor_bytes: int = 256 * 1024 * 1024,
+    max_neg_tensor_bytes: int = 128 * 1024 * 1024,
 ) -> int:
-    """Shrink row batches so ``neg_z`` stays under ~256 MiB (rows × k_neg × D × 4)."""
+    """Shrink row batches so ``neg_z`` stays under ~128 MiB (rows × k_neg × D × 4).
+
+    Tightened from 256 MiB so DIRECT_H (D=198) retains headroom after the hetero GNN
+    forward on Large-HI-scale neighbor batches.
+    """
     if k_neg <= 0 or embed_dim <= 0:
         return row_chunk
     bytes_per_row = k_neg * embed_dim * 4
@@ -510,16 +514,16 @@ def _neg_k_chunk_for_subsample(
     row_chunk: int,
     embed_dim: int,
     *,
-    max_neg_tensor_bytes: int = 32 * 1024 * 1024,
+    max_neg_tensor_bytes: int = 16 * 1024 * 1024,
 ) -> int:
-    """Chunk size along the negative axis (rows × k_chunk × D × 4 ≤ ~32 MiB)."""
+    """Chunk size along the negative axis (rows × k_chunk × D × 4 ≤ ~16 MiB)."""
     if row_chunk <= 0 or embed_dim <= 0:
         return 128
     k_chunk = max_neg_tensor_bytes // (row_chunk * embed_dim * 4)
     return max(1, int(k_chunk))
 
 
-def _neg_logsumexp_subsampled(
+def _neg_logsumexp_subsampled_values(
     z_b: torch.Tensor,
     candidate_z: torch.Tensor,
     neg_idx: torch.Tensor,
@@ -528,7 +532,7 @@ def _neg_logsumexp_subsampled(
     *,
     k_chunk: int,
 ) -> torch.Tensor:
-    """Logsumexp over subsampled negatives without materializing (rows, k_neg, D)."""
+    """Forward values only (no autograd through B×K×D products)."""
     k_neg = int(neg_idx.shape[1])
     log_neg = None
     for k0 in range(0, k_neg, k_chunk):
@@ -540,9 +544,84 @@ def _neg_logsumexp_subsampled(
         logits = torch.where(valid_slice, logits, torch.full_like(logits, float("-inf")))
         ls = logits.logsumexp(dim=1)
         log_neg = ls if log_neg is None else torch.logaddexp(log_neg, ls)
+        del neg_z, logits, ls, idx_slice, valid_slice
     if log_neg is None:
         return z_b.new_full((z_b.shape[0],), float("-inf"))
     return log_neg
+
+
+class _NegLogsumexpSubsampledFn(torch.autograd.Function):
+    """Memory-safe subsampled neg logsumexp: no retained B×K×D intermediates.
+
+    Chunking alone does not reduce peak during ``loss.backward()`` when every
+    row-chunk's 3D products stay in the autograd graph. This Function saves only
+    ``(z_b, candidate_z, neg_idx, valid)`` and recomputes chunk weights in backward.
+    Exact for InfoNCE; required for DIRECT_H (D=198) at 8192×8192.
+    """
+
+    @staticmethod
+    def forward(ctx, z_b, candidate_z, neg_idx, valid, temperature, k_chunk):
+        ctx.temperature = float(temperature)
+        ctx.k_chunk = int(k_chunk)
+        ctx.save_for_backward(z_b, candidate_z, neg_idx, valid)
+        with torch.no_grad():
+            out = _neg_logsumexp_subsampled_values(
+                z_b, candidate_z, neg_idx, valid, ctx.temperature, k_chunk=ctx.k_chunk
+            )
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        z_b, candidate_z, neg_idx, valid = ctx.saved_tensors
+        temperature = ctx.temperature
+        k_chunk = ctx.k_chunk
+        with torch.no_grad():
+            log_neg = _neg_logsumexp_subsampled_values(
+                z_b, candidate_z, neg_idx, valid, temperature, k_chunk=k_chunk
+            )
+            grad_z_b = torch.zeros_like(z_b)
+            grad_cand = torch.zeros_like(candidate_z)
+            k_neg = int(neg_idx.shape[1])
+            go = grad_output.reshape(-1)
+            for k0 in range(0, k_neg, k_chunk):
+                k1 = min(k0 + k_chunk, k_neg)
+                idx_slice = neg_idx[:, k0:k1].clamp(min=0)
+                valid_slice = valid[:, k0:k1]
+                neg_z = candidate_z[idx_slice]
+                logits = (z_b.unsqueeze(1) * neg_z).sum(dim=-1) / temperature
+                logits = torch.where(valid_slice, logits, torch.full_like(logits, float("-inf")))
+                # softmax weights over *all* negatives via (logit - log_neg)
+                w = torch.exp(logits - log_neg.unsqueeze(1))
+                w = torch.where(valid_slice, w, torch.zeros_like(w))
+                w = w * go.unsqueeze(1)
+                grad_z_b = grad_z_b + (w.unsqueeze(-1) * neg_z).sum(dim=1) / temperature
+                g_neg = w.unsqueeze(-1) * z_b.unsqueeze(1) / temperature
+                flat_idx = idx_slice.reshape(-1)
+                flat_g = g_neg.reshape(-1, g_neg.shape[-1])
+                flat_valid = valid_slice.reshape(-1)
+                if bool(flat_valid.any()):
+                    grad_cand.index_add_(0, flat_idx[flat_valid], flat_g[flat_valid])
+                del neg_z, logits, w, g_neg, idx_slice, valid_slice
+        return grad_z_b, grad_cand, None, None, None, None
+
+
+def _neg_logsumexp_subsampled(
+    z_b: torch.Tensor,
+    candidate_z: torch.Tensor,
+    neg_idx: torch.Tensor,
+    valid: torch.Tensor,
+    temperature: float,
+    *,
+    k_chunk: int,
+) -> torch.Tensor:
+    """Logsumexp over subsampled negatives without retaining (rows, k_neg, D) for backward."""
+    if not z_b.requires_grad and not candidate_z.requires_grad:
+        return _neg_logsumexp_subsampled_values(
+            z_b, candidate_z, neg_idx, valid, temperature, k_chunk=k_chunk
+        )
+    return _NegLogsumexpSubsampledFn.apply(
+        z_b, candidate_z, neg_idx, valid, float(temperature), int(k_chunk)
+    )
 
 
 FALSE_NEG_FILTER_MODES = {
@@ -802,10 +881,24 @@ def _directional_aligned_infonce(
     embed_dim = int(z_anchor.shape[1])
     k_chunk = 1
     if use_neg_subsample:
+        # Leave headroom for DIRECT_H (D=198) / crowded hetero neighbor batches.
+        max_row_bytes = 128 * 1024 * 1024
+        max_k_bytes = 16 * 1024 * 1024
+        if z_anchor.is_cuda:
+            try:
+                free_b, _total_b = torch.cuda.mem_get_info(z_anchor.device)
+                # Cap chunk tensors at ~1/8 of currently free VRAM (min 4 MiB).
+                dyn = max(4 * 1024 * 1024, int(free_b) // 8)
+                max_row_bytes = min(max_row_bytes, dyn)
+                max_k_bytes = min(max_k_bytes, dyn)
+            except Exception:
+                pass
         row_chunk = _infonce_row_chunk_for_neg_subsample(
-            row_chunk, k_neg, embed_dim
+            row_chunk, k_neg, embed_dim, max_neg_tensor_bytes=max_row_bytes
         )
-        k_chunk = _neg_k_chunk_for_subsample(row_chunk, embed_dim)
+        k_chunk = _neg_k_chunk_for_subsample(
+            row_chunk, embed_dim, max_neg_tensor_bytes=max_k_bytes
+        )
 
     candidate_ids = edge_ids
     candidate_z = z_other

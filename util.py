@@ -137,6 +137,13 @@ def create_parser():
     parser.add_argument("--testing", action='store_true', help="Disable wandb logging while running the script in 'testing' mode.")
     parser.add_argument("--save_model", action='store_true', help="Save training checkpoints to saved-models/.")
     parser.add_argument(
+        "--skip_test_eval",
+        action="store_true",
+        help="Supervised only: do not materialize the full-timeline test graph and do not "
+        "evaluate/log the test split during training. Validation remains available for "
+        "checkpoint selection. Use for protocol smokes that must keep test locked.",
+    )
+    parser.add_argument(
         "--checkpoint_policy",
         type=str,
         default="last",
@@ -415,6 +422,42 @@ def create_parser():
         type=int,
         default=128,
         help="Output width for --contrast_projection_head (default 128).",
+    )
+    parser.add_argument(
+        "--direct_r198_infonce",
+        action="store_true",
+        help=(
+            "DIRECT_H: bypass GINe.embedding_head (forward returns R198=pre_embedding_3h) and "
+            "apply InfoNCE directly to R198. Forbids --contrast_projection_head. "
+            "Collaborator direct-H scout; not an exact PaPaGei reproduction."
+        ),
+    )
+    parser.add_argument(
+        "--direct_r198_tfmoe",
+        action="store_true",
+        help=(
+            "DIRECT_H_TFMOE: with --direct_r198_infonce, attach three scalar TF MoE heads on "
+            "view-1 R198 seeds (sender interarrival, sender 7d count, amount vs past mean) "
+            "with literal learned alpha/beta after epoch-1 loss-scale calibration."
+        ),
+    )
+    parser.add_argument(
+        "--direct_r198_tfmoe_cache",
+        type=str,
+        default="",
+        help="Optional path to temporal_flow_causal cache dir (default results/cache/temporal_flow_causal/<data>).",
+    )
+    parser.add_argument(
+        "--direct_r198_log_dir",
+        type=str,
+        default="",
+        help="Local step/epoch/plot log directory for DIRECT_H scout (default under results/diagnostics/<unique_name>/logs).",
+    )
+    parser.add_argument(
+        "--direct_r198_checkpoint_epochs",
+        type=str,
+        default="1,3,5,10",
+        help="Comma-separated 1-indexed epochs to snapshot as checkpoint_<name>_epochXX.tar.",
     )
     parser.add_argument(
         "--edge_drop_policy",

@@ -57,6 +57,16 @@ from graph_augmentations import generate_views
 from edge_drop_scores import load_or_build_edge_drop_cache
 from contrastive_loss import EdgeMemoryQueue, edge_identity_infonce_loss
 from contrastive_projection import project_seed_pair, project_seeds, setup_contrastive_projection
+from direct_r198.train_hooks import (
+    apply_direct_r198_loss,
+    finalize_direct_r198_plots,
+    maybe_log_direct_r198_step,
+    maybe_write_direct_r198_epoch,
+    on_epoch_begin_direct_r198,
+    parse_checkpoint_epochs,
+    setup_direct_r198_modules,
+    validate_direct_r198_args,
+)
 from knn_filter import load_transaction_knn_filter
 from knn_soft_positives import (
     forward_view2_embeddings_for_edge_ids,
@@ -744,52 +754,73 @@ def train_homo_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds, 
 
 
 def _log_and_record_supervised_epoch(
-    epoch, train_f1, train_loss, val_metrics, te_metrics, optimizer, recorder
+    epoch, train_f1, train_loss, val_metrics, te_metrics, optimizer, recorder,
+    skip_test_eval=False,
 ):
     """Log the paper-compatible per-epoch metrics (argmax) and append to the history file.
 
     The 'Train F1:' / 'Validation F1:' / 'Test F1:' log lines are preserved verbatim so
     downstream log parsers (scripts/evaluate_supervised_gnn.py) keep working.
+    When ``skip_test_eval`` is True, test metrics are omitted from logs, wandb, and history.
     """
     lr = float(optimizer.param_groups[0]["lr"])
     logging.info(f"Train F1: {train_f1:.4f}")
     logging.info(f"Validation F1: {val_metrics['f1_argmax']:.4f}")
-    logging.info(f"Test F1: {te_metrics['f1_argmax']:.4f}")
-    wandb.log(
-        {
-            "f1/train": train_f1,
-            "loss/train": train_loss,
-            "f1/validation": val_metrics["f1_argmax"],
-            "f1/test": te_metrics["f1_argmax"],
-            "precision/validation": val_metrics["precision_argmax"],
-            "recall/validation": val_metrics["recall_argmax"],
-            "precision/test": te_metrics["precision_argmax"],
-            "recall/test": te_metrics["recall_argmax"],
-            "auroc/validation": val_metrics["auroc"],
-            "auprc/validation": val_metrics["auprc"],
-            "auroc/test": te_metrics["auroc"],
-            "auprc/test": te_metrics["auprc"],
-            "lr": lr,
-        },
-        step=epoch,
-    )
-    recorder.record_epoch(
-        {
-            "epoch": epoch + 1,
-            "train_loss": train_loss,
-            "validation_minority_f1_argmax": val_metrics["f1_argmax"],
-            "test_minority_f1_argmax": te_metrics["f1_argmax"],
-            "validation_precision_argmax": val_metrics["precision_argmax"],
-            "validation_recall_argmax": val_metrics["recall_argmax"],
-            "test_precision_argmax": te_metrics["precision_argmax"],
-            "test_recall_argmax": te_metrics["recall_argmax"],
-            "validation_auroc": val_metrics["auroc"],
-            "validation_auprc": val_metrics["auprc"],
-            "test_auroc": te_metrics["auroc"],
-            "test_auprc": te_metrics["auprc"],
-            "learning_rate": lr,
-        }
-    )
+    if not skip_test_eval:
+        logging.info(f"Test F1: {te_metrics['f1_argmax']:.4f}")
+    else:
+        logging.info("Test F1: skipped (--skip_test_eval; test split locked)")
+    wandb_payload = {
+        "f1/train": train_f1,
+        "loss/train": train_loss,
+        "f1/validation": val_metrics["f1_argmax"],
+        "precision/validation": val_metrics["precision_argmax"],
+        "recall/validation": val_metrics["recall_argmax"],
+        "auroc/validation": val_metrics["auroc"],
+        "auprc/validation": val_metrics["auprc"],
+        "lr": lr,
+    }
+    if not skip_test_eval:
+        wandb_payload.update(
+            {
+                "f1/test": te_metrics["f1_argmax"],
+                "precision/test": te_metrics["precision_argmax"],
+                "recall/test": te_metrics["recall_argmax"],
+                "auroc/test": te_metrics["auroc"],
+                "auprc/test": te_metrics["auprc"],
+            }
+        )
+    wandb.log(wandb_payload, step=epoch)
+    hist = {
+        "epoch": epoch + 1,
+        "train_loss": train_loss,
+        "validation_minority_f1_argmax": val_metrics["f1_argmax"],
+        "validation_precision_argmax": val_metrics["precision_argmax"],
+        "validation_recall_argmax": val_metrics["recall_argmax"],
+        "validation_auroc": val_metrics["auroc"],
+        "validation_auprc": val_metrics["auprc"],
+        "validation_positive_prediction_rate": val_metrics.get("positive_prediction_rate"),
+        "validation_tp": val_metrics.get("tp"),
+        "validation_fp": val_metrics.get("fp"),
+        "validation_tn": val_metrics.get("tn"),
+        "validation_fn": val_metrics.get("fn"),
+        "validation_n": val_metrics.get("n"),
+        "validation_n_positives": val_metrics.get("n_positives"),
+        "validation_positive_coverage": val_metrics.get("positive_coverage"),
+        "learning_rate": lr,
+        "test_evaluated": (not skip_test_eval),
+    }
+    if not skip_test_eval:
+        hist.update(
+            {
+                "test_minority_f1_argmax": te_metrics["f1_argmax"],
+                "test_precision_argmax": te_metrics["precision_argmax"],
+                "test_recall_argmax": te_metrics["recall_argmax"],
+                "test_auroc": te_metrics["auroc"],
+                "test_auprc": te_metrics["auprc"],
+            }
+        )
+    recorder.record_epoch(hist)
 
 
 def train_homo_supervised(tr_loader, val_loader, te_loader, tr_inds, val_inds, te_inds, model, optimizer, loss_fn, args, config, device, val_data, te_data, data_config):
@@ -843,10 +874,21 @@ def train_homo_supervised(tr_loader, val_loader, te_loader, tr_inds, val_inds, t
         train_loss = total_loss / max(total_examples, 1)
 
         val_metrics = evaluate_supervised_split(val_loader, val_inds, model, val_data, device, args)
-        te_metrics = evaluate_supervised_split(te_loader, te_inds, model, te_data, device, args)
+        skip_test = bool(getattr(args, "skip_test_eval", False))
+        if skip_test:
+            te_metrics = {
+                "f1_argmax": float("nan"),
+                "precision_argmax": float("nan"),
+                "recall_argmax": float("nan"),
+                "auroc": float("nan"),
+                "auprc": float("nan"),
+            }
+        else:
+            te_metrics = evaluate_supervised_split(te_loader, te_inds, model, te_data, device, args)
 
         _log_and_record_supervised_epoch(
-            epoch, train_f1, train_loss, val_metrics, te_metrics, optimizer, recorder
+            epoch, train_f1, train_loss, val_metrics, te_metrics, optimizer, recorder,
+            skip_test_eval=skip_test,
         )
         # Checkpoint selection depends ONLY on validation minority-class F1.
         checkpointer.update(
@@ -921,10 +963,21 @@ def train_hetero_supervised(tr_loader, val_loader, te_loader, tr_inds, val_inds,
 
         #evaluate
         val_metrics = evaluate_supervised_split(val_loader, val_inds, model, val_data, device, args)
-        te_metrics = evaluate_supervised_split(te_loader, te_inds, model, te_data, device, args)
+        skip_test = bool(getattr(args, "skip_test_eval", False))
+        if skip_test:
+            te_metrics = {
+                "f1_argmax": float("nan"),
+                "precision_argmax": float("nan"),
+                "recall_argmax": float("nan"),
+                "auroc": float("nan"),
+                "auprc": float("nan"),
+            }
+        else:
+            te_metrics = evaluate_supervised_split(te_loader, te_inds, model, te_data, device, args)
 
         _log_and_record_supervised_epoch(
-            epoch, train_f1, train_loss, val_metrics, te_metrics, optimizer, recorder
+            epoch, train_f1, train_loss, val_metrics, te_metrics, optimizer, recorder,
+            skip_test_eval=skip_test,
         )
         # Checkpoint selection depends ONLY on validation minority-class F1.
         checkpointer.update(
@@ -1037,6 +1090,40 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
             max_optimizer_steps,
         )
 
+    # DIRECT_H: deterministic warmup+cosine over optimizer steps (not batches/chunks).
+    scheduler = None
+    if bool(getattr(args, "direct_r198_infonce", False)):
+        from direct_r198.lr_scheduler import build_direct_h_scheduler
+
+        if n_train_batches is None:
+            raise ValueError(
+                "DIRECT_H LR scheduler requires a sized training loader "
+                "(len(tr_loader)) to plan optimizer steps."
+            )
+        scheduler = build_direct_h_scheduler(
+            optimizer,
+            n_epochs=int(config.epochs),
+            n_train_batches=int(n_train_batches),
+            accum_steps=int(accum_steps),
+        )
+        args._direct_r198_scheduler = scheduler
+        cfg = scheduler.configuration()
+        logging.info(
+            "DIRECT_H LR scheduler: type=%s warmup_steps=%s cosine_steps=%s "
+            "total_planned_optimizer_steps=%s steps_per_epoch=%s "
+            "warmup=%.2f→%.2f cosine_end=%.2f base_lrs=%s "
+            "(same multiplicative factor for all groups; not metric-driven)",
+            cfg["scheduler_type"],
+            cfg["warmup_steps"],
+            cfg["cosine_steps"],
+            cfg["total_planned_optimizer_steps"],
+            cfg["steps_per_epoch"],
+            cfg["warmup_start_mult"],
+            cfg["warmup_end_mult"],
+            cfg["cosine_end_mult"],
+            cfg["base_lrs"],
+        )
+
     # Common stream barrier for matched-configuration ablations: both C0 and M
     # (and any morph-init isolation) start loader iteration from the same seed.
     set_seed(int(getattr(args, "seed", 0)))
@@ -1048,6 +1135,7 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
     for epoch in range(config.epochs):
         if hit_max_optimizer_steps:
             break
+        on_epoch_begin_direct_r198(args, epoch)
         total_examples = 0
         optimizer_steps = 0
         requested_seed_sum = 0
@@ -1071,7 +1159,9 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                 break
             seed_edge_ids = get_hetero_seed_edge_ids(batch, tr_loader.data)
             attach_edge_id_from_batch(batch, tr_loader.data)
-            if max_optimizer_steps > 0 and step < 32:
+            _dr_stats = None
+            _dr_log_this_step = False
+            if step < 32:
                 ids_cpu = seed_edge_ids.detach().cpu().contiguous().numpy()
                 logging.info(
                     "scout_batch_log epoch=%s step=%s seed_ids_sha256=%s n_seeds=%s "
@@ -1101,43 +1191,85 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                 **_contrastive_view_kwargs(args, edge_drop_stats, seed_edge_ids=seed_edge_ids),
             )
 
-            with autocast(enabled=use_amp):
-                out1 = model(
-                    view1.x_dict,
-                    view1.edge_index_dict,
-                    view1.edge_attr_dict,
+            use_seed_r198 = bool(getattr(args, "direct_r198_infonce", False))
+            if use_seed_r198:
+                from direct_r198.seed_readout import (
+                    align_seed_r198_pair,
+                    forward_seed_r198_hetero,
                 )
-                z1 = out1[FORWARD_EDGE_TYPE]
-                if contrastive_symmetric:
-                    out2 = model(
-                        view2.x_dict,
-                        view2.edge_index_dict,
-                        view2.edge_attr_dict,
+
+                # Seed-only R198: full MP (fwd+rev), no full-subgraph R198 / H128 / Z128.
+                with autocast(enabled=use_amp):
+                    z1_all_seeds, id1_all, _mp_stats1 = forward_seed_r198_hetero(
+                        model, view1, seed_edge_ids
                     )
-                    z2 = out2[FORWARD_EDGE_TYPE]
-                else:
-                    with torch.no_grad():
+                    if contrastive_symmetric:
+                        z2_all_seeds, id2_all, _mp_stats2 = forward_seed_r198_hetero(
+                            model, view2, seed_edge_ids
+                        )
+                    else:
+                        with torch.no_grad():
+                            z2_all_seeds, id2_all, _mp_stats2 = forward_seed_r198_hetero(
+                                model, view2, seed_edge_ids
+                            )
+                z1_seed, seed_id1, z2_seed, seed_id2 = align_seed_r198_pair(
+                    z1_all_seeds, id1_all, z2_all_seeds, id2_all
+                )
+                del z1_all_seeds, z2_all_seeds, id1_all, id2_all
+                if epoch == 0 and step == 0:
+                    logging.info(
+                        "DIRECT_H seed-only R198: nodes=%s fwd_edges=%s rev_edges=%s "
+                        "seed_r198=%s bytes_r198_seed=%s bytes_r198_full_fwd_equiv=%s "
+                        "(no full R198; no H128; no proj)",
+                        _mp_stats1.get("n_nodes"),
+                        _mp_stats1.get("n_fwd_edges"),
+                        _mp_stats1.get("n_rev_edges"),
+                        _mp_stats1.get("n_seed_r198"),
+                        _mp_stats1.get("bytes_r198_seed"),
+                        _mp_stats1.get("bytes_r198_full_fwd_equiv"),
+                    )
+            else:
+                with autocast(enabled=use_amp):
+                    out1 = model(
+                        view1.x_dict,
+                        view1.edge_index_dict,
+                        view1.edge_attr_dict,
+                    )
+                    z1 = out1[FORWARD_EDGE_TYPE]
+                    if contrastive_symmetric:
                         out2 = model(
                             view2.x_dict,
                             view2.edge_index_dict,
                             view2.edge_attr_dict,
                         )
                         z2 = out2[FORWARD_EDGE_TYPE]
+                    else:
+                        with torch.no_grad():
+                            out2 = model(
+                                view2.x_dict,
+                                view2.edge_index_dict,
+                                view2.edge_attr_dict,
+                            )
+                            z2 = out2[FORWARD_EDGE_TYPE]
 
-            edge_id1 = view1[FORWARD_EDGE_TYPE].edge_id
-            edge_id2 = view2[FORWARD_EDGE_TYPE].edge_id
-            z1_seed, seed_id1, z2_seed, seed_id2 = select_shared_seed_edge_embeddings(
-                z1,
-                edge_id1,
-                z2,
-                edge_id2,
-                seed_edge_ids,
-            )
+                edge_id1 = view1[FORWARD_EDGE_TYPE].edge_id
+                edge_id2 = view2[FORWARD_EDGE_TYPE].edge_id
+                z1_seed, seed_id1, z2_seed, seed_id2 = select_shared_seed_edge_embeddings(
+                    z1,
+                    edge_id1,
+                    z2,
+                    edge_id2,
+                    seed_edge_ids,
+                )
+                del out1, z1
+                if not contrastive_symmetric:
+                    del out2, z2
+
             requested_seed_sum += int(seed_edge_ids.numel())
             shared_seed_sum += int(seed_id1.numel())
             if not contrastive_symmetric:
                 z2_seed = z2_seed.detach().clone()
-                del out2, z2, view2
+                del view2
             if epoch == 0 and step == 0:
                 logging.info(
                     "Hetero contrastive seed-edge filtering: requested_seed_edges=%s shared_seed_edges=%s queue_size=%s",
@@ -1146,10 +1278,20 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                     0 if memory_queue is None else memory_queue.size,
                 )
 
+            # Drop view1 after seed extract when morph does not need it.
+            need_view1_after_seed = morph_contrast_cfg is not None or morph_head is not None
+            if not need_view1_after_seed:
+                del view1
+                view1 = None
+            if use_seed_r198 and device.type == "cuda":
+                torch.cuda.empty_cache()
+
             with autocast(enabled=False):
                 # M2: morphology bin ids on view1 → merged InfoNCE positives
                 morph_bins = None
                 if morph_contrast_cfg is not None:
+                    if view1 is None:
+                        raise RuntimeError("morph_contrast requires view1 after seed select")
                     morph_bins = morph_contrast_bin_ids_hetero(
                         view1,
                         seed_id1,
@@ -1230,6 +1372,16 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                     ),
                 )
                 contrastive_loss_sum = contrastive_loss_sum + loss_raw.detach()
+                if bool(getattr(args, "direct_r198_infonce", False)):
+                    loss_raw, _dr_stats = apply_direct_r198_loss(
+                        args,
+                        contrast_raw=loss_raw,
+                        z1_seed=z1_seed,
+                        seed_id1=seed_id1,
+                        epoch0=epoch,
+                    )
+                    _dr_log_this_step = bool(step < 8 or (step % 50 == 0))
+                    args._direct_r198_global_step = int(getattr(args, "_direct_r198_global_step", 0)) + 1
                 # M1/M1b: auxiliary morphology MSE on shared seed embeddings
                 if morph_head is not None and morph_cfg is not None:
                     morph_loss = morph_expert_loss_hetero_step(
@@ -1295,6 +1447,65 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
+            if bool(getattr(args, "direct_r198_infonce", False)) and device.type == "cuda":
+                torch.cuda.empty_cache()
+
+            if (
+                bool(getattr(args, "direct_r198_infonce", False))
+                and _dr_log_this_step
+                and _dr_stats is not None
+            ):
+                with torch.no_grad():
+                    r_var = (
+                        float(z1_seed.float().var(dim=0).mean().cpu()) if z1_seed.numel() else 0.0
+                    )
+                    r_std = float(z1_seed.float().std().cpu()) if z1_seed.numel() else 0.0
+                    enc_sq = 0.0
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            enc_sq += float(p.grad.detach().float().pow(2).sum().cpu())
+                    ab = getattr(args, "direct_r198_alpha_beta", None)
+                    alpha_gn = 0.0
+                    if ab is not None and ab.alpha_logit.grad is not None:
+                        alpha_gn = float(ab.alpha_logit.grad.detach().float().norm().cpu())
+                _sched = getattr(args, "_direct_r198_scheduler", None)
+                _enc_lr = float(optimizer.param_groups[0]["lr"])
+                _ab_lr = (
+                    float(optimizer.param_groups[1]["lr"])
+                    if len(optimizer.param_groups) > 1
+                    else None
+                )
+                maybe_log_direct_r198_step(
+                    args,
+                    {
+                        "epoch": int(epoch) + 1,
+                        "step": int(getattr(args, "_direct_r198_global_step", 0)) - 1,
+                        "lr": _enc_lr,
+                        "encoder_lr": _enc_lr,
+                        "alpha_beta_lr": _ab_lr,
+                        "optimizer_step_index": int(
+                            getattr(_sched, "completed_optimizer_steps", total_optimizer_steps)
+                        ),
+                        "schedule_phase": (
+                            _sched.phase_at(_sched.completed_optimizer_steps)
+                            if _sched is not None
+                            else "fixed"
+                        ),
+                        "lr_factor": (
+                            float(_sched.current_factor()) if _sched is not None else 1.0
+                        ),
+                        "total_planned_optimizer_steps": (
+                            int(_sched.total_planned_optimizer_steps)
+                            if _sched is not None
+                            else None
+                        ),
+                        "r198_var": r_var,
+                        "r198_std": r_std,
+                        "encoder_grad_norm": enc_sq ** 0.5,
+                        "alpha_grad_norm": alpha_gn,
+                        **_dr_stats,
+                    },
+                )
 
             step_one_indexed = step + 1
             should_step = (step_one_indexed % accum_steps == 0) or (
@@ -1306,6 +1517,9 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                     scaler.update()
                 else:
                     optimizer.step()
+                # Exactly one scheduler step per optimizer step (not per microbatch / InfoNCE chunk).
+                if scheduler is not None:
+                    scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 optimizer_steps += 1
                 total_optimizer_steps += 1
@@ -1370,6 +1584,18 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
             "contrastive/unique_negs_per_anchor": unique_negs_per_anchor,
             "contrastive/duplicate_neg_count": duplicate_neg_count,
         }
+        if scheduler is not None:
+            log_payload["lr/encoder"] = float(optimizer.param_groups[0]["lr"])
+            if len(optimizer.param_groups) > 1:
+                log_payload["lr/alpha_beta"] = float(optimizer.param_groups[1]["lr"])
+            log_payload["lr/factor"] = float(scheduler.current_factor())
+            log_payload["lr/optimizer_step_index"] = int(scheduler.completed_optimizer_steps)
+            log_payload["lr/total_planned_optimizer_steps"] = int(
+                scheduler.total_planned_optimizer_steps
+            )
+            log_payload["lr/schedule_phase"] = scheduler.phase_at(
+                scheduler.completed_optimizer_steps
+            )
         if float(tf_loss_sum.detach().cpu()) != 0.0 or getattr(args, "temporal_flow_aux_head", None) is not None:
             avg_tf = float((tf_loss_sum / max(total_examples, 1)).cpu())
             log_payload["loss/temporal_flow_aux"] = avg_tf
@@ -1428,6 +1654,21 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                 ckpt_tracker.best_score if ckpt_tracker.best_epoch >= 0 else float("nan")
             )
         wandb.log(log_payload, step=epoch)
+        epoch1 = int(epoch) + 1
+        maybe_write_direct_r198_epoch(args, epoch1, dict(log_payload))
+        ckpt_eps = getattr(args, "_direct_r198_ckpt_epochs", set()) or set()
+        if bool(getattr(args, "direct_r198_infonce", False)) and epoch1 in ckpt_eps:
+            from train_util import save_model as _save_model
+
+            _save_model(
+                model,
+                optimizer,
+                epoch,
+                args,
+                data_config,
+                suffix=f"_epoch{epoch1:02d}",
+            )
+            logging.info("DIRECT_H checkpoint saved for epoch %s", epoch1)
 
     logging.info(
         "Contrastive training finished: total_optimizer_steps=%s max_optimizer_steps=%s",
@@ -1435,6 +1676,7 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
         max_optimizer_steps if max_optimizer_steps > 0 else "unlimited",
     )
     ckpt_tracker.finalize(config.epochs - 1, model, optimizer, args, data_config)
+    finalize_direct_r198_plots(args)
     return model
 
 
@@ -1657,6 +1899,14 @@ def get_model(sample_batch, config, args):
 
     supervised_head = getattr(args, "supervised_head", "embedding")
     embedding_dim = int(getattr(args, "embedding_dim", 128))
+    bypass_r198 = bool(getattr(args, "direct_r198_infonce", False))
+    if bypass_r198:
+        embedding_dim = int(round(config.n_hidden)) * 3
+        args.embedding_dim = embedding_dim
+        if bool(getattr(args, "contrast_projection_head", False)):
+            raise ValueError("--direct_r198_infonce forbids --contrast_projection_head")
+        if getattr(args, "supervised_head", "embedding") == "legacy":
+            raise ValueError("--direct_r198_infonce is for contrastive embedding-mode SSL, not --supervised_head legacy")
 
     if args.model == "gin":
         model = GINe(
@@ -1666,8 +1916,11 @@ def get_model(sample_batch, config, args):
                 embedding_dim=embedding_dim,
                 use_gradient_checkpointing=getattr(args, "gradient_checkpointing", False),
                 supervised_head=supervised_head,
+                bypass_embedding_head=bypass_r198,
                 )
     elif args.model == "gat":
+        if bypass_r198:
+            raise ValueError("--direct_r198_infonce currently supported for gin only")
         model = GATe(
                 num_features=n_feats, num_gnn_layers=config.n_gnn_layers, n_classes=2,
                 n_hidden=round(config.n_hidden), n_heads=round(config.n_heads),
@@ -1677,6 +1930,8 @@ def get_model(sample_batch, config, args):
                 supervised_head=supervised_head,
                 )
     elif args.model == "pna":
+        if bypass_r198:
+            raise ValueError("--direct_r198_infonce currently supported for gin only")
         if not isinstance(sample_batch, HeteroData):
             d = degree(sample_batch.edge_index[1], dtype=torch.long)
         else:
@@ -1691,6 +1946,8 @@ def get_model(sample_batch, config, args):
             supervised_head=supervised_head,
             )
     elif args.model == "rgcn":
+        if bypass_r198:
+            raise ValueError("--direct_r198_infonce currently supported for gin only")
         num_relations = 2 if args.reverse_mp else 1
         model = RGCN(
             num_features=n_feats, edge_dim=e_dim, num_relations=num_relations,
@@ -1855,9 +2112,17 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
         )
     morph_contrast_cfg = setup_morphology_contrast(args, device)
     args.morph_contrast_cfg = morph_contrast_cfg
+    validate_direct_r198_args(args)
+    if bool(getattr(args, "direct_r198_infonce", False)) and bool(
+        getattr(args, "contrast_projection_head", False)
+    ):
+        raise ValueError("--direct_r198_infonce forbids --contrast_projection_head")
     proj_head = setup_contrastive_projection(args, device, embedding_dim=model_embedding_dim)
     args.contrast_projection_module = proj_head
     args._val_data_for_morph = val_data
+    setup_direct_r198_modules(args, device, embedding_dim=model_embedding_dim)
+    args._direct_r198_global_step = 0
+    args._direct_r198_ckpt_epochs = set(parse_checkpoint_epochs(args))
 
     tf_head, tf_cfg, tf_ctx = setup_temporal_flow_aux(
         args,
@@ -1965,7 +2230,20 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
         masked_spec = getattr(args, "masked_edge_spec", None)
         if masked_spec is not None and masked_spec.learned_mask_tokens is not None:
             opt_params += list(masked_spec.learned_mask_tokens.parameters())
-        optimizer = torch.optim.Adam(opt_params, lr=config.lr)
+        tfmoe = getattr(args, "direct_r198_tfmoe_bundle", None)
+        if tfmoe is not None:
+            opt_params += list(tfmoe.parameters())
+        ab = getattr(args, "direct_r198_alpha_beta", None)
+        if ab is not None:
+            # Separate lr group for alpha/beta (1e-3); encoder group uses config.lr
+            optimizer = torch.optim.Adam(
+                [
+                    {"params": opt_params, "lr": config.lr},
+                    {"params": list(ab.parameters()), "lr": 1e-3},
+                ]
+            )
+        else:
+            optimizer = torch.optim.Adam(opt_params, lr=config.lr)
 
     model.to(device)
     if morph_contrast_cfg is not None and setup.is_contrastive:
@@ -2001,6 +2279,11 @@ def train_gnn(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, args, data
         sample_batch.edge_attr = sample_batch.edge_attr[:, 1:]
     sample_edge_attr = sample_batch.edge_attr if not isinstance(sample_batch, HeteroData) else sample_batch.edge_attr_dict
     logging.info(summary(model, sample_x, sample_edge_index, sample_edge_attr))
+    # Summary sample is a full NeighborLoader batch; leaving it on GPU through training
+    # doubles subgraph feature residency and tipsover DIRECT_H (R198) peak VRAM.
+    del sample_batch, sample_x, sample_edge_index, sample_edge_attr
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     loss_fn = torch.nn.CrossEntropyLoss(weight=torch.FloatTensor([config.w_ce1, config.w_ce2]).to(device))
 

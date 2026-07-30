@@ -18,6 +18,17 @@ from feature_contracts import (
     apply_feature_contract_to_base_edge_attr,
     resolve_feature_contract_id,
 )
+from paysim_native_multigin import (  # noqa: E402
+    CONTRACT_NATIVE_MULTIGIN_CORE,
+    EXPECTED_BASE_DIM,
+    EXPECTED_EDGE_DIM_PORTS,
+    apply_train_fit_continuous_znorm,
+    build_native_base_edge_attr,
+    continuous_indices_with_ports,
+    contract_summary as native_contract_summary,
+    is_native_multigin_contract,
+    load_aligned_paysim_native,
+)
 from morphology.temporal_flow_edge_features import maybe_append_temporal_flow_edge_features
 from pattern_metadata import (
     load_laundering_pattern_metadata,
@@ -64,6 +75,38 @@ def get_data(args, data_config):
     t_csv = _stage_tick(args, "data_loading_csv_sec", t_csv)
 
     logging.info(f'Available Edge Features: {df_edges.columns.tolist()}')
+
+    contract_id = resolve_feature_contract_id(getattr(args, "feature_contract", None))
+    native_multigin = is_native_multigin_contract(contract_id)
+    native_meta = None
+    native_df = None
+    if native_multigin:
+        if args.data != "PaySim":
+            raise ValueError(
+                f"{CONTRACT_NATIVE_MULTIGIN_CORE} requires --data PaySim; got {args.data}"
+            )
+        if bool(getattr(args, "tds", False)):
+            raise ValueError(f"{CONTRACT_NATIVE_MULTIGIN_CORE} requires TDS off (ports-only edge_dim=13)")
+        raw_candidates = [
+            aml_root / "PaySim" / "PS_20174392719_1491204439457_log.csv",
+            Path(__file__).resolve().parent / "aml-data" / "PaySim" / "PS_20174392719_1491204439457_log.csv",
+        ]
+        raw_path = next((Path(c) for c in raw_candidates if Path(c).is_file()), None)
+        if raw_path is None:
+            raise FileNotFoundError(
+                f"{CONTRACT_NATIVE_MULTIGIN_CORE} requires raw PaySim CSV "
+                "(balances not in formatted_transactions.csv)"
+            )
+        logging.info("Loading PaySim-native balances from %s", raw_path)
+        native_df, native_meta = load_aligned_paysim_native(
+            formatted_csv=transaction_file, raw_csv=raw_path
+        )
+        # Prefer formatted graph ids (already verified equal); keep df_edges for graph
+        logging.info(
+            "Native Multi-GIN contract: base_dim=%d expected_with_ports=%d",
+            EXPECTED_BASE_DIM,
+            EXPECTED_EDGE_DIM_PORTS,
+        )
 
     pattern_metadata_by_edge_id = {}
     load_pattern = bool(getattr(args, "load_pattern_metadata", False))
@@ -115,24 +158,45 @@ def get_data(args, data_config):
 
     x = torch.tensor(df_nodes.loc[:, node_features].to_numpy()).float()
     edge_index = torch.LongTensor(df_edges.loc[:, ["from_id", "to_id"]].to_numpy().T)
-    edge_attr = torch.tensor(df_edges.loc[:, edge_features].to_numpy()).float()
 
-    # PaySim feature contracts act on base semantic columns only. Omitted flag ⇒
-    # no transform (bit-exact historical path). AMLWorld datasets ignore PaySim IDs.
-    contract_id = resolve_feature_contract_id(getattr(args, "feature_contract", None))
     contract_summary = None
-    if contract_id is not None:
-        if args.data != "PaySim":
+    if native_multigin:
+        assert native_df is not None
+        # timestamps already re-zeroed above into df_edges["Timestamp"]
+        ts_rezero = df_edges["Timestamp"].to_numpy(dtype=np.float64)
+        edge_attr = build_native_base_edge_attr(native_df, timestamp_rezeroed=ts_rezero)
+        if int(edge_attr.shape[1]) != EXPECTED_BASE_DIM:
             raise ValueError(
-                f"--feature_contract={contract_id} is PaySim-only; got --data={args.data}"
+                f"native base edge_attr width {edge_attr.shape[1]} != {EXPECTED_BASE_DIM}"
             )
-        edge_attr, contract_summary = apply_feature_contract_to_base_edge_attr(
-            edge_attr, contract_id
-        )
+        contract_summary = native_contract_summary()
+        if native_meta is not None:
+            contract_summary["alignment_meta"] = native_meta
         logging.info(
-            "Applied feature_contract=%s (neutral→raw 0.0 before ports/TDS/z-norm)",
-            contract_id,
+            "Applied feature_contract=%s (native base_dim=%d; continuous train-fit after ports)",
+            CONTRACT_NATIVE_MULTIGIN_CORE,
+            EXPECTED_BASE_DIM,
         )
+        args.edge_feature_schema_names = list(
+            contract_summary["base_feature_names"]
+        ) + (["in_port", "out_port"] if args.ports else [])
+    else:
+        edge_attr = torch.tensor(df_edges.loc[:, edge_features].to_numpy()).float()
+
+        # PaySim feature contracts act on base semantic columns only. Omitted flag ⇒
+        # no transform (bit-exact historical path). AMLWorld datasets ignore PaySim IDs.
+        if contract_id is not None:
+            if args.data != "PaySim":
+                raise ValueError(
+                    f"--feature_contract={contract_id} is PaySim-only; got --data={args.data}"
+                )
+            edge_attr, contract_summary = apply_feature_contract_to_base_edge_attr(
+                edge_attr, contract_id
+            )
+            logging.info(
+                "Applied feature_contract=%s (neutral→raw 0.0 before ports/TDS/z-norm)",
+                contract_id,
+            )
 
     bucket_sec = 24 * 3600 if spec.split_mode == "calendar_day" else 3600
     n_buckets = int(timestamps.max() / bucket_sec + 1)
@@ -147,6 +211,12 @@ def get_data(args, data_config):
     log_split_label_stats(
         y, tr_inds, val_inds, te_inds, label_col=spec.label_col, split_mode=spec.split_mode
     )
+    skip_test_eval = bool(getattr(args, "skip_test_eval", False))
+    if skip_test_eval:
+        logging.info(
+            "skip_test_eval=True: will NOT materialize full-timeline test graph or "
+            "use test edges for ports/TDS/z-norm; te_data will alias val_data for API only."
+        )
 
     #Creating the final data objects
     tr_x, val_x, te_x = x, x, x
@@ -165,12 +235,21 @@ def get_data(args, data_config):
         y[e_val],
         timestamps[e_val],
     )
-    te_edge_index, te_edge_attr, te_y, te_edge_times = (
-        edge_index,
-        edge_attr,
-        y,
-        timestamps,
-    )
+    if skip_test_eval:
+        # Placeholder only; never includes held-out test edges.
+        te_edge_index, te_edge_attr, te_y, te_edge_times = (
+            val_edge_index,
+            val_edge_attr,
+            val_y,
+            val_edge_times,
+        )
+    else:
+        te_edge_index, te_edge_attr, te_y, te_edge_times = (
+            edge_index,
+            edge_attr,
+            y,
+            timestamps,
+        )
 
     tr_data = GraphData(
         x=tr_x, y=tr_y, edge_index=tr_edge_index, edge_attr=tr_edge_attr, timestamps=tr_edge_times
@@ -192,7 +271,8 @@ def get_data(args, data_config):
         t_ports = time.perf_counter()
         tr_data.add_ports()
         val_data.add_ports()
-        te_data.add_ports()
+        if not skip_test_eval:
+            te_data.add_ports()
         _stage_tick(args, "ports_construction_sec", t_ports)
         logging.info(f"Done: adding ports")
     if args.tds:
@@ -200,9 +280,17 @@ def get_data(args, data_config):
         t_tds = time.perf_counter()
         tr_data.add_time_deltas()
         val_data.add_time_deltas()
-        te_data.add_time_deltas()
+        if not skip_test_eval:
+            te_data.add_time_deltas()
         _stage_tick(args, "tds_construction_sec", t_tds)
         logging.info(f"Done: adding time-deltas")
+
+    if skip_test_eval:
+        # Ensure te placeholder matches fully-built val attrs (ports/TDS) before z-norm.
+        te_data.edge_attr = val_data.edge_attr.clone()
+        te_data.edge_index = val_data.edge_index
+        te_data.y = val_data.y
+        te_data.timestamps = val_data.timestamps
 
     #Normalize data
     # Node x: always train-fit (clone to val/test) — inductive for nodes.
@@ -212,11 +300,39 @@ def get_data(args, data_config):
 
     # Edge attr z-norm:
     # - Default (legacy): independent per-graph z_norm on train / train∪val / all.
-    #   Transductive w.r.t. split-graph edge statistics; must NOT be used for
-    #   inductive transfer claims (e.g. AMLWorld→PaySim frozen D+).
     # - --train_fit_edge_znorm: fit mean/std on train edge_attr only; apply to val/test.
+    # - Native Multi-GIN: train-fit on continuous columns only; one-hots unchanged.
     train_fit_edge = bool(getattr(args, "train_fit_edge_znorm", False))
-    if train_fit_edge:
+    if native_multigin:
+        if not train_fit_edge:
+            logging.warning(
+                "%s requires train-fit continuous z-norm; enabling despite "
+                "missing --train_fit_edge_znorm",
+                CONTRACT_NATIVE_MULTIGIN_CORE,
+            )
+        cont_idx = continuous_indices_with_ports(ports=bool(args.ports))
+        logging.info(
+            "Edge attr z-norm: native Multi-GIN train-fit continuous-only "
+            "(indices=%s; one-hots unchanged)",
+            cont_idx,
+        )
+        tr_data.edge_attr, val_data.edge_attr, te_data.edge_attr, scaler_meta = (
+            apply_train_fit_continuous_znorm(
+                tr_data.edge_attr,
+                val_data.edge_attr,
+                te_data.edge_attr,
+                cont_idx,
+            )
+        )
+        if contract_summary is not None:
+            contract_summary["scaler"] = scaler_meta
+        args.native_edge_scaler = scaler_meta
+        if int(tr_data.edge_attr.shape[1]) != EXPECTED_EDGE_DIM_PORTS and args.ports:
+            raise ValueError(
+                f"native edge_dim after ports={tr_data.edge_attr.shape[1]} "
+                f"!= {EXPECTED_EDGE_DIM_PORTS}"
+            )
+    elif train_fit_edge:
         logging.info(
             "Edge attr z-norm: train-fit inductive "
             "(fit mean/std on train edge_attr only; apply to val/test). "
@@ -233,11 +349,20 @@ def get_data(args, data_config):
             "Edge attr z-norm: independent per-graph (legacy/transductive). "
             "For inductive PaySim transfer use --train_fit_edge_znorm."
         )
-        tr_data.edge_attr, val_data.edge_attr, te_data.edge_attr = (
-            z_norm(tr_data.edge_attr),
-            z_norm(val_data.edge_attr),
-            z_norm(te_data.edge_attr),
-        )
+        if skip_test_eval:
+            # Alias val graph attrs onto te placeholder after val z-norm (no test edges).
+            tr_data.edge_attr = z_norm(tr_data.edge_attr)
+            val_data.edge_attr = z_norm(val_data.edge_attr)
+            te_data.edge_attr = val_data.edge_attr.clone()
+            if args.ports:
+                # ports already on val; copy full GraphData fields used downstream
+                pass
+        else:
+            tr_data.edge_attr, val_data.edge_attr, te_data.edge_attr = (
+                z_norm(tr_data.edge_attr),
+                z_norm(val_data.edge_attr),
+                z_norm(te_data.edge_attr),
+            )
 
     if args.reverse_mp:
         correct_rev = bool(getattr(args, "correct_reverse_edge_features", False))
@@ -261,9 +386,14 @@ def get_data(args, data_config):
             val_data.timestamps,
             args,
         )
-        te_data = create_hetero_obj(
-            te_data.x, te_data.y, te_data.edge_index, te_data.edge_attr, te_data.timestamps, args
-        )
+        if skip_test_eval:
+            # Reuse validation hetero graph as API placeholder; no test edges involved.
+            te_data = val_data
+            logging.info("skip_test_eval: te_data aliased to val_data (no test-edge hetero graph)")
+        else:
+            te_data = create_hetero_obj(
+                te_data.x, te_data.y, te_data.edge_index, te_data.edge_attr, te_data.timestamps, args
+            )
         schema = getattr(tr_data, "edge_feature_schema", None)
         if schema is not None:
             logging.info(
@@ -277,6 +407,11 @@ def get_data(args, data_config):
             args.reverse_edge_feature_semantics = getattr(
                 tr_data, "reverse_edge_feature_semantics", None
             )
+
+    if skip_test_eval and not args.reverse_mp:
+        # Homo path: te placeholder lacked ports/TDS; alias to fully-built val graph.
+        te_data = val_data
+        logging.info("skip_test_eval (homo): te_data aliased to val_data")
 
     # Append causal temporal-flow encoder inputs after base z_norm / hetero port swap
     # so TF columns are not mistaken for ports in create_hetero_obj.
@@ -304,9 +439,20 @@ def get_data(args, data_config):
     val_data.is_contrastive = True
     te_data.is_contrastive = True
 
-    te_data.csv_edge_ids = torch.LongTensor(df_edges["EdgeID"].astype(np.int64).to_numpy())
-    te_data.pattern_metadata_by_edge_id = pattern_metadata_by_edge_id
-    te_data.dataset_spec_summary = spec_summary(spec)
+    if skip_test_eval:
+        # te_data may alias val_data — do not attach full-timeline EdgeIDs/pattern
+        # metadata onto the validation graph. Empty te_inds so no NeighborLoader
+        # seed would evaluate test even if a caller forgets to skip eval.
+        te_inds = torch.tensor([], dtype=torch.long)
+        logging.info(
+            "skip_test_eval: te_inds emptied (n=0); omitting te_data.csv_edge_ids / "
+            "pattern_metadata attachments"
+        )
+        te_data.dataset_spec_summary = spec_summary(spec)
+    else:
+        te_data.csv_edge_ids = torch.LongTensor(df_edges["EdgeID"].astype(np.int64).to_numpy())
+        te_data.pattern_metadata_by_edge_id = pattern_metadata_by_edge_id
+        te_data.dataset_spec_summary = spec_summary(spec)
     if contract_summary is not None:
         tr_data.feature_contract = contract_summary
         val_data.feature_contract = contract_summary

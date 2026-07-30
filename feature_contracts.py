@@ -164,6 +164,9 @@ def resolve_feature_contract_id(raw: Optional[str]) -> Optional[str]:
     s = str(raw).strip()
     if not s:
         return None
+    # Native Multi-GIN is a separate family (not AML slot neutralization).
+    if s == "paysim_native_multigin_core_v1":
+        return s
     return get_feature_contract(s).contract_id
 
 
@@ -175,9 +178,15 @@ def apply_feature_contract_to_base_edge_attr(
 
     Legacy / omitted contract: return ``edge_attr`` unchanged (bit-exact path).
     Neutral slots: set to ``NEUTRAL_RAW_VALUE`` in-place on a clone.
+    Native Multi-GIN contracts must not use this path (builder replaces base attr).
     """
     if contract_id is None:
         return edge_attr, None
+    if contract_id == "paysim_native_multigin_core_v1":
+        raise ValueError(
+            "paysim_native_multigin_core_v1 must be built via paysim_native_multigin "
+            "loader, not apply_feature_contract_to_base_edge_attr"
+        )
 
     contract = get_feature_contract(contract_id)
     if edge_attr.dim() != 2:

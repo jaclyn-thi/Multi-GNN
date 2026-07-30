@@ -143,3 +143,23 @@ Distinct evaluations (same checkpoint, different stack/rep/threshold) are **not*
 
 - See `/orcd/home/002/jthi/ondemand/data/sys/myjobs/projects/Multi-GNN/notes/final_corrected_no_preserve_multiseed.md` / `/orcd/home/002/jthi/ondemand/data/sys/myjobs/projects/Multi-GNN/results/diagnostics/final_corrected_no_preserve_multiseed.json`
 - Appended 2 registry row(s); historical rows unchanged.
+
+
+## paysim_native_tabular_baseline
+
+- Appended `paysim_native_tabular_baseline|paysim_native_core_v1|hgb|seed2` (table_eligible=false); historical rows unchanged.
+- See `notes/paysim_native_tabular_baseline.md`.
+
+
+## paysim_native_multigin_core_v1_smoke
+
+- Appended `paysim_native_multigin_core_v1_smoke|paysim_native_multigin_core_v1|gin|seed2` (table_eligible=false); historical rows unchanged.
+- See `notes/paysim_native_multigin_core_v1_smoke.md`.
+
+### PaySim native Multi-GIN formal seed-2 (appended)
+- Added 2 row(s) for `paysim_native_multigin_core_v1_formal_seed2` at 2026-07-29T02:22:33.267662+00:00
+- Source: `results/diagnostics/paysim_native_multigin_core_v1_formal_seed2.json`
+
+### SAML-D formal Candidate-A seed-2 (appended)
+- Added 2 row(s) for `samld_supervised_multigin_eu_v1_formal_seed2` at 2026-07-29T19:32:51.305924+00:00
+- Source: `results/diagnostics/samld_supervised_multigin_eu_formal_seed2.json`

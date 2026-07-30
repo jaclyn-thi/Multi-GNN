@@ -40,7 +40,7 @@ class GINe(torch.nn.Module):
                 n_hidden=100, edge_updates=False, residual=True,
                 edge_dim=None, dropout=0.0, final_dropout=0.5,
                 embedding_dim=128, use_gradient_checkpointing=False,
-                supervised_head="embedding"):
+                supervised_head="embedding", bypass_embedding_head=False):
 
         super().__init__()
         self.n_hidden = n_hidden
@@ -75,12 +75,19 @@ class GINe(torch.nn.Module):
             self.convs.append(conv)
             self.batch_norms.append(BatchNorm(n_hidden))
 
+        # DIRECT_H: bypass embedding_head so forward returns R198 (pre_embedding_3h).
+        self.bypass_embedding_head = bool(bypass_embedding_head)
         if self.supervised_head == "legacy":
             # Fork-point (IBM Multi-GNN, Egressy et al.) head: logits straight from the
             # 3*n_hidden edge representation, no embedding bottleneck. forward() returns
             # that representation and self.classifier maps it to two-class logits.
             self.embedding_head = None
             self.classifier = _legacy_edge_classifier(n_hidden, n_classes, self.final_dropout)
+        elif self.bypass_embedding_head:
+            # Contrastive DIRECT_H: return R198; keep a classifier scaffold unused in SSL.
+            self.embedding_head = None
+            self.classifier = _legacy_edge_classifier(n_hidden, n_classes, self.final_dropout)
+            self.embedding_dim = int(n_hidden * 3)
         else:
             # Current project head: embedding layer compresses GNN output into a clean
             # representation space; classifier maps the embedding to a prediction.
@@ -144,10 +151,13 @@ class GINe(torch.nn.Module):
                     ) / 2
 
         # Per-edge readout (+ embedding head in embedding mode): large activations;
-        # checkpoint when enabled.
+        # checkpoint when enabled. DIRECT_H / legacy: return R198 (3*n_hidden).
+        use_r198_readout = (
+            self.supervised_head == "legacy" or self.bypass_embedding_head
+        )
         tail_fn = (
             self._legacy_readout_forward
-            if self.supervised_head == "legacy"
+            if use_r198_readout
             else self._embedding_tail_forward
         )
         if self.use_gradient_checkpointing and self.training:

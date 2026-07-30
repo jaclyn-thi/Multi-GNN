@@ -104,18 +104,28 @@ def run_embedding_extraction(
     emb_dim = int(getattr(model, "embedding_dim", 128))
     actual_n_hidden = int(getattr(model, "n_hidden", round(float(config.n_hidden))))
     head_spec = None
+    bypass_r198 = bool(getattr(model, "bypass_embedding_head", False)) or bool(
+        getattr(args, "direct_r198_infonce", False)
+    )
     if representation_source == "pre_embedding_3h":
-        head_spec = resolve_embedding_head_linear(model, emb_dim)
-        pre_dim = head_spec.in_features
-        logging.info(
-            "Resolved pre_embedding_3h head: module=%s in_features=%d out_features=%d "
-            "(model n_hidden=%d, requested n_hidden=%s)",
-            head_spec.module_name,
-            head_spec.in_features,
-            head_spec.out_features,
-            actual_n_hidden,
-            config.n_hidden,
-        )
+        if bypass_r198:
+            pre_dim = 3 * actual_n_hidden
+            logging.info(
+                "DIRECT_H bypass extract: R198=forward output dim=%s (no embedding_head hook)",
+                pre_dim,
+            )
+        else:
+            head_spec = resolve_embedding_head_linear(model, emb_dim)
+            pre_dim = head_spec.in_features
+            logging.info(
+                "Resolved pre_embedding_3h head: module=%s in_features=%d out_features=%d "
+                "(model n_hidden=%d, requested n_hidden=%s)",
+                head_spec.module_name,
+                head_spec.in_features,
+                head_spec.out_features,
+                actual_n_hidden,
+                config.n_hidden,
+            )
     else:
         pre_dim = 3 * actual_n_hidden
 

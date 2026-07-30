@@ -393,13 +393,17 @@ def get_loaders(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, transfor
                                     edge_label_index=(('node', 'to', 'node'), val_edge_label_index),
                                     edge_label=val_edge_label, batch_size=args.batch_size, shuffle=False, transform=transform, **lw)
 
-        te_edge_label_index = te_data['node', 'to', 'node'].edge_index[:,te_inds]
-        te_edge_label = te_data['node', 'to', 'node'].y[te_inds]
+        if int(te_inds.numel()) == 0:
+            # --skip_test_eval: empty seed set; alias val loader (never evaluated).
+            te_loader = val_loader
+        else:
+            te_edge_label_index = te_data['node', 'to', 'node'].edge_index[:,te_inds]
+            te_edge_label = te_data['node', 'to', 'node'].y[te_inds]
 
 
-        te_loader =  LinkNeighborLoader(te_data, num_neighbors=args.num_neighs,
-                                    edge_label_index=(('node', 'to', 'node'), te_edge_label_index),
-                                    edge_label=te_edge_label, batch_size=args.batch_size, shuffle=False, transform=transform, **lw)
+            te_loader =  LinkNeighborLoader(te_data, num_neighbors=args.num_neighs,
+                                        edge_label_index=(('node', 'to', 'node'), te_edge_label_index),
+                                        edge_label=te_edge_label, batch_size=args.batch_size, shuffle=False, transform=transform, **lw)
     else:
         tr_loader = LinkNeighborLoader(
             tr_data,
@@ -411,8 +415,11 @@ def get_loaders(tr_data, val_data, te_data, tr_inds, val_inds, te_inds, transfor
         )
         val_loader = LinkNeighborLoader(val_data,num_neighbors=args.num_neighs, edge_label_index=val_data.edge_index[:, val_inds],
                                         edge_label=val_data.y[val_inds], batch_size=args.batch_size, shuffle=False, transform=transform, **lw)
-        te_loader =  LinkNeighborLoader(te_data,num_neighbors=args.num_neighs, edge_label_index=te_data.edge_index[:, te_inds],
-                                edge_label=te_data.y[te_inds], batch_size=args.batch_size, shuffle=False, transform=transform, **lw)
+        if int(te_inds.numel()) == 0:
+            te_loader = val_loader
+        else:
+            te_loader =  LinkNeighborLoader(te_data,num_neighbors=args.num_neighs, edge_label_index=te_data.edge_index[:, te_inds],
+                                    edge_label=te_data.y[te_inds], batch_size=args.batch_size, shuffle=False, transform=transform, **lw)
 
     return tr_loader, val_loader, te_loader
 
@@ -584,6 +591,32 @@ def save_model(model, optimizer, epoch, args, data_config, *, suffix: str = ""):
     proj_head = getattr(args, "contrast_projection_module", None)
     if proj_head is not None:
         payload["contrast_projection_state_dict"] = proj_head.state_dict()
+    tfmoe = getattr(args, "direct_r198_tfmoe_bundle", None)
+    if tfmoe is not None:
+        payload["direct_r198_tfmoe_state_dict"] = tfmoe.state_dict()
+        payload["direct_r198_tfmoe_meta"] = {
+            "target_names": list(getattr(tfmoe, "target_names", [])),
+            "uses_labels": False,
+            "attach": "view1_R198_seeds",
+            "discard_at_extract": True,
+        }
+    ab = getattr(args, "direct_r198_alpha_beta", None)
+    if ab is not None:
+        payload["direct_r198_alpha_beta_state_dict"] = ab.state_dict()
+        payload["direct_r198_effective_weights"] = ab.effective_weights()
+    payload["direct_r198_infonce"] = bool(getattr(args, "direct_r198_infonce", False))
+    payload["direct_r198_tfmoe"] = bool(getattr(args, "direct_r198_tfmoe", False))
+    sched = getattr(args, "_direct_r198_scheduler", None)
+    if sched is not None and hasattr(sched, "checkpoint_payload"):
+        payload.update(sched.checkpoint_payload())
+    elif sched is not None:
+        payload["scheduler_type"] = type(sched).__name__
+        payload["scheduler_state_dict"] = (
+            sched.state_dict() if hasattr(sched, "state_dict") else None
+        )
+        payload["current_lr_per_group"] = [
+            float(g["lr"]) for g in optimizer.param_groups
+        ]
     tf_head = getattr(args, "temporal_flow_aux_head", None)
     if tf_head is not None:
         payload["temporal_flow_aux_state_dict"] = tf_head.state_dict()
@@ -908,6 +941,16 @@ class PreEmbeddingCapture:
         self.handles.clear()
 
 
+def _model_bypasses_embedding_head(model: torch.nn.Module) -> bool:
+    """True when encoder forward already returns R198 (DIRECT_H / legacy bypass)."""
+    if bool(getattr(model, "bypass_embedding_head", False)):
+        return True
+    for m in model.modules():
+        if bool(getattr(m, "bypass_embedding_head", False)):
+            return True
+    return False
+
+
 def _validate_representation_source(representation_source: str) -> str:
     src = str(representation_source or "post_embedding")
     if src not in REPRESENTATION_SOURCES:
@@ -937,6 +980,13 @@ def extract_seed_embeddings_homo(
     (``3*n_hidden``) captured via a forward hook; ``pre_dim``/``emb_dim`` locate the head.
     """
     representation_source = _validate_representation_source(representation_source)
+    # DIRECT_H: embedding_head is bypassed; forward output is already R198.
+    if representation_source == "pre_embedding_3h" and _model_bypasses_embedding_head(model):
+        representation_source = "post_embedding"
+        logging.info(
+            "pre_embedding_3h extract on bypass_embedding_head model: using forward R198 "
+            "(identical to post_embedding for DIRECT_H)"
+        )
     capture = (
         PreEmbeddingCapture(model, pre_dim=pre_dim, emb_dim=emb_dim or 128, head_spec=head_spec)
         if representation_source == "pre_embedding_3h"
@@ -1029,6 +1079,13 @@ def extract_seed_embeddings_hetero(
     See :func:`extract_seed_embeddings_homo` for the ``representation_source`` semantics.
     """
     representation_source = _validate_representation_source(representation_source)
+    if representation_source == "pre_embedding_3h" and _model_bypasses_embedding_head(model):
+        # Bypass models expose R198 as the forward edge embedding.
+        representation_source = "post_embedding"
+        logging.info(
+            "pre_embedding_3h extract on bypass_embedding_head model: using forward R198 "
+            "(identical to post_embedding for DIRECT_H)"
+        )
     capture = (
         PreEmbeddingCapture(model, pre_dim=pre_dim, emb_dim=emb_dim or 128, head_spec=head_spec)
         if representation_source == "pre_embedding_3h"
@@ -1288,6 +1345,7 @@ SUPERVISED_ARG_KEYS = (
     "ports", "tds", "ego", "seed", "n_epochs", "batch_size", "num_neighs",
     "override_lr", "override_n_hidden", "override_final_dropout", "finetune",
     "unique_name", "correct_reverse_edge_features", "preserve_seed_edges",
+    "skip_test_eval", "save_model", "train_fit_edge_znorm", "feature_contract",
 )
 
 
@@ -1341,10 +1399,23 @@ def _atomic_torch_save(payload: Dict[str, Any], path: Path) -> None:
 def _supervised_split_metrics(
     y_true: np.ndarray, y_pred_argmax: np.ndarray, y_proba: np.ndarray
 ) -> Dict[str, float]:
+    tp = float(((y_pred_argmax == 1) & (y_true == 1)).sum())
+    fp = float(((y_pred_argmax == 1) & (y_true == 0)).sum())
+    tn = float(((y_pred_argmax == 0) & (y_true == 0)).sum())
+    fn = float(((y_pred_argmax == 0) & (y_true == 1)).sum())
+    n = float(y_true.shape[0])
     metrics = {
         "f1_argmax": float(f1_score(y_true, y_pred_argmax, zero_division=0)),
         "precision_argmax": float(precision_score(y_true, y_pred_argmax, zero_division=0)),
         "recall_argmax": float(recall_score(y_true, y_pred_argmax, zero_division=0)),
+        "tp": tp,
+        "fp": fp,
+        "tn": tn,
+        "fn": fn,
+        "positive_prediction_rate": float(y_pred_argmax.mean()) if n else 0.0,
+        "n": n,
+        "n_positives": float(int(y_true.sum())),
+        "positive_coverage": float(tp / max(float(int(y_true.sum())), 1.0)),
     }
     if np.unique(y_true).size < 2:
         metrics["auroc"] = float("nan")
@@ -1447,12 +1518,13 @@ def evaluate_supervised_split(loader, inds, model, data, device, args) -> Dict[s
 
 
 def supervised_run_metadata(args, config) -> Dict[str, Any]:
-    return {
+    meta = {
         "run_name": supervised_run_name(args),
         "dataset": getattr(args, "data", None),
         "seed": int(getattr(args, "seed", -1)),
         "model_architecture": getattr(args, "model", None),
         "supervised_head": getattr(args, "supervised_head", "embedding"),
+        "args": {k: getattr(args, k, None) for k in SUPERVISED_ARG_KEYS},
         "graph_flags": {
             "emlps": bool(getattr(args, "emlps", False)),
             "reverse_mp": bool(getattr(args, "reverse_mp", False)),
@@ -1463,6 +1535,9 @@ def supervised_run_metadata(args, config) -> Dict[str, Any]:
                 getattr(args, "correct_reverse_edge_features", False)
             ),
             "preserve_seed_edges": bool(getattr(args, "preserve_seed_edges", False)),
+            "train_fit_edge_znorm": bool(getattr(args, "train_fit_edge_znorm", False)),
+            "skip_test_eval": bool(getattr(args, "skip_test_eval", False)),
+            "save_model": bool(getattr(args, "save_model", False)),
             "reverse_edge_feature_semantics": (
                 getattr(args, "reverse_edge_feature_semantics", None)
                 or (
@@ -1483,6 +1558,14 @@ def supervised_run_metadata(args, config) -> Dict[str, Any]:
         "decision_rule": DECISION_RULE_ARGMAX,
         "created_utc": datetime.now(timezone.utc).isoformat(),
     }
+    # Versioned PaySim-native contract / scaler metadata (omit when absent).
+    fc = getattr(args, "feature_contract_summary", None)
+    if fc is not None:
+        meta["feature_contract_summary"] = fc
+    scaler = getattr(args, "native_edge_scaler", None)
+    if scaler is not None:
+        meta["native_edge_scaler"] = scaler
+    return meta
 
 
 class SupervisedHistoryRecorder:
