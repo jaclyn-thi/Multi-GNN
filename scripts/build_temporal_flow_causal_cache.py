@@ -5,10 +5,14 @@ Computes the five strictly causal features once per dataset and writes an atomic
 cache. AMLWorld datasets use ``results/cache/temporal_flow_causal/{dataset}/``
 with version ``temporal_flow_causal_v1``. PaySim uses ``temporal_flow_cache/PaySim/``
 with version ``temporal_flow_causal_paysim_v1`` (does not overwrite AML caches).
+SAML-D shared-core Phase-1 uses
+``results/cache/temporal_flow_causal_samld_shared_core_v1/SAML-D/`` with version
+``temporal_flow_causal_samld_shared_core_v1`` (train/val only; no test cache).
 
-Cross-split history policy: features are computed on the full CSV in global timestamp
-order. Validation rows reflect all prior training transactions; test rows reflect
-training + validation history. Labels are not used for features.
+Cross-split history policy: features are computed in global timestamp order.
+Validation rows reflect all prior training transactions; when test rows are
+retained, they reflect training + validation history. Labels are not used for
+features. SAML-D Phase-1 retains train∪val rows only.
 
 Timestamp ties (canonical AML policy B): equal timestamps are featurized as a batch
 using history strictly before that timestamp; state updates after the batch.
@@ -49,9 +53,20 @@ from util import logger_setup
 
 CACHE_VERSION_AML = "temporal_flow_causal_v1"
 CACHE_VERSION_PAYSIM = "temporal_flow_causal_paysim_v1"
+CACHE_VERSION_SAMLD_SHARED_CORE = "temporal_flow_causal_samld_shared_core_v1"
 DEFAULT_CACHE_ROOT_AML = "results/cache/temporal_flow_causal"
 DEFAULT_CACHE_ROOT_PAYSIM = "temporal_flow_cache"
-SUPPORTED_DATASETS = ("Small-HI", "Small-LI", "PaySim")
+DEFAULT_CACHE_ROOT_SAMLD_SHARED_CORE = (
+    "results/cache/temporal_flow_causal_samld_shared_core_v1"
+)
+SUPPORTED_DATASETS = ("Small-HI", "Small-LI", "PaySim", "SAML-D")
+
+# MoE targets (subset of the five causal features); standardization is train-only.
+MOE_TARGET_NAMES = (
+    "log1p_sender_interarrival",
+    "log1p_sender_past_7d_count",
+    "log1p_amount_vs_sender_past_mean",
+)
 
 TIE_POLICY_ID = "B_simultaneous_batch_strictly_earlier_timestamps"
 TIE_POLICY_DESCRIPTION = (
@@ -127,11 +142,52 @@ def _atomic_save_npy(final_path: Path, arr: np.ndarray) -> None:
 
 
 def cache_version_for(data: str) -> str:
-    return CACHE_VERSION_PAYSIM if data == "PaySim" else CACHE_VERSION_AML
+    if data == "PaySim":
+        return CACHE_VERSION_PAYSIM
+    if data == "SAML-D":
+        return CACHE_VERSION_SAMLD_SHARED_CORE
+    return CACHE_VERSION_AML
 
 
 def default_cache_root_for(data: str) -> str:
-    return DEFAULT_CACHE_ROOT_PAYSIM if data == "PaySim" else DEFAULT_CACHE_ROOT_AML
+    if data == "PaySim":
+        return DEFAULT_CACHE_ROOT_PAYSIM
+    if data == "SAML-D":
+        return DEFAULT_CACHE_ROOT_SAMLD_SHARED_CORE
+    return DEFAULT_CACHE_ROOT_AML
+
+
+def _moe_train_scaler(
+    features: np.ndarray,
+    train_edge_ids: np.ndarray,
+    edge_id: np.ndarray,
+    feature_names: Sequence[str],
+) -> Dict[str, Any]:
+    """Train-only mean/std for the three MoE targets (dataset-specific)."""
+    name_to_idx = {n: i for i, n in enumerate(feature_names)}
+    cols_idx = [name_to_idx[n] for n in MOE_TARGET_NAMES]
+    # Map train EdgeIDs → rows in features/edge_id arrays
+    id_to_row = {int(e): i for i, e in enumerate(edge_id.tolist())}
+    try:
+        rows = np.array([id_to_row[int(e)] for e in train_edge_ids.tolist()], dtype=np.int64)
+    except KeyError as exc:
+        raise RuntimeError(f"Train EdgeID missing from cache rows: {exc}") from exc
+    tr = features[rows][:, cols_idx].astype(np.float64)
+    tr = np.nan_to_num(tr, nan=0.0, posinf=0.0, neginf=0.0)
+    mean = tr.mean(axis=0)
+    scale = tr.std(axis=0)
+    scale = np.where(scale < 1e-6, 1.0, scale)
+    payload = np.concatenate([mean, scale]).tobytes()
+    return {
+        "target_names": list(MOE_TARGET_NAMES),
+        "target_indices_in_features": cols_idx,
+        "train_only": True,
+        "n_train": int(rows.shape[0]),
+        "mean": mean.tolist(),
+        "scale": scale.tolist(),
+        "scaler_sha256": hashlib.sha256(payload).hexdigest(),
+        "reuses_small_hi_statistics": False,
+    }
 
 
 def timestamp_multiplicity_stats(timestamps: np.ndarray) -> Dict[str, Any]:
@@ -196,7 +252,9 @@ def chronological_edge_fraction_split(
 
 
 def resolve_amount_for_dataset(df: pd.DataFrame, data: str) -> str:
-    """PaySim amount maps to Amount Received via formatter; still resolve dynamically."""
+    """Prefer Amount Received for shared AML/SAML-D and PaySim formatted schemas."""
+    if data in ("SAML-D", "Small-HI", "Small-LI") and "Amount Received" in df.columns:
+        return "Amount Received"
     col = resolve_amount_column(df)
     if data == "PaySim" and "Amount Received" in df.columns and col != "Amount Received":
         # Prefer the canonical AML schema channel when present.
@@ -213,9 +271,18 @@ def build_cache(
     overwrite: bool = False,
     max_timestamps: Optional[int] = None,
     write_test_split_files: bool = True,
+    train_val_only: Optional[bool] = None,
 ) -> Path:
     if data not in SUPPORTED_DATASETS:
         raise ValueError(f"Unsupported dataset {data!r}; choose from {SUPPORTED_DATASETS}")
+
+    samld_shared = data == "SAML-D"
+    if train_val_only is None:
+        train_val_only = bool(samld_shared)
+    if samld_shared:
+        # Phase-1 SAML-D shared-core protocol: no test cache materialization.
+        write_test_split_files = False
+        train_val_only = True
 
     spec = get_dataset_spec(data)
     cfg = load_data_config(data_config_path)
@@ -227,6 +294,7 @@ def build_cache(
     meta_path = out_dir / "meta.json"
     features_path = out_dir / "features.npy"
     edge_id_path = out_dir / "edge_id.npy"
+    expected_version = cache_version_for(data)
 
     # Never allow PaySim writes under the AML cache root accidentally.
     if data == "PaySim" and "temporal_flow_causal" in str(cache_root) and "temporal_flow_cache" not in str(cache_root):
@@ -234,27 +302,56 @@ def build_cache(
             f"Refusing to write PaySim TF under AML cache root {cache_root}; "
             f"use --cache_root {DEFAULT_CACHE_ROOT_PAYSIM}"
         )
+    if samld_shared and "samld_shared_core" not in str(cache_root):
+        raise SystemExit(
+            f"Refusing SAML-D TF write under non-unique root {cache_root}; "
+            f"use --cache_root {DEFAULT_CACHE_ROOT_SAMLD_SHARED_CORE}"
+        )
 
-    if meta_path.is_file() and features_path.is_file() and not overwrite:
-        logging.info("Cache already exists at %s (use --overwrite to rebuild)", out_dir)
-        return out_dir
+    if meta_path.is_file() and features_path.is_file():
+        prev = json.loads(meta_path.read_text(encoding="utf-8"))
+        prev_ver = str(prev.get("cache_version"))
+        if prev_ver != expected_version and not overwrite:
+            raise RuntimeError(
+                f"Refusing nonmatching cache at {out_dir}: "
+                f"existing={prev_ver!r} expected={expected_version!r} "
+                f"(pass --overwrite only after intentional rebuild)"
+            )
+        if not overwrite:
+            logging.info("Cache already exists at %s (use --overwrite to rebuild)", out_dir)
+            return out_dir
 
     logging.info("Loading %s", csv_path)
     df = pd.read_csv(csv_path)
     required = ["Timestamp", "from_id", "to_id", spec.label_col]
+    if samld_shared:
+        required.append("Amount Received")
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"{data} CSV missing columns: {missing}")
 
-    # Stable edge identity: prefer EdgeID column when it matches row index.
+    # Stable edge identity: prefer EdgeID column when unique.
+    # SAML-D formatter assigns EdgeID then sorts by Timestamp, so EdgeID is unique
+    # in [0, n) but not equal to post-sort CSV row index. Retain EdgeID for joins.
+    edge_id_equals_row_index = True
     if "EdgeID" in df.columns:
         edge_id_col = df["EdgeID"].to_numpy(dtype=np.int64)
-        if not np.array_equal(edge_id_col, np.arange(len(df), dtype=np.int64)):
+        if int(edge_id_col.shape[0]) != len(df):
+            raise ValueError(f"{data}: EdgeID length mismatch")
+        if len(set(edge_id_col.tolist())) != int(edge_id_col.shape[0]):
+            raise ValueError(f"{data}: duplicate EdgeIDs; refusing cache build")
+        edge_id_equals_row_index = bool(
+            np.array_equal(edge_id_col, np.arange(len(df), dtype=np.int64))
+        )
+        if not edge_id_equals_row_index and data not in ("SAML-D",):
             raise ValueError(
                 f"{data}: EdgeID is not equal to row index; refusing silent CSV-order join"
             )
-    edge_id = np.arange(len(df), dtype=np.int64)
+        edge_id = edge_id_col.copy()
+    else:
+        edge_id = np.arange(len(df), dtype=np.int64)
 
+    df = df.copy()
     df["Timestamp"] = df["Timestamp"] - df["Timestamp"].min()
     amount_col = resolve_amount_for_dataset(df, data)
     multiplicity = timestamp_multiplicity_stats(df["Timestamp"].to_numpy())
@@ -277,7 +374,7 @@ def build_cache(
     y = torch.LongTensor(df[spec.label_col].to_numpy())
     timestamps = torch.Tensor(df["Timestamp"].to_numpy())
     smoke_split_meta: Optional[Dict[str, Any]] = None
-    if max_timestamps is not None:
+    if max_timestamps is not None and not samld_shared:
         # Tiny prefixes can make temporal_edge_split assign an empty train set
         # (observed on PaySim with 8 hourly steps). Smoke only needs non-empty
         # partitions for metadata; TF features themselves are label/split-free.
@@ -297,12 +394,41 @@ def build_cache(
         )
     else:
         tr_inds, val_inds, te_inds, split_buckets = temporal_edge_split(timestamps, y, spec)
-        if tr_inds.numel() == 0 or val_inds.numel() == 0 or te_inds.numel() == 0:
+        if tr_inds.numel() == 0 or val_inds.numel() == 0:
             raise RuntimeError(
-                f"temporal_edge_split returned an empty partition for {data}: "
-                f"train={int(tr_inds.numel())} val={int(val_inds.numel())} "
-                f"test={int(te_inds.numel())}"
+                f"temporal_edge_split returned empty train/val for {data}: "
+                f"train={int(tr_inds.numel())} val={int(val_inds.numel())}"
             )
+        if write_test_split_files and te_inds.numel() == 0:
+            raise RuntimeError(
+                f"temporal_edge_split returned empty test for {data}"
+            )
+
+    if train_val_only:
+        # Drop test rows before feature construction (no test cache / inspection).
+        keep_pos = np.unique(
+            np.concatenate(
+                [tr_inds.numpy().astype(np.int64), val_inds.numpy().astype(np.int64)]
+            )
+        )
+        keep_pos.sort()
+        df = df.iloc[keep_pos].reset_index(drop=True)
+        edge_id = edge_id[keep_pos]
+        y = y[keep_pos]
+        old_to_new = {int(old): new for new, old in enumerate(keep_pos.tolist())}
+        tr_inds = torch.tensor(
+            [old_to_new[int(i)] for i in tr_inds.tolist()], dtype=torch.long
+        )
+        val_inds = torch.tensor(
+            [old_to_new[int(i)] for i in val_inds.tolist()], dtype=torch.long
+        )
+        te_inds = torch.tensor([], dtype=torch.long)
+        logging.info(
+            "train_val_only: retained %d rows (train=%d val=%d; test excluded)",
+            len(df),
+            int(tr_inds.numel()),
+            int(val_inds.numel()),
+        )
 
     logging.info("Computing temporal_flow_causal features (%d rows)", len(df))
     features, feature_names = compute_temporal_flow_causal_features(df, amount_col=amount_col)
@@ -323,25 +449,48 @@ def build_cache(
     # Map split indices: when subsetting, split returns positions in subset df
     # but edge_id holds original CSV indices. Remap split files to original edge_ids.
     split_edge_ids = {k: edge_id[v] for k, v in split_arrays.items()}
+    if set(split_edge_ids["train"].tolist()) & set(split_edge_ids["val"].tolist()):
+        raise RuntimeError("train/val EdgeID overlap")
+    if len(set(edge_id.tolist())) != int(edge_id.size):
+        raise RuntimeError("Duplicate EdgeIDs in cache rows")
 
-    cache_version = cache_version_for(data)
+    moe_scaler = _moe_train_scaler(
+        features, split_edge_ids["train"], edge_id, feature_names
+    )
+    cache_version = expected_version
     meta: Dict[str, Any] = {
         "cache_version": cache_version,
         "dataset": data,
+        "feature_contract_id": (
+            "smallhi_samld_shared_core_v1" if samld_shared else None
+        ),
         "feature_group": "temporal_flow_causal",
         "feature_names": list(TEMPORAL_FLOW_CAUSAL_FEATURE_NAMES),
         "feature_definitions": TEMPORAL_FLOW_CAUSAL_DEFINITIONS,
+        "moe_targets": list(MOE_TARGET_NAMES),
+        "moe_target_train_scaler": moe_scaler,
         "n_rows": int(len(df)),
         "n_features": int(features.shape[1]),
-        "row_order": "features[i] corresponds to edge_id[i]; edge_id is CSV row index",
-        "edge_id_policy": "CSV row index (== EdgeID when present and contiguous)",
+        "row_order": (
+            "features[i] corresponds to edge_id[i] (EdgeID of CSV row i after load)"
+        ),
+        "edge_id_policy": (
+            "formatted CSV EdgeID column (unique); may differ from post-sort row index "
+            "on SAML-D"
+            if not edge_id_equals_row_index
+            else "CSV row index (== EdgeID when present and contiguous)"
+        ),
+        "edge_id_equals_row_index": bool(edge_id_equals_row_index),
+        "test_split_written": bool(write_test_split_files),
+        "train_val_only": bool(train_val_only),
         "split_row_counts": {k: int(v.shape[0]) for k, v in split_edge_ids.items()},
         "split_indices_files": {k: f"split_{k}_edge_id.npy" for k in split_edge_ids},
         "timestamp_handling": {
             "policy": "global_timestamp_sort_mergesort",
             "tie_policy_id": TIE_POLICY_ID,
             "timestamp_ties": TIE_POLICY_DESCRIPTION,
-            "timestamp_shift": "Timestamp -= min(Timestamp) over full (or smoke-subset) CSV",
+            "timestamp_units": "seconds",
+            "timestamp_shift": "Timestamp -= min(Timestamp) over retained CSV rows",
             "does_not_rely_on_csv_row_order_within_ties": True,
             "alternative_rejected": (
                 "A_stable_Timestamp_edge_id_order would create arbitrary within-step "
@@ -353,7 +502,7 @@ def build_cache(
             "past_only": True,
             "uses_labels": False,
             "val_sees_train_history": True,
-            "test_sees_train_and_val_history": True,
+            "test_sees_train_and_val_history": bool(write_test_split_files and not train_val_only),
             "window_7d_sec": TEMPORAL_FLOW_CAUSAL_WINDOW_7D_SEC,
             "window_note_paysim": (
                 "W=604800s with Timestamp=step*3600 => 168 PaySim steps; valid past window"
@@ -368,7 +517,11 @@ def build_cache(
                 "pair_repeat_indicator": 0.0,
             },
             "normalization_at_cache_time": "none (raw causal values)",
-            "scaler_policy": "deferred_to_probe_StandardScaler_fit_train_only",
+            "scaler_policy": (
+                "moe_targets_train_fit_standardization_in_moe_target_train_scaler"
+                if samld_shared
+                else "deferred_to_probe_StandardScaler_fit_train_only"
+            ),
             "implementation": "morphology.temporal_flow_causal.compute_temporal_flow_causal_features",
         },
         "field_mapping": {
@@ -389,35 +542,71 @@ def build_cache(
         "split_buckets": split_buckets,
         "smoke_split": smoke_split_meta,
         "feature_summary": feature_summary_stats(features),
+        "coverage": {
+            "n_feature_rows": int(features.shape[0]),
+            "n_train": int(split_edge_ids["train"].shape[0]),
+            "n_val": int(split_edge_ids["val"].shape[0]),
+            "moe_finite_fraction": float(
+                np.isfinite(
+                    features[
+                        :,
+                        [
+                            list(TEMPORAL_FLOW_CAUSAL_FEATURE_NAMES).index(n)
+                            for n in MOE_TARGET_NAMES
+                        ],
+                    ]
+                ).mean()
+            ),
+        },
         "prevalence": {
-            "positive_rate_full": float(y.float().mean().item()),
+            "n_train": int(tr_inds.numel()),
+            "n_val": int(val_inds.numel()),
+            "n_pos_train": int(y[tr_inds].sum().item()),
+            "n_pos_val": int(y[val_inds].sum().item()),
             "positive_rate_train": float(y[tr_inds].float().mean().item()),
             "positive_rate_val": float(y[val_inds].float().mean().item()),
-            "positive_rate_test": float(y[te_inds].float().mean().item()) if write_test_split_files else None,
+            "positive_rate_test": (
+                float(y[te_inds].float().mean().item())
+                if write_test_split_files and te_inds.numel() > 0
+                else None
+            ),
+            "note": "Label counts from split metadata only; unused in TF construction",
         },
         "labels_used_in_feature_construction": False,
+        "reuses_small_hi_target_statistics": False,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "code_metadata": {
             "script": "scripts/build_temporal_flow_causal_cache.py",
             "module": "morphology/temporal_flow_causal.py",
             "source_code_sha256": _code_hashes(),
-            "features_sha256": _sha256_bytes(features.tobytes()),
+            "features_sha256": _sha256_bytes(features.astype(np.float32).tobytes()),
             "edge_id_sha256": _sha256_bytes(edge_id.tobytes()),
+            "moe_scaler_sha256": moe_scaler["scaler_sha256"],
         },
         "phase1_note": (
-            "Full-row TF matrix may include test-row features for expanding-window "
-            "parity; Phase-1 PaySim downstream evaluation must not use test metrics."
-            if data == "PaySim"
-            else None
+            "SAML-D shared-core Phase-1: train/val TF only; MoE target scaler is "
+            "dataset-specific (never reuses Small-HI statistics)."
+            if samld_shared
+            else (
+                "Full-row TF matrix may include test-row features for expanding-window "
+                "parity; Phase-1 PaySim downstream evaluation must not use test metrics."
+                if data == "PaySim"
+                else None
+            )
         ),
     }
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    test_split_path = out_dir / "split_test_edge_id.npy"
+    if not write_test_split_files and test_split_path.is_file():
+        test_split_path.unlink()
     _atomic_save_npy(features_path, features.astype(np.float32))
-    _atomic_save_npy(edge_id_path, edge_id)
+    _atomic_save_npy(edge_id_path, edge_id.astype(np.int64))
     for split_name, idx in split_edge_ids.items():
-        _atomic_save_npy(out_dir / f"split_{split_name}_edge_id.npy", idx)
+        _atomic_save_npy(out_dir / f"split_{split_name}_edge_id.npy", idx.astype(np.int64))
     _atomic_write_json(meta_path, meta)
+    if samld_shared:
+        _atomic_write_json(out_dir / "moe_target_train_scaler.json", moe_scaler)
 
     logging.info("Wrote cache to %s (version=%s)", out_dir, cache_version)
     return out_dir
@@ -432,7 +621,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=None,
         help=(
             "Root directory for dataset caches. Defaults: "
-            f"{DEFAULT_CACHE_ROOT_AML} for AMLWorld, {DEFAULT_CACHE_ROOT_PAYSIM} for PaySim."
+            f"{DEFAULT_CACHE_ROOT_AML} for AMLWorld, {DEFAULT_CACHE_ROOT_PAYSIM} for PaySim, "
+            f"{DEFAULT_CACHE_ROOT_SAMLD_SHARED_CORE} for SAML-D."
         ),
     )
     p.add_argument("--overwrite", action="store_true")
@@ -445,7 +635,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--no_test_split_files",
         action="store_true",
-        help="Omit split_test_edge_id.npy (Phase-1 option; features still cover all rows).",
+        help="Omit split_test_edge_id.npy (forced for SAML-D).",
+    )
+    p.add_argument(
+        "--train_val_only",
+        action="store_true",
+        help="Retain train∪val rows only (forced for SAML-D).",
     )
     return p.parse_args(argv)
 
@@ -461,6 +656,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         overwrite=bool(args.overwrite),
         max_timestamps=args.max_timestamps,
         write_test_split_files=not bool(args.no_test_split_files),
+        train_val_only=True if args.train_val_only else None,
     )
 
 

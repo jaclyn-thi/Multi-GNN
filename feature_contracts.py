@@ -167,6 +167,15 @@ def resolve_feature_contract_id(raw: Optional[str]) -> Optional[str]:
     # Native Multi-GIN is a separate family (not AML slot neutralization).
     if s == "paysim_native_multigin_core_v1":
         return s
+    # Mixed-SSL shared core (Small-HI + SAML-D); not a PaySim v1 neutralization.
+    if s == "smallhi_samld_shared_core_v1":
+        return s
+    # Phase-4A multi-dataset shared core (broader registry; same geometry).
+    if s == "financial_multidataset_shared_core_v1":
+        return s
+    # Phase-4C four-domain protocol (same geometry; includes PaySim).
+    if s == "financial_multidataset_shared_core_4domain_v1":
+        return s
     return get_feature_contract(s).contract_id
 
 
@@ -179,6 +188,8 @@ def apply_feature_contract_to_base_edge_attr(
     Legacy / omitted contract: return ``edge_attr`` unchanged (bit-exact path).
     Neutral slots: set to ``NEUTRAL_RAW_VALUE`` in-place on a clone.
     Native Multi-GIN contracts must not use this path (builder replaces base attr).
+    Shared-core (``smallhi_samld_shared_core_v1``) must use ``shared_core_contract``
+    selection, not this PaySim neutralization path.
     """
     if contract_id is None:
         return edge_attr, None
@@ -186,6 +197,23 @@ def apply_feature_contract_to_base_edge_attr(
         raise ValueError(
             "paysim_native_multigin_core_v1 must be built via paysim_native_multigin "
             "loader, not apply_feature_contract_to_base_edge_attr"
+        )
+    if contract_id == "smallhi_samld_shared_core_v1":
+        raise ValueError(
+            "smallhi_samld_shared_core_v1 must be applied via shared_core_contract "
+            "select_shared_core_base_edge_attr (drops categoricals to base_dim=2)"
+        )
+    if contract_id == "financial_multidataset_shared_core_v1":
+        raise ValueError(
+            "financial_multidataset_shared_core_v1 must be applied via "
+            "financial_multidataset_shared_core_contract "
+            "(drops categoricals to base_dim=2)"
+        )
+    if contract_id == "financial_multidataset_shared_core_4domain_v1":
+        raise ValueError(
+            "financial_multidataset_shared_core_4domain_v1 must be applied via "
+            "financial_multidataset_shared_core_4domain_contract "
+            "(drops categoricals to base_dim=2; PaySim fraud_detection)"
         )
 
     contract = get_feature_contract(contract_id)

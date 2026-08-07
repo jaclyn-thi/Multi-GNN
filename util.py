@@ -189,10 +189,11 @@ def create_parser():
         type=str,
         default=None,
         help=(
-            "Optional versioned PaySim edge-feature contract ID "
-            "(e.g. paysim_type_only_v1). Omit for bit-exact historical PaySim "
-            "loading (type duplicated into currency + payment-format). "
-            "PaySim-only; does not alter AMLWorld datasets."
+            "Optional versioned edge-feature contract ID. PaySim examples: "
+            "paysim_type_only_v1, paysim_legacy_duplicate_v1. Mixed-SSL shared "
+            "core for Small-HI/SAML-D: smallhi_samld_shared_core_v1 (edge_dim=6 = "
+            "Timestamp+Amount+ports+TDS; not historical supervised ports-only dim6). "
+            "Omit for bit-exact historical PaySim loading."
         ),
     )
 
@@ -448,6 +449,25 @@ def create_parser():
         help="Optional path to temporal_flow_causal cache dir (default results/cache/temporal_flow_causal/<data>).",
     )
     parser.add_argument(
+        "--direct_r198_tfmoe_weight_mode",
+        type=str,
+        default="adaptive",
+        choices=[
+            "adaptive",
+            "fixed_balanced",
+            "adaptive_contrast_floor",
+            "expert_only",
+            "fixed_current_early",
+        ],
+        help=(
+            "TFMOE objective weighting. 'adaptive' = production learned α/β. "
+            "Ablations: fixed_balanced (0.5 / 1/6/1/6/1/6), "
+            "adaptive_contrast_floor (w_contrast=max(α,0.25)), "
+            "expert_only (w_contrast=0, learned β among experts), "
+            "fixed_current_early (freeze epoch-10 lr=2e-3 adaptive weights)."
+        ),
+    )
+    parser.add_argument(
         "--direct_r198_log_dir",
         type=str,
         default="",
@@ -458,6 +478,17 @@ def create_parser():
         type=str,
         default="1,3,5,10",
         help="Comma-separated 1-indexed epochs to snapshot as checkpoint_<name>_epochXX.tar.",
+    )
+    parser.add_argument(
+        "--direct_r198_lr_schedule",
+        type=str,
+        default="cosine",
+        choices=["cosine", "linear"],
+        help=(
+            "DIRECT_R198 optimizer-step LR schedule with --direct_r198_infonce: "
+            "'cosine' (default; warmup then cosine 1.0→0.1) or "
+            "'linear' (warmup then linear 1.0→0.1)."
+        ),
     )
     parser.add_argument(
         "--edge_drop_policy",

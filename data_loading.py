@@ -18,6 +18,37 @@ from feature_contracts import (
     apply_feature_contract_to_base_edge_attr,
     resolve_feature_contract_id,
 )
+from shared_core_contract import (
+    CONTRACT_SHARED_CORE_V1,
+    SHARED_CORE_BASE_FEATURE_NAMES,
+    SHARED_CORE_FINAL_FEATURE_NAMES,
+    apply_train_fit_znorm_with_provenance,
+    assert_dataset_allowed as assert_shared_core_dataset,
+    assert_no_label_column_in_features,
+    assert_shared_core_final_schema,
+    is_shared_core_contract,
+    select_shared_core_base_edge_attr,
+    shared_core_summary,
+)
+from financial_multidataset_shared_core_contract import (
+    CONTRACT_FINANCIAL_MULTIDATASET_SHARED_CORE_V1,
+    BASE_FEATURE_NAMES as FIN_MD_BASE_FEATURE_NAMES,
+    FINAL_FEATURE_NAMES as FIN_MD_FINAL_FEATURE_NAMES,
+    apply_train_fit_znorm_with_provenance as apply_fin_md_train_fit_znorm,
+    assert_dataset_allowed as assert_fin_md_dataset,
+    assert_financial_md_final_schema,
+    financial_multidataset_shared_core_summary,
+    is_financial_multidataset_shared_core,
+    select_financial_md_base_edge_attr,
+)
+from financial_multidataset_shared_core_4domain_contract import (
+    CONTRACT_FINANCIAL_MULTIDATASET_SHARED_CORE_4DOMAIN_V1,
+    assert_dataset_allowed as assert_fin_md_4domain_dataset,
+    assert_financial_md_4domain_final_schema,
+    financial_multidataset_shared_core_4domain_summary,
+    is_financial_multidataset_shared_core_4domain,
+    select_financial_md_4domain_base_edge_attr,
+)
 from paysim_native_multigin import (  # noqa: E402
     CONTRACT_NATIVE_MULTIGIN_CORE,
     EXPECTED_BASE_DIM,
@@ -183,20 +214,96 @@ def get_data(args, data_config):
     else:
         edge_attr = torch.tensor(df_edges.loc[:, edge_features].to_numpy()).float()
 
-        # PaySim feature contracts act on base semantic columns only. Omitted flag ⇒
-        # no transform (bit-exact historical path). AMLWorld datasets ignore PaySim IDs.
+        # Feature contracts:
+        # - PaySim v1 neutralization (PaySim-only)
+        # - smallhi_samld_shared_core_v1 drops categoricals → base_dim=2 (Small-HI/SAML-D)
+        # - financial_multidataset_shared_core_v1 same geometry; broader registry
         if contract_id is not None:
-            if args.data != "PaySim":
+            if is_shared_core_contract(contract_id):
+                assert_shared_core_dataset(args.data)
+                if not bool(getattr(args, "ports", False)) or not bool(
+                    getattr(args, "tds", False)
+                ):
+                    raise ValueError(
+                        f"{CONTRACT_SHARED_CORE_V1} requires --ports and --tds"
+                    )
+                edge_attr, sel_meta = select_shared_core_base_edge_attr(
+                    edge_attr, source_feature_names=edge_features
+                )
+                contract_summary = shared_core_summary(dataset=str(args.data))
+                contract_summary["selection"] = sel_meta
+                assert_no_label_column_in_features(
+                    SHARED_CORE_FINAL_FEATURE_NAMES, spec.label_col
+                )
+                args.edge_feature_schema_names = list(SHARED_CORE_BASE_FEATURE_NAMES)
+                logging.info(
+                    "Applied feature_contract=%s (base_dim=2; categoricals dropped; "
+                    "ports+TDS → edge_dim=6; NOT historical supervised ports-only dim6)",
+                    CONTRACT_SHARED_CORE_V1,
+                )
+            elif is_financial_multidataset_shared_core(contract_id):
+                assert_fin_md_dataset(args.data)
+                if not bool(getattr(args, "ports", False)) or not bool(
+                    getattr(args, "tds", False)
+                ):
+                    raise ValueError(
+                        f"{CONTRACT_FINANCIAL_MULTIDATASET_SHARED_CORE_V1} "
+                        "requires --ports and --tds"
+                    )
+                edge_attr, sel_meta = select_financial_md_base_edge_attr(
+                    edge_attr, source_feature_names=edge_features
+                )
+                contract_summary = financial_multidataset_shared_core_summary(
+                    dataset=str(args.data)
+                )
+                contract_summary["selection"] = sel_meta
+                assert_no_label_column_in_features(
+                    FIN_MD_FINAL_FEATURE_NAMES, spec.label_col
+                )
+                args.edge_feature_schema_names = list(FIN_MD_BASE_FEATURE_NAMES)
+                logging.info(
+                    "Applied feature_contract=%s (base_dim=2; categoricals dropped; "
+                    "ports+TDS → edge_dim=6; NOT historical supervised ports-only dim6)",
+                    CONTRACT_FINANCIAL_MULTIDATASET_SHARED_CORE_V1,
+                )
+            elif is_financial_multidataset_shared_core_4domain(contract_id):
+                assert_fin_md_4domain_dataset(args.data)
+                if not bool(getattr(args, "ports", False)) or not bool(
+                    getattr(args, "tds", False)
+                ):
+                    raise ValueError(
+                        f"{CONTRACT_FINANCIAL_MULTIDATASET_SHARED_CORE_4DOMAIN_V1} "
+                        "requires --ports and --tds"
+                    )
+                edge_attr, sel_meta = select_financial_md_4domain_base_edge_attr(
+                    edge_attr, source_feature_names=edge_features
+                )
+                contract_summary = financial_multidataset_shared_core_4domain_summary(
+                    dataset=str(args.data)
+                )
+                contract_summary["selection"] = sel_meta
+                assert_no_label_column_in_features(
+                    FIN_MD_FINAL_FEATURE_NAMES, spec.label_col
+                )
+                args.edge_feature_schema_names = list(FIN_MD_BASE_FEATURE_NAMES)
+                logging.info(
+                    "Applied feature_contract=%s (base_dim=2; categoricals dropped; "
+                    "ports+TDS → edge_dim=6; PaySim task=fraud_detection; "
+                    "NOT historical supervised ports-only dim6)",
+                    CONTRACT_FINANCIAL_MULTIDATASET_SHARED_CORE_4DOMAIN_V1,
+                )
+            elif args.data != "PaySim":
                 raise ValueError(
                     f"--feature_contract={contract_id} is PaySim-only; got --data={args.data}"
                 )
-            edge_attr, contract_summary = apply_feature_contract_to_base_edge_attr(
-                edge_attr, contract_id
-            )
-            logging.info(
-                "Applied feature_contract=%s (neutral→raw 0.0 before ports/TDS/z-norm)",
-                contract_id,
-            )
+            else:
+                edge_attr, contract_summary = apply_feature_contract_to_base_edge_attr(
+                    edge_attr, contract_id
+                )
+                logging.info(
+                    "Applied feature_contract=%s (neutral→raw 0.0 before ports/TDS/z-norm)",
+                    contract_id,
+                )
 
     bucket_sec = 24 * 3600 if spec.split_mode == "calendar_day" else 3600
     n_buckets = int(timestamps.max() / bucket_sec + 1)
@@ -303,6 +410,51 @@ def get_data(args, data_config):
     # - --train_fit_edge_znorm: fit mean/std on train edge_attr only; apply to val/test.
     # - Native Multi-GIN: train-fit on continuous columns only; one-hots unchanged.
     train_fit_edge = bool(getattr(args, "train_fit_edge_znorm", False))
+    shared_core = is_shared_core_contract(contract_id)
+    fin_md_core = is_financial_multidataset_shared_core(contract_id)
+    fin_md_4domain = is_financial_multidataset_shared_core_4domain(contract_id)
+    if shared_core:
+        if not train_fit_edge:
+            logging.warning(
+                "%s requires --train_fit_edge_znorm; enabling automatically",
+                CONTRACT_SHARED_CORE_V1,
+            )
+            train_fit_edge = True
+        assert_shared_core_final_schema(
+            tr_data.edge_attr,
+            feature_names=SHARED_CORE_FINAL_FEATURE_NAMES,
+            ports=bool(args.ports),
+            tds=bool(args.tds),
+        )
+        args.edge_feature_schema_names = list(SHARED_CORE_FINAL_FEATURE_NAMES)
+    if fin_md_core:
+        if not train_fit_edge:
+            logging.warning(
+                "%s requires --train_fit_edge_znorm; enabling automatically",
+                CONTRACT_FINANCIAL_MULTIDATASET_SHARED_CORE_V1,
+            )
+            train_fit_edge = True
+        assert_financial_md_final_schema(
+            tr_data.edge_attr,
+            feature_names=FIN_MD_FINAL_FEATURE_NAMES,
+            ports=bool(args.ports),
+            tds=bool(args.tds),
+        )
+        args.edge_feature_schema_names = list(FIN_MD_FINAL_FEATURE_NAMES)
+    if fin_md_4domain:
+        if not train_fit_edge:
+            logging.warning(
+                "%s requires --train_fit_edge_znorm; enabling automatically",
+                CONTRACT_FINANCIAL_MULTIDATASET_SHARED_CORE_4DOMAIN_V1,
+            )
+            train_fit_edge = True
+        assert_financial_md_4domain_final_schema(
+            tr_data.edge_attr,
+            feature_names=FIN_MD_FINAL_FEATURE_NAMES,
+            ports=bool(args.ports),
+            tds=bool(args.tds),
+        )
+        args.edge_feature_schema_names = list(FIN_MD_FINAL_FEATURE_NAMES)
     if native_multigin:
         if not train_fit_edge:
             logging.warning(
@@ -332,6 +484,76 @@ def get_data(args, data_config):
                 f"native edge_dim after ports={tr_data.edge_attr.shape[1]} "
                 f"!= {EXPECTED_EDGE_DIM_PORTS}"
             )
+    elif shared_core:
+        logging.info(
+            "Edge attr z-norm: %s train-fit per-dataset inductive "
+            "(fit on train only; apply to val; test unused under skip_test_eval)",
+            CONTRACT_SHARED_CORE_V1,
+        )
+        tr_data.edge_attr, val_data.edge_attr, scaler_meta = (
+            apply_train_fit_znorm_with_provenance(
+                tr_data.edge_attr,
+                val_data.edge_attr,
+                dataset=str(args.data),
+            )
+        )
+        te_data.edge_attr = val_data.edge_attr.clone()
+        if contract_summary is not None:
+            contract_summary["scaler"] = scaler_meta
+        args.shared_core_edge_scaler = scaler_meta
+        assert_shared_core_final_schema(
+            tr_data.edge_attr,
+            feature_names=SHARED_CORE_FINAL_FEATURE_NAMES,
+            ports=True,
+            tds=True,
+        )
+    elif fin_md_core:
+        logging.info(
+            "Edge attr z-norm: %s train-fit per-dataset inductive "
+            "(fit on train only; apply to val; test unused under skip_test_eval)",
+            CONTRACT_FINANCIAL_MULTIDATASET_SHARED_CORE_V1,
+        )
+        tr_data.edge_attr, val_data.edge_attr, scaler_meta = (
+            apply_fin_md_train_fit_znorm(
+                tr_data.edge_attr,
+                val_data.edge_attr,
+                dataset=str(args.data),
+            )
+        )
+        te_data.edge_attr = val_data.edge_attr.clone()
+        if contract_summary is not None:
+            contract_summary["scaler"] = scaler_meta
+        args.shared_core_edge_scaler = scaler_meta
+        assert_financial_md_final_schema(
+            tr_data.edge_attr,
+            feature_names=FIN_MD_FINAL_FEATURE_NAMES,
+            ports=True,
+            tds=True,
+        )
+    elif fin_md_4domain:
+        logging.info(
+            "Edge attr z-norm: %s train-fit per-dataset inductive "
+            "(fit on train only; apply to val; test unused under skip_test_eval; "
+            "PaySim=fraud_detection)",
+            CONTRACT_FINANCIAL_MULTIDATASET_SHARED_CORE_4DOMAIN_V1,
+        )
+        tr_data.edge_attr, val_data.edge_attr, scaler_meta = (
+            apply_fin_md_train_fit_znorm(
+                tr_data.edge_attr,
+                val_data.edge_attr,
+                dataset=str(args.data),
+            )
+        )
+        te_data.edge_attr = val_data.edge_attr.clone()
+        if contract_summary is not None:
+            contract_summary["scaler"] = scaler_meta
+        args.shared_core_edge_scaler = scaler_meta
+        assert_financial_md_4domain_final_schema(
+            tr_data.edge_attr,
+            feature_names=FIN_MD_FINAL_FEATURE_NAMES,
+            ports=True,
+            tds=True,
+        )
     elif train_fit_edge:
         logging.info(
             "Edge attr z-norm: train-fit inductive "

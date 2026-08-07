@@ -601,11 +601,14 @@ def save_model(model, optimizer, epoch, args, data_config, *, suffix: str = ""):
             "discard_at_extract": True,
         }
     ab = getattr(args, "direct_r198_alpha_beta", None)
+    weight_mode = str(getattr(args, "direct_r198_tfmoe_weight_mode", "adaptive") or "adaptive")
     if ab is not None:
         payload["direct_r198_alpha_beta_state_dict"] = ab.state_dict()
-        payload["direct_r198_effective_weights"] = ab.effective_weights()
+        payload["direct_r198_effective_weights"] = ab.effective_weights(weight_mode)
+        payload["direct_r198_tfmoe_weight_mode"] = weight_mode
     payload["direct_r198_infonce"] = bool(getattr(args, "direct_r198_infonce", False))
     payload["direct_r198_tfmoe"] = bool(getattr(args, "direct_r198_tfmoe", False))
+    payload["direct_r198_tfmoe_weight_mode"] = weight_mode
     sched = getattr(args, "_direct_r198_scheduler", None)
     if sched is not None and hasattr(sched, "checkpoint_payload"):
         payload.update(sched.checkpoint_payload())
@@ -941,8 +944,12 @@ class PreEmbeddingCapture:
         self.handles.clear()
 
 
-def _model_bypasses_embedding_head(model: torch.nn.Module) -> bool:
+def _model_bypasses_embedding_head(
+    model: torch.nn.Module, args: Optional[Any] = None
+) -> bool:
     """True when encoder forward already returns R198 (DIRECT_H / legacy bypass)."""
+    if args is not None and bool(getattr(args, "direct_r198_infonce", False)):
+        return True
     if bool(getattr(model, "bypass_embedding_head", False)):
         return True
     for m in model.modules():
@@ -981,7 +988,9 @@ def extract_seed_embeddings_homo(
     """
     representation_source = _validate_representation_source(representation_source)
     # DIRECT_H: embedding_head is bypassed; forward output is already R198.
-    if representation_source == "pre_embedding_3h" and _model_bypasses_embedding_head(model):
+    if representation_source == "pre_embedding_3h" and _model_bypasses_embedding_head(
+        model, args
+    ):
         representation_source = "post_embedding"
         logging.info(
             "pre_embedding_3h extract on bypass_embedding_head model: using forward R198 "
@@ -1061,6 +1070,57 @@ def _extract_seed_embeddings_homo_impl(
     return edge_ids, embeddings, labels
 
 
+def _reinject_missing_forward_seeds(
+    batch,
+    data,
+    *,
+    store,
+    missing_global_edge_ids: torch.Tensor,
+) -> int:
+    """Append missing forward seed edges into ``batch`` (Small_J/Small_Q mechanism).
+
+    ``missing_global_edge_ids`` are global forward EdgeIDs (= column indices into the
+    full-graph forward ``edge_index`` / ``edge_attr`` after ``add_arange_ids``).
+
+    Returns the number of edges appended. Does not touch reverse edges.
+    """
+    if missing_global_edge_ids.numel() == 0:
+        return 0
+    fwd = batch[store]
+    missing_ids = missing_global_edge_ids.detach().cpu().long().view(-1)
+    # Unique while preserving order (parallel edges remain distinct by EdgeID).
+    seen = set()
+    ordered = []
+    for eid in missing_ids.tolist():
+        if eid in seen:
+            continue
+        seen.add(eid)
+        ordered.append(int(eid))
+    missing_ids = torch.tensor(ordered, dtype=torch.long)
+    n_ids = batch["node"].n_id.detach().cpu()
+    node_mapping = {int(value.item()): idx for idx, value in enumerate(n_ids)}
+    add_edge_index = data[store].edge_index[:, missing_ids].detach().cpu().clone()
+    mapped = []
+    for row in add_edge_index:
+        mapped_row = []
+        for val in row:
+            key = int(val.item())
+            if key not in node_mapping:
+                raise RuntimeError(
+                    f"seed-complete reinjection: endpoint node {key} absent from batch n_id "
+                    f"for EdgeID(s) among {ordered[:8]}"
+                )
+            mapped_row.append(node_mapping[key])
+        mapped.append(mapped_row)
+    add_edge_index = torch.tensor(mapped, dtype=torch.long)
+    add_edge_attr = data[store].edge_attr[missing_ids, :].detach().cpu().clone()
+    add_y = data[store].y[missing_ids].detach().cpu().clone()
+    fwd.edge_index = torch.cat((fwd.edge_index.detach().cpu(), add_edge_index), 1)
+    fwd.edge_attr = torch.cat((fwd.edge_attr.detach().cpu(), add_edge_attr), 0)
+    fwd.y = torch.cat((fwd.y.detach().cpu(), add_y), 0)
+    return int(missing_ids.numel())
+
+
 @torch.no_grad()
 def extract_seed_embeddings_hetero(
     loader,
@@ -1073,13 +1133,24 @@ def extract_seed_embeddings_hetero(
     pre_dim: Optional[int] = None,
     emb_dim: Optional[int] = None,
     head_spec: Optional[EmbeddingHeadSpec] = None,
+    max_batches: Optional[int] = None,
+    require_seed_complete: bool = False,
+    stats_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Collect frozen forward-edge representations for seed transactions (hetero graphs).
 
     See :func:`extract_seed_embeddings_homo` for the ``representation_source`` semantics.
+
+    ``require_seed_complete`` (default False): when True, missing requested seeds that
+    did not survive LinkNeighborLoader subgraph sampling are reinjected via a *second*
+    forward so already-surviving seed rows stay bit-identical to the clean forward.
+    Historical callers leave this False (Small_J/Small_Q keep their legacy single-pass
+    reinjection behavior).
     """
     representation_source = _validate_representation_source(representation_source)
-    if representation_source == "pre_embedding_3h" and _model_bypasses_embedding_head(model):
+    if representation_source == "pre_embedding_3h" and _model_bypasses_embedding_head(
+        model, args
+    ):
         # Bypass models expose R198 as the forward edge embedding.
         representation_source = "post_embedding"
         logging.info(
@@ -1093,7 +1164,17 @@ def extract_seed_embeddings_hetero(
     )
     try:
         edge_ids, z_post, y, z_pre = _extract_seed_embeddings_hetero_impl(
-            loader, split_inds, model, data, device, args, capture, dual=False
+            loader,
+            split_inds,
+            model,
+            data,
+            device,
+            args,
+            capture,
+            dual=False,
+            max_batches=max_batches,
+            require_seed_complete=require_seed_complete,
+            stats_out=stats_out,
         )
         if representation_source == "pre_embedding_3h":
             return edge_ids, z_pre, y
@@ -1115,6 +1196,8 @@ def extract_seed_embeddings_hetero_dual(
     emb_dim: Optional[int] = None,
     head_spec: Optional[EmbeddingHeadSpec] = None,
     max_batches: Optional[int] = None,
+    require_seed_complete: bool = False,
+    stats_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """One forward: return ``(edge_ids, z_pre3h, z_post128, y)`` with identical row order."""
     capture = PreEmbeddingCapture(
@@ -1131,6 +1214,8 @@ def extract_seed_embeddings_hetero_dual(
             capture,
             dual=True,
             max_batches=max_batches,
+            require_seed_complete=require_seed_complete,
+            stats_out=stats_out,
         )
     finally:
         capture.remove()
@@ -1147,43 +1232,69 @@ def _extract_seed_embeddings_hetero_impl(
     capture: Optional[PreEmbeddingCapture],
     dual: bool = False,
     max_batches: Optional[int] = None,
+    require_seed_complete: bool = False,
+    stats_out: Optional[Dict[str, Any]] = None,
 ):
     edge_id_chunks: List[torch.Tensor] = []
     z_post_chunks: List[torch.Tensor] = []
     z_pre_chunks: List[torch.Tensor] = []
     y_chunks: List[torch.Tensor] = []
     store = FORWARD_EDGE_TYPE
+    n_reinjected = 0
+    legacy_dataset_reinject = (not require_seed_complete) and (
+        getattr(args, "data", None) in ("Small_J", "Small_Q")
+    )
 
     split_inds_cpu = split_inds.detach().cpu()
     for batch_i, batch in enumerate(tqdm.tqdm(loader, disable=not args.tqdm, desc="extract hetero")):
         if max_batches is not None and batch_i >= int(max_batches):
             break
         fwd = batch[store]
+        rev = batch[REVERSE_EDGE_TYPE]
         batch_edge_inds = split_inds_cpu[fwd.input_id.detach().cpu()]
         batch_edge_ids = loader.data[store].edge_attr.detach().cpu()[batch_edge_inds, 0]
-        mask = torch.isin(fwd.edge_attr[:, 0].detach().cpu(), batch_edge_ids)
+        ea_cpu = fwd.edge_attr.detach().cpu()
+        mask = torch.isin(ea_cpu[:, 0], batch_edge_ids)
+        missing = ~torch.isin(batch_edge_ids, ea_cpu[:, 0])
 
-        missing = ~torch.isin(batch_edge_ids, fwd.edge_attr[:, 0].detach().cpu())
-        if missing.sum() != 0 and (args.data == "Small_J" or args.data == "Small_Q"):
-            missing_ids = batch_edge_ids[missing].int()
-            n_ids = batch["node"].n_id
-            add_edge_index = data[store].edge_index[:, missing_ids].detach().clone()
-            node_mapping = {value.item(): idx for idx, value in enumerate(n_ids)}
-            add_edge_index = torch.tensor(
-                [[node_mapping[val.item()] for val in row] for row in add_edge_index]
+        # Snapshot pre-strip tensors for optional second-pass reinjection.
+        ei0 = fwd.edge_index.detach().cpu().clone()
+        ea0 = ea_cpu.clone()
+        y0 = fwd.y.detach().cpu().clone()
+        rea0 = rev.edge_attr.detach().cpu().clone()
+
+        if legacy_dataset_reinject and missing.sum() != 0:
+            n_add = _reinject_missing_forward_seeds(
+                batch, data, store=store, missing_global_edge_ids=batch_edge_ids[missing]
             )
-            add_edge_attr = data[store].edge_attr[missing_ids, :].detach().clone()
-            add_y = data[store].y[missing_ids].detach().clone()
+            n_reinjected += n_add
+            mask = torch.cat((mask, torch.ones(n_add, dtype=torch.bool)))
+            edge_ids = fwd.edge_attr[:, 0].long().clone()
+            fwd.edge_attr = fwd.edge_attr[:, 1:]
+            rev.edge_attr = rev.edge_attr[:, 1:]
+            batch.to(device)
+            if capture is not None:
+                capture.clear()
+            out = model(batch.x_dict, batch.edge_index_dict, batch.edge_attr_dict)
+            z_post = out[store]
+            z_pre = capture.get(z_post) if capture is not None else None
+            mask_dev = mask.to(device, non_blocking=True)
+            edge_id_chunks.append(edge_ids[mask].detach().cpu())
+            z_post_chunks.append(z_post[mask_dev].detach().cpu())
+            if z_pre is not None:
+                z_pre_chunks.append(z_pre[mask_dev].detach().cpu())
+            y_chunks.append(fwd.y[mask_dev].detach().cpu().long())
+            continue
 
-            fwd.edge_index = torch.cat((fwd.edge_index, add_edge_index), 1)
-            fwd.edge_attr = torch.cat((fwd.edge_attr, add_edge_attr), 0)
-            fwd.y = torch.cat((fwd.y, add_y), 0)
-            mask = torch.cat((mask, torch.ones(add_y.shape[0], dtype=torch.bool)))
-
-        edge_ids = fwd.edge_attr[:, 0].long().clone()
-        fwd.edge_attr = fwd.edge_attr[:, 1:]
-        batch[REVERSE_EDGE_TYPE].edge_attr = batch[REVERSE_EDGE_TYPE].edge_attr[:, 1:]
-
+        # Clean forward (no MP mutation): preserves surviving-seed R198.
+        edge_ids_clean = ea0[:, 0].long().clone()
+        fwd.edge_index = ei0.clone()
+        fwd.edge_attr = ea0[:, 1:].clone()
+        fwd.y = y0.clone()
+        if rea0.shape[1] == ea0.shape[1]:
+            rev.edge_attr = rea0[:, 1:].clone()
+        else:
+            rev.edge_attr = rea0.clone()
         batch.to(device)
         if capture is not None:
             capture.clear()
@@ -1191,15 +1302,55 @@ def _extract_seed_embeddings_hetero_impl(
         z_post = out[store]
         z_pre = capture.get(z_post) if capture is not None else None
         mask_dev = mask.to(device, non_blocking=True)
-        edge_id_chunks.append(edge_ids[mask].detach().cpu())
-        z_post_chunks.append(z_post[mask_dev].detach().cpu())
-        if z_pre is not None:
-            z_pre_chunks.append(z_pre[mask_dev].detach().cpu())
-        y_chunks.append(fwd.y[mask_dev].detach().cpu().long())
+        eid_surv = edge_ids_clean[mask].detach().cpu()
+        z_surv = z_post[mask_dev].detach().cpu()
+        y_surv = y0[mask].detach().cpu().long()
+        z_pre_surv = z_pre[mask_dev].detach().cpu() if z_pre is not None else None
+
+        if require_seed_complete and missing.sum() != 0:
+            # Second forward with reinjection; keep ONLY newly appended rows.
+            fwd.edge_index = ei0.clone()
+            fwd.edge_attr = ea0.clone()
+            fwd.y = y0.clone()
+            rev.edge_attr = rea0.clone()
+            n_add = _reinject_missing_forward_seeds(
+                batch, data, store=store, missing_global_edge_ids=batch_edge_ids[missing]
+            )
+            n_reinjected += n_add
+            edge_ids2 = fwd.edge_attr[:, 0].long().clone()
+            fwd.edge_attr = fwd.edge_attr[:, 1:]
+            if rev.edge_attr.shape[1] == ea0.shape[1]:
+                rev.edge_attr = rev.edge_attr[:, 1:]
+            else:
+                rev.edge_attr = rea0[:, 1:].clone() if rea0.shape[1] == ea0.shape[1] else rea0.clone()
+            batch.to(device)
+            if capture is not None:
+                capture.clear()
+            out2 = model(batch.x_dict, batch.edge_index_dict, batch.edge_attr_dict)
+            z_post2 = out2[store]
+            z_pre2 = capture.get(z_post2) if capture is not None else None
+            eid_miss = edge_ids2[-n_add:].detach().cpu()
+            z_miss = z_post2[-n_add:].detach().cpu()
+            y_miss = fwd.y[-n_add:].detach().cpu().long()
+            eid_surv = torch.cat((eid_surv, eid_miss), dim=0)
+            z_surv = torch.cat((z_surv, z_miss), dim=0)
+            y_surv = torch.cat((y_surv, y_miss), dim=0)
+            if z_pre_surv is not None and z_pre2 is not None:
+                z_pre_surv = torch.cat((z_pre_surv, z_pre2[-n_add:].detach().cpu()), dim=0)
+
+        edge_id_chunks.append(eid_surv)
+        z_post_chunks.append(z_surv)
+        y_chunks.append(y_surv)
+        if z_pre_surv is not None:
+            z_pre_chunks.append(z_pre_surv)
 
     edge_ids = torch.cat(edge_id_chunks, dim=0)
     z_post = torch.cat(z_post_chunks, dim=0)
     y = torch.cat(y_chunks, dim=0)
+    if stats_out is not None:
+        stats_out["require_seed_complete"] = bool(require_seed_complete)
+        stats_out["n_reinjected"] = int(n_reinjected)
+        stats_out["legacy_dataset_reinject"] = bool(legacy_dataset_reinject)
     if capture is not None:
         z_pre = torch.cat(z_pre_chunks, dim=0)
         # Dedupe on shared order: apply same keep mask from edge_ids

@@ -1090,7 +1090,7 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
             max_optimizer_steps,
         )
 
-    # DIRECT_H: deterministic warmup+cosine over optimizer steps (not batches/chunks).
+    # DIRECT_R198: deterministic warmup+decay over optimizer steps (not batches/chunks).
     scheduler = None
     if bool(getattr(args, "direct_r198_infonce", False)):
         from direct_r198.lr_scheduler import build_direct_h_scheduler
@@ -1100,27 +1100,31 @@ def train_hetero_contrastive(tr_loader, val_loader, te_loader, tr_inds, val_inds
                 "DIRECT_H LR scheduler requires a sized training loader "
                 "(len(tr_loader)) to plan optimizer steps."
             )
+        lr_sched = str(getattr(args, "direct_r198_lr_schedule", "cosine") or "cosine")
         scheduler = build_direct_h_scheduler(
             optimizer,
             n_epochs=int(config.epochs),
             n_train_batches=int(n_train_batches),
             accum_steps=int(accum_steps),
+            schedule=lr_sched,
         )
         args._direct_r198_scheduler = scheduler
         cfg = scheduler.configuration()
+        end_key = "cosine_end_mult" if "cosine_end_mult" in cfg else "linear_end_mult"
+        decay_key = "cosine_steps" if "cosine_steps" in cfg else "linear_steps"
         logging.info(
-            "DIRECT_H LR scheduler: type=%s warmup_steps=%s cosine_steps=%s "
+            "DIRECT_R198 LR scheduler: type=%s warmup_steps=%s decay_steps=%s "
             "total_planned_optimizer_steps=%s steps_per_epoch=%s "
-            "warmup=%.2f→%.2f cosine_end=%.2f base_lrs=%s "
+            "warmup=%.2f→%.2f decay_end=%.2f base_lrs=%s "
             "(same multiplicative factor for all groups; not metric-driven)",
             cfg["scheduler_type"],
             cfg["warmup_steps"],
-            cfg["cosine_steps"],
+            cfg[decay_key],
             cfg["total_planned_optimizer_steps"],
             cfg["steps_per_epoch"],
             cfg["warmup_start_mult"],
             cfg["warmup_end_mult"],
-            cfg["cosine_end_mult"],
+            cfg[end_key],
             cfg["base_lrs"],
         )
 

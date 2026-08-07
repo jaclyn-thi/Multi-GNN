@@ -131,6 +131,9 @@ def run_embedding_extraction(
 
     if hetero:
         model = to_hetero(model, te_data.metadata(), aggr="mean")
+        # to_hetero wraps into a GraphModule and drops module attrs; re-stamp for extract.
+        if bypass_r198:
+            model.bypass_embedding_head = True
 
     finetuned = bool(getattr(args, "finetune", False))
     random_init = bool(getattr(args, "random_init", False))
@@ -155,6 +158,11 @@ def run_embedding_extraction(
         logging.info("Loaded %s (epoch=%s)", ckpt_label, ckpt_epoch)
 
     model.eval()
+    for _p in model.parameters():
+        _p.requires_grad_(False)
+    for _m in model.modules():
+        if isinstance(_m, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.SyncBatchNorm)):
+            _m.eval()
 
     # Fresh loaders after CUDA init (never reuse a consumed multi-worker iterator).
     tr_loader, val_loader, te_loader = get_loaders(
@@ -201,6 +209,11 @@ def run_embedding_extraction(
 
     embedding_dim: int | None = None
     split_checksums: dict = {}
+    extract_max_batches = getattr(args, "extract_max_batches", None)
+    if extract_max_batches is not None:
+        extract_max_batches = int(extract_max_batches)
+        if extract_max_batches <= 0:
+            extract_max_batches = None
     for split_name, loader, split_inds, graph_data in splits:
         expected = expected_seed_edge_ids(loader.data, split_inds, hetero=hetero)
         if hetero:
@@ -208,8 +221,13 @@ def run_embedding_extraction(
                 loader, split_inds, model, graph_data, device, args,
                 representation_source=representation_source, pre_dim=pre_dim, emb_dim=emb_dim,
                 head_spec=head_spec,
+                max_batches=extract_max_batches,
             )
         else:
+            if extract_max_batches is not None:
+                raise ValueError(
+                    "extract_max_batches is only supported for hetero (reverse_mp) extracts"
+                )
             edge_ids, z, y = extract_seed_embeddings_homo(
                 loader, split_inds, model, graph_data, device, args,
                 representation_source=representation_source, pre_dim=pre_dim, emb_dim=emb_dim,
@@ -278,6 +296,11 @@ def run_embedding_extraction(
             te_data, "temporal_flow_edge_features_meta", None
         ),
         "checkpoint_path": str(ckpt_path) if ckpt_path is not None else None,
+        "extract_max_batches": extract_max_batches,
+        "encoder_requires_grad": False,
+        "bn_eval_mode": True,
+        "skip_test_eval": bool(getattr(args, "skip_test_eval", False)),
+        "extract_splits": sorted(split_filter),
     }
     dataset_spec = getattr(te_data, "dataset_spec_summary", None)
     if dataset_spec is not None:
